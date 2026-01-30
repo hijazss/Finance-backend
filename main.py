@@ -1,4 +1,3 @@
-# main.py
 import os
 import re
 import time
@@ -6,11 +5,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import quiverquant
 import xml.etree.ElementTree as ET
-
 
 app = FastAPI(title="Finance Signals Backend")
 
@@ -23,15 +21,38 @@ app.add_middleware(
 
 QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
 
+# SEC requires identifying User-Agent (include contact email)
 SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "FinanceApp/1.0 (contact: hijazss@gmail.com)")
 SEC_TIMEOUT = 20
 
+# Rolling windows
 WINDOW_30_DAYS = 30
 WINDOW_180_DAYS = 180
-WINDOW_365_DAYS = 365
 WINDOW_2Y_DAYS = 730
+WINDOW_365_DAYS = 365
 
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
+
+# --------------------------
+# Small in-memory caches
+# --------------------------
+_CACHE: Dict[str, Tuple[float, Any]] = {}
+CACHE_TTL_SECONDS = 60 * 60 * 6  # 6 hours
+
+
+def cache_get(key: str):
+    v = _CACHE.get(key)
+    if not v:
+        return None
+    ts, payload = v
+    if time.time() - ts > CACHE_TTL_SECONDS:
+        _CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def cache_set(key: str, payload: Any):
+    _CACHE[key] = (time.time(), payload)
 
 
 @app.get("/")
@@ -40,9 +61,8 @@ def root():
 
 
 # --------------------------
-# Helpers: common parsing
+# Helpers: Quiver (Congress)
 # --------------------------
-
 def pick_first(row: dict, keys: List[str], default=""):
     for k in keys:
         if k in row and row[k] is not None:
@@ -110,13 +130,6 @@ def is_sell(tx: str) -> bool:
 
 
 def parse_dt_any(v: Any) -> Optional[datetime]:
-    """
-    Robust date parser.
-    Handles:
-      - ISO: 2026-01-30, 2026-01-30T12:34:56Z
-      - US: 01/30/2026, 1/30/26
-      - With time: 01/30/2026 13:22:00
-    """
     if v is None:
         return None
     if isinstance(v, datetime):
@@ -127,45 +140,19 @@ def parse_dt_any(v: Any) -> Optional[datetime]:
         return None
 
     s = s.replace("Z", "+00:00")
-
-    # Try ISO first
     try:
         dt = datetime.fromisoformat(s)
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         pass
 
-    # Common formats (IMPORTANT: includes MM/DD/YYYY)
-    fmts = [
-        "%Y-%m-%d",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%f",
-        "%m/%d/%Y",
-        "%m/%d/%y",
-        "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%y %H:%M:%S",
-    ]
-
-    # Normalize double spaces
-    s2 = re.sub(r"\s+", " ", s)
-
+    fmts = ["%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"]
     for fmt in fmts:
         try:
-            dt = datetime.strptime(s2, fmt)
+            dt = datetime.strptime(s[:10], "%Y-%m-%d")
             return dt.replace(tzinfo=timezone.utc)
         except Exception:
             continue
-
-    # Last resort: try to extract something that looks like a date
-    m = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})", s2)
-    if m:
-        for fmt in ("%m/%d/%Y", "%m/%d/%y"):
-            try:
-                dt = datetime.strptime(m.group(1), fmt)
-                return dt.replace(tzinfo=timezone.utc)
-            except Exception:
-                continue
 
     return None
 
@@ -174,32 +161,9 @@ def iso_date_only(dt: Optional[datetime]) -> str:
     return dt.date().isoformat() if dt else ""
 
 
-def norm_politician_name(row: dict) -> str:
-    return str(pick_first(row, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
-
-
-def norm_chamber(row: dict) -> str:
-    for k in ["Chamber", "chamber"]:
-        v = row.get(k)
-        if not v:
-            continue
-        s = str(v).strip().lower()
-        if "sen" in s:
-            return "Senate"
-        if "hou" in s:
-            return "House"
-
-    p = norm_politician_name(row).lower()
-    if p.startswith("sen") or " sen" in p:
-        return "Senate"
-    if p.startswith("rep") or " rep" in p:
-        return "House"
-    return ""
-
-
 def interleave(items: List[dict], limit: int = 80) -> List[dict]:
-    d = [x for x in items if x.get("party") == "D"]
-    r = [x for x in items if x.get("party") == "R"]
+    d = [x for x in items if x["party"] == "D"]
+    r = [x for x in items if x["party"] == "R"]
     out: List[dict] = []
     for i in range(0, max(len(d), len(r))):
         if i < len(d):
@@ -212,12 +176,12 @@ def interleave(items: List[dict], limit: int = 80) -> List[dict]:
 
 
 def to_card(x: dict, kind: str) -> dict:
-    dem = 1 if x.get("party") == "D" else 0
-    rep = 1 if x.get("party") == "R" else 0
+    dem = 1 if x["party"] == "D" else 0
+    rep = 1 if x["party"] == "R" else 0
     who = x.get("politician", "")
     last = x.get("filed") or x.get("traded") or ""
     return {
-        "ticker": x.get("ticker", ""),
+        "ticker": x["ticker"],
         "companyName": who,
         "demBuyers": dem if kind == "BUY" else 0,
         "repBuyers": rep if kind == "BUY" else 0,
@@ -230,92 +194,105 @@ def to_card(x: dict, kind: str) -> dict:
 
 
 # --------------------------
-# Safe price lookup (Stooq)
+# Price helper (fast + cached)
+# Uses Stooq free CSV. For US tickers, use {ticker}.us
 # --------------------------
-
-_PRICE_CACHE: Dict[str, List[Tuple[datetime, float]]] = {}
-
-
-def _stooq_symbol(ticker: str) -> str:
+def stooq_symbol(ticker: str) -> str:
     t = (ticker or "").strip().lower()
     if not t:
         return ""
-    if not t.endswith(".us"):
-        t = f"{t}.us"
-    return t
+    # crude but good enough for US equities
+    if t.endswith(".us") or t in ["spy.us", "^spx"]:
+        return t
+    # handle BRK.B -> brk.b.us
+    return f"{t}.us"
 
 
-def _fetch_stooq_daily_closes(ticker: str) -> List[Tuple[datetime, float]]:
-    sym = _stooq_symbol(ticker)
+def fetch_stooq_history_close(ticker: str) -> List[Tuple[datetime, float]]:
+    """
+    Returns list of (date_utc, close) sorted ascending.
+    Cached aggressively.
+    """
+    t = ticker.upper().strip()
+    if not t:
+        return []
+
+    cache_key = f"stooq_hist::{t}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    sym = stooq_symbol(t)
     if not sym:
         return []
 
     url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-
     try:
-        r = requests.get(url, timeout=12)
+        r = requests.get(url, timeout=15)
         if r.status_code != 200:
+            cache_set(cache_key, [])
             return []
-
-        text = (r.text or "").strip()
-        if not text or "Date,Open" not in text:
-            return []
-
-        lines = text.splitlines()
-        if len(lines) < 2:
+        text = r.text.strip()
+        if not text or "Date,Open,High,Low,Close,Volume" not in text:
+            cache_set(cache_key, [])
             return []
 
         out: List[Tuple[datetime, float]] = []
+        lines = text.splitlines()
         for line in lines[1:]:
             parts = line.split(",")
             if len(parts) < 5:
                 continue
-
-            dt = parse_dt_any(parts[0])
-            if not dt:
-                continue
-
+            d = parts[0].strip()
+            c = parts[4].strip()
             try:
-                close = float(parts[4])
+                dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                close = float(c)
+                out.append((dt, close))
             except Exception:
                 continue
 
-            out.append((dt.replace(hour=0, minute=0, second=0, microsecond=0), close))
-
         out.sort(key=lambda x: x[0])
+        cache_set(cache_key, out)
         return out
-
     except Exception:
+        cache_set(cache_key, [])
         return []
 
 
-def get_close_on_or_after(ticker: str, dt: datetime) -> Optional[float]:
-    try:
-        t = (ticker or "").upper().strip()
-        if not t:
-            return None
-
-        if t not in _PRICE_CACHE:
-            _PRICE_CACHE[t] = _fetch_stooq_daily_closes(t)
-
-        series = _PRICE_CACHE.get(t) or []
-        if not series:
-            return None
-
-        target = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        for d, price in series:
-            if d >= target:
-                return price
-
+def nearest_close_on_or_after(series: List[Tuple[datetime, float]], dt: datetime) -> Optional[Tuple[datetime, float]]:
+    if not series:
         return None
-    except Exception:
+    target = dt.date()
+    for d, c in series:
+        if d.date() >= target:
+            return (d, c)
+    return None
+
+
+def forward_return(series: List[Tuple[datetime, float]], dt: datetime, horizon_days: int) -> Optional[float]:
+    """
+    Return % change from close at/after dt to close at/after dt+horizon.
+    """
+    if not series:
         return None
+    p0 = nearest_close_on_or_after(series, dt)
+    if not p0:
+        return None
+    dt2 = dt + timedelta(days=horizon_days)
+    p1 = nearest_close_on_or_after(series, dt2)
+    if not p1:
+        return None
+    _, c0 = p0
+    _, c1 = p1
+    if c0 <= 0:
+        return None
+    return (c1 - c0) / c0
 
 
 # --------------------------
 # SEC EDGAR helpers (Leaders)
 # --------------------------
-
 def sec_get_json(url: str) -> dict:
     headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate", "Host": "data.sec.gov"}
     r = requests.get(url, headers=headers, timeout=SEC_TIMEOUT)
@@ -365,7 +342,6 @@ def parse_form4_buy_sell(xml_text: str) -> Tuple[int, int]:
                 buy += 1
             elif code == "S":
                 sell += 1
-
     return (buy, sell)
 
 
@@ -400,10 +376,10 @@ def extract_latest_filings(submissions: dict, forms_allow: List[str], max_items:
 
 
 # --------------------------
-# Core Congress window builder
+# Core extraction from Quiver with correct rolling window behavior
+# IMPORTANT: filter on FILED date first, then TRADED date if filed missing
 # --------------------------
-
-def build_congress_window(window_days: int) -> dict:
+def extract_congress_rows(window_days: int) -> Dict[str, Any]:
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
@@ -415,6 +391,7 @@ def build_congress_window(window_days: int) -> dict:
 
     if df is None or len(df) == 0:
         return {
+            "date": now.date().isoformat(),
             "windowDays": window_days,
             "windowStart": since.date().isoformat(),
             "windowEnd": now.date().isoformat(),
@@ -434,9 +411,7 @@ def build_congress_window(window_days: int) -> dict:
     for r in rows:
         ticker = norm_ticker(r)
         party = norm_party_from_any(r)
-        pol = norm_politician_name(r)
-
-        if not ticker or not party or not pol:
+        if not ticker or not party:
             continue
 
         tx = tx_text(r)
@@ -447,23 +422,17 @@ def build_congress_window(window_days: int) -> dict:
         filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
         traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
 
-        # IMPORTANT CHANGE:
-        # Include if EITHER traded OR filed is within the rolling window.
-        in_window = False
-        if traded_dt and since <= traded_dt <= now:
-            in_window = True
-        if filed_dt and since <= filed_dt <= now:
-            in_window = True
-        if not in_window:
+        # KEY FIX: prefer filed date for window filtering, fall back to traded only if filed missing
+        best_dt = filed_dt or traded_dt
+        if best_dt is None:
+            continue
+        if best_dt < since or best_dt > now:
             continue
 
-        # For ordering, prefer traded date, else filed date
-        best_dt = traded_dt or filed_dt
-        if not best_dt:
-            continue
+        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
 
         item = {
-            "ticker": ticker.upper(),
+            "ticker": ticker,
             "party": party,
             "filed": iso_date_only(filed_dt),
             "traded": iso_date_only(traded_dt),
@@ -491,7 +460,7 @@ def build_congress_window(window_days: int) -> dict:
     buy_cards = [to_card(x, "BUY") for x in buy_mixed]
     sell_cards = [to_card(x, "SELL") for x in sell_mixed]
 
-    # Convergence = overlapping tickers on BUY in this window
+    # Convergence: overlap tickers on BUY
     dem_buy = [x for x in buys if x["party"] == "D"]
     rep_buy = [x for x in buys if x["party"] == "R"]
     overlap = sorted(set(x["ticker"] for x in dem_buy).intersection(set(x["ticker"] for x in rep_buy)))
@@ -525,91 +494,102 @@ def build_congress_window(window_days: int) -> dict:
     overlap_cards.sort(key=lambda x: (-(x["demBuyers"] + x["repBuyers"]), x["ticker"]))
 
     return {
+        "date": now.date().isoformat(),
         "windowDays": window_days,
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
-        "convergence": overlap_cards[:50],
+        "convergence": overlap_cards[:20],
         "politicianBuys": buy_cards[:120],
         "politicianSells": sell_cards[:120],
     }
 
 
 # --------------------------
-# Endpoint: Congress rolling 30D + include 180D overlap payload
+# Endpoint: Congress (30D main + includes 180D block)
 # --------------------------
-
 @app.get("/report/today")
 def report_today():
-    now = datetime.now(timezone.utc)
+    # 30D primary
+    main30 = extract_congress_rows(WINDOW_30_DAYS)
 
-    data30 = build_congress_window(WINDOW_30_DAYS)
-    data180 = build_congress_window(WINDOW_180_DAYS)
+    # 180D secondary (for your 30D/180D toggle)
+    main180 = extract_congress_rows(WINDOW_180_DAYS)
 
     return {
-        "date": now.date().isoformat(),
-        "windowDays": WINDOW_30_DAYS,
-        "windowStart": data30["windowStart"],
-        "windowEnd": data30["windowEnd"],
-
-        # Main 30D payload (what your UI currently uses)
-        "convergence": data30["convergence"][:25],
-        "politicianBuys": data30["politicianBuys"][:120],
-        "politicianSells": data30["politicianSells"][:120],
-
-        # Backward compatibility
-        "bipartisanTickers": data30["politicianBuys"][:60],
-        "fundSignals": [],
-
-        # Extra: 180D overlap (so UI can show "30D overlap" and "180D overlap")
-        "overlap180": {
-            "windowDays": WINDOW_180_DAYS,
-            "windowStart": data180["windowStart"],
-            "windowEnd": data180["windowEnd"],
-            "convergence": data180["convergence"][:50],
+        **main30,
+        "windows": {
+            "d30": {
+                "windowDays": main30["windowDays"],
+                "windowStart": main30["windowStart"],
+                "windowEnd": main30["windowEnd"],
+                "convergence": main30["convergence"],
+            },
+            "d180": {
+                "windowDays": main180["windowDays"],
+                "windowStart": main180["windowStart"],
+                "windowEnd": main180["windowEnd"],
+                "convergence": main180["convergence"],
+            },
         },
+        # Backward compatible keys some older frontends used
+        "bipartisanTickers": main30.get("politicianBuys", [])[:60],
+        "fundSignals": [],
     }
 
 
 # --------------------------
-# Endpoint: Congress performance over last 2 years
+# Endpoint: Performance 2Y (fast, capped, cached)
+# Score: BUY gets forward horizon return minus SPY. SELL gets negative forward return minus SPY.
+# Uses filed date first (same logic as above).
 # --------------------------
-
 @app.get("/report/performance-2y")
-def report_performance_2y(
-    horizon_days: int = Query(30, ge=7, le=365),
-    limit: int = Query(25, ge=5, le=200),
-):
+def report_performance_2y(horizon_days: int = 30, top_n: int = 5):
+    if horizon_days < 5 or horizon_days > 180:
+        raise HTTPException(400, "horizon_days must be between 5 and 180")
+
+    cache_key = f"perf2y::{horizon_days}::{top_n}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
     now = datetime.now(timezone.utc)
-    since2y = now - timedelta(days=WINDOW_2Y_DAYS)
+    since = now - timedelta(days=WINDOW_2Y_DAYS)
 
     q = quiverquant.quiver(QUIVER_TOKEN)
     df = q.congress_trading()
-
     if df is None or len(df) == 0:
-        return {
+        payload = {
             "date": now.date().isoformat(),
-            "lookbackDays": WINDOW_2Y_DAYS,
+            "windowDays": WINDOW_2Y_DAYS,
+            "windowStart": since.date().isoformat(),
+            "windowEnd": now.date().isoformat(),
             "horizonDays": horizon_days,
             "leaders": [],
-            "note": "No congress data returned from Quiver.",
+            "note": "No congress trades returned from Quiver.",
         }
+        cache_set(cache_key, payload)
+        return payload
 
     try:
         rows = df.to_dict(orient="records")
     except Exception:
         rows = list(df)
 
+    # Build a list of scored trade records (capped for speed)
+    # We cap number of rows processed to avoid Render timeout.
+    MAX_TRADES_TO_SCORE = 600  # keep it fast
     trades: List[dict] = []
+
     for r in rows:
+        if len(trades) >= MAX_TRADES_TO_SCORE:
+            break
+
         ticker = norm_ticker(r)
         party = norm_party_from_any(r)
-        pol = norm_politician_name(r)
-        chamber = norm_chamber(r)
-
-        if not ticker or not party or not pol:
+        if not ticker or not party:
             continue
 
         tx = tx_text(r)
@@ -620,13 +600,13 @@ def report_performance_2y(
         filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
         traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
 
-        event_dt = traded_dt or filed_dt
-        if not event_dt:
-            continue
-        if not (since2y <= event_dt <= now):
+        best_dt = filed_dt or traded_dt
+        if best_dt is None or best_dt < since or best_dt > now:
             continue
 
-        amount = str(pick_first(r, ["Range", "range", "Amount", "amount", "TransactionAmount", "transaction_amount"], "")).strip()
+        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
+        chamber = str(pick_first(r, ["Chamber", "chamber"], "")).strip()
+        amount = str(pick_first(r, ["Range", "range", "Amount", "amount"], "")).strip()
 
         trades.append(
             {
@@ -635,126 +615,95 @@ def report_performance_2y(
                 "chamber": chamber,
                 "ticker": ticker.upper(),
                 "kind": kind,
-                "tradedDate": iso_date_only(traded_dt),
-                "filedDate": iso_date_only(filed_dt),
-                "event_dt": event_dt,
+                "dt": best_dt,
+                "filed": iso_date_only(filed_dt),
+                "traded": iso_date_only(traded_dt),
                 "amount": amount,
             }
         )
 
-    if not trades:
-        return {
-            "date": now.date().isoformat(),
-            "lookbackDays": WINDOW_2Y_DAYS,
-            "horizonDays": horizon_days,
-            "leaders": [],
-            "note": "No scorable trades found in last 2 years.",
-        }
+    # Group by politician, score vs SPY
+    spy_series = fetch_stooq_history_close("SPY")
+    if not spy_series:
+        raise HTTPException(502, "Could not fetch SPY price history (needed for performance scoring)")
 
-    horizon_delta = timedelta(days=horizon_days)
+    score_map: Dict[str, dict] = {}
 
-    agg: Dict[str, dict] = {}
+    # Cache price histories for tickers used
+    ticker_series_cache: Dict[str, List[Tuple[datetime, float]]] = {}
 
-    def ensure(pol_key: str, party: str, chamber: str) -> dict:
-        if pol_key not in agg:
-            agg[pol_key] = {
-                "name": pol_key,
-                "party": party,
-                "chamber": chamber or "",
-                "buyCount": 0,
-                "sellCount": 0,
-                "scoredBuy": 0,
-                "scoredSell": 0,
-                "avgBuyReturn": 0.0,
-                "avgSellAlpha": 0.0,
+    for tr in trades:
+        t = tr["ticker"]
+        if t not in ticker_series_cache:
+            ticker_series_cache[t] = fetch_stooq_history_close(t)
+
+        series = ticker_series_cache[t]
+        if not series:
+            continue
+
+        r_ticker = forward_return(series, tr["dt"], horizon_days)
+        r_spy = forward_return(spy_series, tr["dt"], horizon_days)
+        if r_ticker is None or r_spy is None:
+            continue
+
+        # BUY: +return; SELL: penalize if it goes up after they sold, reward if it drops
+        # Score is excess over SPY on same dates.
+        excess = (r_ticker - r_spy)
+        if tr["kind"] == "SELL":
+            excess = (-r_ticker) - (-r_spy)  # equivalent to (r_spy - r_ticker)
+
+        key = tr["politician"] or "Unknown"
+        cur = score_map.get(key)
+        if not cur:
+            cur = {
+                "name": key,
+                "party": tr["party"],
+                "chamber": tr["chamber"],
+                "tradesScored": 0,
                 "score": 0.0,
                 "examples": [],
             }
-        return agg[pol_key]
+            score_map[key] = cur
 
-    price_pair_cache: Dict[Tuple[str, str, int], Optional[Tuple[float, float]]] = {}
+        cur["tradesScored"] += 1
+        cur["score"] += float(excess)
 
-    for tr in trades:
-        ticker = tr["ticker"]
-        event_dt = tr["event_dt"]
-        horizon_dt = event_dt + horizon_delta
-
-        key = (ticker, iso_date_only(event_dt), horizon_days)
-        if key not in price_pair_cache:
-            p0 = get_close_on_or_after(ticker, event_dt)
-            p1 = get_close_on_or_after(ticker, horizon_dt)
-            if p0 is None or p1 is None or p0 <= 0:
-                price_pair_cache[key] = None
-            else:
-                price_pair_cache[key] = (p0, p1)
-
-        pair = price_pair_cache.get(key)
-        if not pair:
-            continue
-
-        p0, p1 = pair
-        fwd_ret = (p1 - p0) / p0
-
-        rec = ensure(tr["politician"], tr["party"], tr["chamber"])
-
-        if len(rec["examples"]) < 6:
-            rec["examples"].append(
+        # keep a few examples for UI
+        if len(cur["examples"]) < 4:
+            cur["examples"].append(
                 {
-                    "ticker": ticker,
+                    "ticker": t,
                     "kind": tr["kind"],
-                    "tradedDate": tr["tradedDate"],
-                    "filedDate": tr["filedDate"],
+                    "filed": tr["filed"],
+                    "traded": tr["traded"],
                     "amount": tr["amount"],
-                    "horizonReturn": round(fwd_ret, 4),
+                    "excessVsSPY": round(excess, 4),
                 }
             )
 
-        if tr["kind"] == "BUY":
-            rec["buyCount"] += 1
-            rec["avgBuyReturn"] += fwd_ret
-            rec["scoredBuy"] += 1
-        else:
-            rec["sellCount"] += 1
-            rec["avgSellAlpha"] += (-fwd_ret)
-            rec["scoredSell"] += 1
+    leaders = list(score_map.values())
+    # Normalize: require minimum number of scored trades so we don’t rank noise
+    MIN_SCORED = 3
+    leaders = [x for x in leaders if x["tradesScored"] >= MIN_SCORED]
+    leaders.sort(key=lambda x: x["score"], reverse=True)
+    leaders = leaders[: max(1, min(int(top_n), 20))]
 
-    leaders = list(agg.values())
-
-    for r in leaders:
-        if r["scoredBuy"] > 0:
-            r["avgBuyReturn"] = r["avgBuyReturn"] / r["scoredBuy"]
-        else:
-            r["avgBuyReturn"] = 0.0
-
-        if r["scoredSell"] > 0:
-            r["avgSellAlpha"] = r["avgSellAlpha"] / r["scoredSell"]
-        else:
-            r["avgSellAlpha"] = 0.0
-
-        sample = r["scoredBuy"] + r["scoredSell"]
-        size_boost = min(1.0, sample / 20.0)
-        r["score"] = (r["avgBuyReturn"] + r["avgSellAlpha"]) * size_boost
-
-        r["avgBuyReturn"] = round(r["avgBuyReturn"], 4)
-        r["avgSellAlpha"] = round(r["avgSellAlpha"], 4)
-        r["score"] = round(r["score"], 4)
-
-    leaders.sort(key=lambda x: (x["score"], x["scoredBuy"] + x["scoredSell"]), reverse=True)
-    leaders = [x for x in leaders if (x["scoredBuy"] + x["scoredSell"]) >= 3]
-
-    return {
+    payload = {
         "date": now.date().isoformat(),
-        "lookbackDays": WINDOW_2Y_DAYS,
+        "windowDays": WINDOW_2Y_DAYS,
+        "windowStart": since.date().isoformat(),
+        "windowEnd": now.date().isoformat(),
         "horizonDays": horizon_days,
-        "note": "Scores use Stooq daily closes. Buys use forward return. Sells use negative forward return (price down after sell is positive).",
-        "leaders": leaders[:limit],
+        "leaders": leaders,
+        "note": "Performance is scored vs SPY using forward horizon returns on filed date (or traded date if filed missing). BUY adds excess return; SELL rewards stocks that fall after selling. Capped to keep response fast.",
     }
+    cache_set(cache_key, payload)
+    return payload
 
 
 # --------------------------
-# Endpoint: Public filings “Leaders” (SEC EDGAR)
+# Endpoint: Public filings “Leaders” (SEC EDGAR, rolling 365D)
 # --------------------------
-
 @app.get("/report/public-leaders")
 def report_public_leaders():
     now = datetime.now(timezone.utc)
@@ -834,5 +783,5 @@ def report_public_leaders():
         "windowStart": since365.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "leaders": results,
-        "note": "Form 4 infers BUY/SELL from transaction codes (P/S). 13F is quarterly and shown as filing events only.",
+        "note": "Form 4 events infer BUY/SELL from transaction codes (P/S). 13F is quarterly and shown as filing events unless holdings deltas are computed.",
     }
