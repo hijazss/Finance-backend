@@ -1,11 +1,15 @@
 import os
 import re
+import json
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import quiverquant
+import xml.etree.ElementTree as ET
 
 
 app = FastAPI(title="Finance Signals Backend")
@@ -19,6 +23,14 @@ app.add_middleware(
 
 QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
 
+# SEC requires identifying User-Agent (include contact email)
+SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "FinanceApp/1.0 (contact: hijazss@gmail.com)")
+SEC_TIMEOUT = 20
+
+# Rolling windows
+WINDOW_30_DAYS = 30
+WINDOW_365_DAYS = 365
+
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
 
@@ -26,6 +38,10 @@ _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 def root():
     return {"status": "ok"}
 
+
+# --------------------------
+# Helpers: Quiver (Congress)
+# --------------------------
 
 def pick_first(row: dict, keys: List[str], default=""):
     for k in keys:
@@ -96,7 +112,6 @@ def is_sell(tx: str) -> bool:
 def parse_dt_any(v: Any) -> Optional[datetime]:
     if v is None:
         return None
-
     if isinstance(v, datetime):
         return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
 
@@ -105,7 +120,6 @@ def parse_dt_any(v: Any) -> Optional[datetime]:
         return None
 
     s = s.replace("Z", "+00:00")
-
     try:
         dt = datetime.fromisoformat(s)
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
@@ -120,7 +134,7 @@ def parse_dt_any(v: Any) -> Optional[datetime]:
     ]
     for fmt in fmts:
         try:
-            dt = datetime.strptime(s[:len(fmt.replace("%f", "000000"))], fmt)
+            dt = datetime.strptime(s[: len(fmt.replace("%f", "000000"))], fmt)
             return dt.replace(tzinfo=timezone.utc)
         except Exception:
             continue
@@ -170,68 +184,114 @@ def to_card(x: dict, kind: str) -> dict:
     }
 
 
-def agg_by_ticker(trades: List[dict]) -> Dict[str, dict]:
+# --------------------------
+# SEC EDGAR helpers
+# --------------------------
+
+def sec_get_json(url: str) -> dict:
+    headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate", "Host": "data.sec.gov"}
+    r = requests.get(url, headers=headers, timeout=SEC_TIMEOUT)
+    if r.status_code != 200:
+        raise HTTPException(502, f"SEC fetch failed HTTP {r.status_code} for {url}")
+    return r.json()
+
+
+def sec_get_text(url: str) -> str:
+    headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
+    r = requests.get(url, headers=headers, timeout=SEC_TIMEOUT)
+    if r.status_code != 200:
+        raise HTTPException(502, f"SEC fetch failed HTTP {r.status_code} for {url}")
+    return r.text
+
+
+def cik10(cik: str) -> str:
+    s = str(cik).strip()
+    s = re.sub(r"\D", "", s)
+    return s.zfill(10)
+
+
+def accession_no_dashes(acc: str) -> str:
+    return (acc or "").replace("-", "").strip()
+
+
+def build_filing_index_url(cik: str, accession: str) -> str:
+    # Example: https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dash}/{index}
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dashes(accession)}/{accession}-index.html"
+
+
+def build_primary_doc_url(cik: str, accession: str, primary_doc: str) -> str:
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dashes(accession)}/{primary_doc}"
+
+
+def parse_form4_buy_sell(xml_text: str) -> Tuple[int, int]:
     """
-    Aggregate trades into per-ticker counts suitable for Yearly tab:
-    demBuyers/repBuyers/demSellers/repSellers as counts of rows,
-    and lastFiledAt as latest dt.
+    Parse Form 4 XML and count number of purchase vs sale transactions.
+    Many filings contain multiple transactions. We return (buy_count, sell_count).
+    We detect by transactionCode: P = purchase, S = sale.
     """
-    out: Dict[str, dict] = {}
-    for x in trades:
-        t = x["ticker"]
-        cur = out.get(t)
-        if not cur:
-            cur = {
-                "ticker": t,
-                "companyName": "",
-                "demBuyers": 0,
-                "repBuyers": 0,
-                "demSellers": 0,
-                "repSellers": 0,
-                "funds": [],
-                "lastFiledAt": "",
-                "strength": "",
-                "_latest": None,
-            }
-            out[t] = cur
+    buy = 0
+    sell = 0
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return (0, 0)
 
-        party = x["party"]
-        kind = x["kind"]
-        if kind == "BUY":
-            if party == "D":
-                cur["demBuyers"] += 1
-            elif party == "R":
-                cur["repBuyers"] += 1
-        elif kind == "SELL":
-            if party == "D":
-                cur["demSellers"] += 1
-            elif party == "R":
-                cur["repSellers"] += 1
+    # transactionCode can appear under nonDerivativeTransaction and derivativeTransaction
+    for node in root.iter():
+        if node.tag.lower().endswith("transactioncode"):
+            code = (node.text or "").strip().upper()
+            if code == "P":
+                buy += 1
+            elif code == "S":
+                sell += 1
 
-        dt = x.get("best_dt")
-        if dt is not None:
-            if cur["_latest"] is None or dt > cur["_latest"]:
-                cur["_latest"] = dt
-                cur["lastFiledAt"] = iso_date_only(dt)
+    return (buy, sell)
 
-    # remove internal
-    for v in out.values():
-        v.pop("_latest", None)
 
-    return out
+def pull_recent_filings_for_cik(cik: str) -> dict:
+    url = f"https://data.sec.gov/submissions/CIK{cik10(cik)}.json"
+    return sec_get_json(url)
 
+
+def extract_latest_filings(submissions: dict, forms_allow: List[str], max_items: int = 20) -> List[dict]:
+    """
+    submissions['filings']['recent'] includes parallel arrays.
+    We'll reconstruct records, filter by forms, return newest-first.
+    """
+    filings = (submissions.get("filings") or {}).get("recent") or {}
+    forms = filings.get("form") or []
+    accs = filings.get("accessionNumber") or []
+    primary_docs = filings.get("primaryDocument") or []
+    filed_dates = filings.get("filingDate") or []
+
+    out = []
+    for i in range(min(len(forms), len(accs), len(primary_docs), len(filed_dates))):
+        form = str(forms[i])
+        if form not in forms_allow:
+            continue
+        out.append({
+            "form": form,
+            "accession": str(accs[i]),
+            "primaryDocument": str(primary_docs[i]),
+            "filingDate": str(filed_dates[i]),
+        })
+
+    # filings['recent'] is already newest-first in practice; but ensure sort
+    out.sort(key=lambda x: x.get("filingDate", ""), reverse=True)
+    return out[:max_items]
+
+
+# --------------------------
+# Endpoint: Congress (your existing app)
+# --------------------------
 
 @app.get("/report/today")
 def report_today():
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    # Windows
     now = datetime.now(timezone.utc)
-    window30 = 30
-    window365 = 365
-    since30 = now - timedelta(days=window30)
-    since365 = now - timedelta(days=window365)
+    since30 = now - timedelta(days=WINDOW_30_DAYS)
 
     q = quiverquant.quiver(QUIVER_TOKEN)
     df = q.congress_trading()
@@ -239,14 +299,13 @@ def report_today():
     if df is None or len(df) == 0:
         return {
             "date": now.date().isoformat(),
-            "windowDays": window30,
+            "windowDays": WINDOW_30_DAYS,
             "windowStart": since30.date().isoformat(),
             "windowEnd": now.date().isoformat(),
             "convergence": [],
             "bipartisanTickers": [],
             "politicianBuys": [],
             "politicianSells": [],
-            "yearly": {"windowDays": window365, "windowStart": since365.date().isoformat(), "windowEnd": now.date().isoformat(), "universe": []},
             "fundSignals": [],
         }
 
@@ -255,12 +314,14 @@ def report_today():
     except Exception:
         rows = list(df)
 
-    trades_30: List[dict] = []
-    trades_365: List[dict] = []
+    buys: List[dict] = []
+    sells: List[dict] = []
 
     for r in rows:
         best_dt = row_best_dt(r)
         if best_dt is None:
+            continue
+        if best_dt < since30 or best_dt > now:
             continue
 
         ticker = norm_ticker(r)
@@ -277,38 +338,32 @@ def report_today():
         traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
         pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
 
-        base = {
+        item = {
             "ticker": ticker,
             "party": party,
             "filed": iso_date_only(filed_dt),
             "traded": iso_date_only(traded_dt),
             "politician": pol,
             "best_dt": best_dt,
-            "kind": kind,
         }
 
-        if since365 <= best_dt <= now:
-            trades_365.append(base)
+        if kind == "BUY":
+            buys.append(item)
+        else:
+            sells.append(item)
 
-        if since30 <= best_dt <= now:
-            trades_30.append(base)
+    buys.sort(key=lambda x: x["best_dt"], reverse=True)
+    sells.sort(key=lambda x: x["best_dt"], reverse=True)
 
-    # 30D buy/sell cards (mixed)
-    buys_30 = [x for x in trades_30 if x["kind"] == "BUY"]
-    sells_30 = [x for x in trades_30 if x["kind"] == "SELL"]
-
-    buys_30.sort(key=lambda x: x["best_dt"], reverse=True)
-    sells_30.sort(key=lambda x: x["best_dt"], reverse=True)
-
-    buy_mixed = interleave([{"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]} for x in buys_30], 80)
-    sell_mixed = interleave([{"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]} for x in sells_30], 80)
+    buy_mixed = interleave([{"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]} for x in buys], 80)
+    sell_mixed = interleave([{"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]} for x in sells], 80)
 
     buy_cards = [to_card(x, "BUY") for x in buy_mixed]
     sell_cards = [to_card(x, "SELL") for x in sell_mixed]
 
-    # 30D convergence (overlap tickers on BUY)
-    dem_buy = [x for x in buys_30 if x["party"] == "D"]
-    rep_buy = [x for x in buys_30 if x["party"] == "R"]
+    # Convergence = overlapping tickers on BUY in the last 30d
+    dem_buy = [x for x in buys if x["party"] == "D"]
+    rep_buy = [x for x in buys if x["party"] == "R"]
     overlap = sorted(set(x["ticker"] for x in dem_buy).intersection(set(x["ticker"] for x in rep_buy)))
 
     overlap_cards: List[dict] = []
@@ -317,7 +372,7 @@ def report_today():
         rep_ct = sum(1 for x in rep_buy if x["ticker"] == t)
 
         latest_dt: Optional[datetime] = None
-        for x in buys_30:
+        for x in buys:
             if x["ticker"] != t:
                 continue
             if latest_dt is None or x["best_dt"] > latest_dt:
@@ -337,37 +392,117 @@ def report_today():
 
     overlap_cards.sort(key=lambda x: (-(x["demBuyers"] + x["repBuyers"]), x["ticker"]))
 
-    # Yearly universe aggregation (per ticker totals in 1Y window)
-    yearly_map = agg_by_ticker(trades_365)
-    yearly_universe = list(yearly_map.values())
+    return {
+        "date": now.date().isoformat(),
+        "windowDays": WINDOW_30_DAYS,
+        "windowStart": since30.date().isoformat(),
+        "windowEnd": now.date().isoformat(),
+        "convergence": overlap_cards[:10],
+        "bipartisanTickers": buy_cards[:60],  # backward compatibility
+        "politicianBuys": buy_cards[:80],
+        "politicianSells": sell_cards[:80],
+        "fundSignals": [],
+    }
 
-    # Sort yearly universe by total participation then ticker
-    def total_participation(v: dict) -> int:
-        return int(v.get("demBuyers", 0)) + int(v.get("repBuyers", 0)) + int(v.get("demSellers", 0)) + int(v.get("repSellers", 0))
 
-    yearly_universe.sort(key=lambda v: (-total_participation(v), v.get("ticker", "")))
+# --------------------------
+# NEW Endpoint: Public filings “Leaders”
+# --------------------------
+
+@app.get("/report/public-leaders")
+def report_public_leaders():
+    """
+    Tracks public filings for a curated list:
+    - Form 4 (insider transactions): we parse XML to infer buy vs sell counts
+    - 13F-HR: shows filing event (quarterly); buy/sell inference is not reliable from headline filing alone
+    """
+    now = datetime.now(timezone.utc)
+    since365 = now - timedelta(days=WINDOW_365_DAYS)
+
+    # Curated list (you can add more later)
+    # CIKs confirmed:
+    # - Elon Musk: 1494730
+    # - Berkshire Hathaway: 1067983
+    # - Bridgewater Associates: 1350694
+    leaders = [
+        {"key": "musk", "name": "Elon Musk", "cik": "1494730", "forms": ["4", "4/A"]},
+        {"key": "berkshire", "name": "Berkshire Hathaway", "cik": "1067983", "forms": ["13F-HR", "13F-HR/A"]},
+        {"key": "bridgewater", "name": "Bridgewater Associates", "cik": "1350694", "forms": ["13F-HR", "13F-HR/A"]},
+    ]
+
+    results = []
+
+    for leader in leaders:
+        cik = leader["cik"]
+        subs = pull_recent_filings_for_cik(cik)
+        filings = extract_latest_filings(subs, leader["forms"], max_items=10)
+
+        events = []
+        for f in filings:
+            filed_dt = parse_dt_any(f.get("filingDate"))
+            if filed_dt is not None and filed_dt < since365:
+                continue
+
+            accession = f["accession"]
+            primary_doc = f["primaryDocument"]
+            form = f["form"]
+            filing_date = f["filingDate"]
+
+            index_url = build_filing_index_url(cik, accession)
+            primary_url = build_primary_doc_url(cik, accession, primary_doc)
+
+            label = "FILED"
+            buy_ct = 0
+            sell_ct = 0
+
+            # Infer buy/sell for Form 4 only (via XML transaction codes P/S)
+            if form.startswith("4"):
+                try:
+                    xml_text = sec_get_text(primary_url)
+                    buy_ct, sell_ct = parse_form4_buy_sell(xml_text)
+                    if buy_ct > 0 and sell_ct == 0:
+                        label = "BUY"
+                    elif sell_ct > 0 and buy_ct == 0:
+                        label = "SELL"
+                    elif buy_ct > 0 and sell_ct > 0:
+                        label = "MIXED"
+                    else:
+                        label = "FORM4"
+                except Exception:
+                    label = "FORM4"
+
+            # 13F: do not guess buy/sell from headline filing; just label it
+            if form.startswith("13F"):
+                label = "13F FILED"
+
+            events.append({
+                "form": form,
+                "label": label,
+                "filingDate": filing_date,
+                "indexUrl": index_url,
+                "primaryUrl": primary_url,
+                "buyTxCount": buy_ct,
+                "sellTxCount": sell_ct,
+            })
+
+            # Keep at most 3 events per leader for UI
+            if len(events) >= 3:
+                break
+
+            # polite pacing
+            time.sleep(0.2)
+
+        results.append({
+            "name": leader["name"],
+            "cik": cik10(cik),
+            "events": events,
+        })
 
     return {
         "date": now.date().isoformat(),
-
-        # 30D metadata
-        "windowDays": window30,
-        "windowStart": since30.date().isoformat(),
+        "windowDays": WINDOW_365_DAYS,
+        "windowStart": since365.date().isoformat(),
         "windowEnd": now.date().isoformat(),
-
-        # 30D data
-        "convergence": overlap_cards[:10],
-        "bipartisanTickers": buy_cards[:60],  # backward compatible key
-        "politicianBuys": buy_cards[:80],
-        "politicianSells": sell_cards[:80],
-
-        # 1Y data for Yearly tab
-        "yearly": {
-            "windowDays": window365,
-            "windowStart": since365.date().isoformat(),
-            "windowEnd": now.date().isoformat(),
-            "universe": yearly_universe[:200],  # keep payload sane
-        },
-
-        "fundSignals": [],
+        "leaders": results,
+        "note": "Form 4 events infer BUY/SELL from transaction codes (P/S). 13F is quarterly and shown as filing events; buy/sell inference requires parsing holdings changes across quarters.",
     }
