@@ -1,15 +1,15 @@
 import os
 import re
-import json
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import requests
+import xml.etree.ElementTree as ET
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import quiverquant
-import xml.etree.ElementTree as ET
 
 
 app = FastAPI(title="Finance Signals Backend")
@@ -189,7 +189,11 @@ def to_card(x: dict, kind: str) -> dict:
 # --------------------------
 
 def sec_get_json(url: str) -> dict:
-    headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate", "Host": "data.sec.gov"}
+    headers = {
+        "User-Agent": SEC_USER_AGENT,
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "application/json",
+    }
     r = requests.get(url, headers=headers, timeout=SEC_TIMEOUT)
     if r.status_code != 200:
         raise HTTPException(502, f"SEC fetch failed HTTP {r.status_code} for {url}")
@@ -197,7 +201,11 @@ def sec_get_json(url: str) -> dict:
 
 
 def sec_get_text(url: str) -> str:
-    headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
+    headers = {
+        "User-Agent": SEC_USER_AGENT,
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+    }
     r = requests.get(url, headers=headers, timeout=SEC_TIMEOUT)
     if r.status_code != 200:
         raise HTTPException(502, f"SEC fetch failed HTTP {r.status_code} for {url}")
@@ -215,7 +223,6 @@ def accession_no_dashes(acc: str) -> str:
 
 
 def build_filing_index_url(cik: str, accession: str) -> str:
-    # Example: https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dash}/{index}
     return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dashes(accession)}/{accession}-index.html"
 
 
@@ -223,22 +230,37 @@ def build_primary_doc_url(cik: str, accession: str, primary_doc: str) -> str:
     return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dashes(accession)}/{primary_doc}"
 
 
+def _local_name(tag: str) -> str:
+    # Handles "{namespace}transactionCode" -> "transactionCode"
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
 def parse_form4_buy_sell(xml_text: str) -> Tuple[int, int]:
     """
     Parse Form 4 XML and count number of purchase vs sale transactions.
-    Many filings contain multiple transactions. We return (buy_count, sell_count).
-    We detect by transactionCode: P = purchase, S = sale.
+    Detect by transactionCode:
+      - P = Purchase
+      - S = Sale
+    Return (buy_count, sell_count).
+
+    Robust to namespaces and both derivative/non-derivative transactions.
     """
     buy = 0
     sell = 0
+
+    if not xml_text or "<" not in xml_text:
+        return (0, 0)
+
     try:
         root = ET.fromstring(xml_text)
     except Exception:
+        # Sometimes the "primary doc" is HTML. Try to find an embedded XML link? For now just return 0.
         return (0, 0)
 
-    # transactionCode can appear under nonDerivativeTransaction and derivativeTransaction
     for node in root.iter():
-        if node.tag.lower().endswith("transactioncode"):
+        if _local_name(node.tag).lower() == "transactioncode":
             code = (node.text or "").strip().upper()
             if code == "P":
                 buy += 1
@@ -254,10 +276,6 @@ def pull_recent_filings_for_cik(cik: str) -> dict:
 
 
 def extract_latest_filings(submissions: dict, forms_allow: List[str], max_items: int = 20) -> List[dict]:
-    """
-    submissions['filings']['recent'] includes parallel arrays.
-    We'll reconstruct records, filter by forms, return newest-first.
-    """
     filings = (submissions.get("filings") or {}).get("recent") or {}
     forms = filings.get("form") or []
     accs = filings.get("accessionNumber") or []
@@ -265,7 +283,8 @@ def extract_latest_filings(submissions: dict, forms_allow: List[str], max_items:
     filed_dates = filings.get("filingDate") or []
 
     out = []
-    for i in range(min(len(forms), len(accs), len(primary_docs), len(filed_dates))):
+    n = min(len(forms), len(accs), len(primary_docs), len(filed_dates))
+    for i in range(n):
         form = str(forms[i])
         if form not in forms_allow:
             continue
@@ -276,13 +295,12 @@ def extract_latest_filings(submissions: dict, forms_allow: List[str], max_items:
             "filingDate": str(filed_dates[i]),
         })
 
-    # filings['recent'] is already newest-first in practice; but ensure sort
     out.sort(key=lambda x: x.get("filingDate", ""), reverse=True)
     return out[:max_items]
 
 
 # --------------------------
-# Endpoint: Congress (your existing app)
+# Endpoint: Congress (rolling 30D)
 # --------------------------
 
 @app.get("/report/today")
@@ -355,8 +373,14 @@ def report_today():
     buys.sort(key=lambda x: x["best_dt"], reverse=True)
     sells.sort(key=lambda x: x["best_dt"], reverse=True)
 
-    buy_mixed = interleave([{"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]} for x in buys], 80)
-    sell_mixed = interleave([{"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]} for x in sells], 80)
+    buy_mixed = interleave(
+        [{"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]} for x in buys],
+        80
+    )
+    sell_mixed = interleave(
+        [{"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]} for x in sells],
+        80
+    )
 
     buy_cards = [to_card(x, "BUY") for x in buy_mixed]
     sell_cards = [to_card(x, "SELL") for x in sell_mixed]
@@ -406,28 +430,30 @@ def report_today():
 
 
 # --------------------------
-# NEW Endpoint: Public filings “Leaders”
+# Endpoint: Public filings “Leaders” (rolling 365D)
 # --------------------------
 
 @app.get("/report/public-leaders")
 def report_public_leaders():
     """
     Tracks public filings for a curated list:
-    - Form 4 (insider transactions): we parse XML to infer buy vs sell counts
-    - 13F-HR: shows filing event (quarterly); buy/sell inference is not reliable from headline filing alone
+    - Form 4 (insider transactions): parse XML to infer buy vs sell counts via transactionCode (P/S)
+    - 13F-HR: shows filing events (quarterly). We do not infer buy/sell from a single filing headline.
     """
     now = datetime.now(timezone.utc)
     since365 = now - timedelta(days=WINDOW_365_DAYS)
 
-    # Curated list (you can add more later)
-    # CIKs confirmed:
-    # - Elon Musk: 1494730
-    # - Berkshire Hathaway: 1067983
-    # - Bridgewater Associates: 1350694
     leaders = [
-        {"key": "musk", "name": "Elon Musk", "cik": "1494730", "forms": ["4", "4/A"]},
-        {"key": "berkshire", "name": "Berkshire Hathaway", "cik": "1067983", "forms": ["13F-HR", "13F-HR/A"]},
-        {"key": "bridgewater", "name": "Bridgewater Associates", "cik": "1350694", "forms": ["13F-HR", "13F-HR/A"]},
+        # Insider Form 4
+        {"name": "Elon Musk", "cik": "1494730", "forms": ["4", "4/A"]},
+
+        # Institutions (13F)
+        {"name": "Berkshire Hathaway", "cik": "1067983", "forms": ["13F-HR", "13F-HR/A"]},
+        {"name": "Bridgewater Associates", "cik": "1350694", "forms": ["13F-HR", "13F-HR/A"]},
+        {"name": "Pershing Square", "cik": "1336528", "forms": ["13F-HR", "13F-HR/A"]},
+        {"name": "Soros Fund Management", "cik": "1029160", "forms": ["13F-HR", "13F-HR/A"]},
+        {"name": "Citadel Advisors", "cik": "1423053", "forms": ["13F-HR", "13F-HR/A"]},
+        {"name": "Renaissance Technologies", "cik": "1037389", "forms": ["13F-HR", "13F-HR/A"]},
     ]
 
     results = []
@@ -435,7 +461,7 @@ def report_public_leaders():
     for leader in leaders:
         cik = leader["cik"]
         subs = pull_recent_filings_for_cik(cik)
-        filings = extract_latest_filings(subs, leader["forms"], max_items=10)
+        filings = extract_latest_filings(subs, leader["forms"], max_items=12)
 
         events = []
         for f in filings:
@@ -455,8 +481,8 @@ def report_public_leaders():
             buy_ct = 0
             sell_ct = 0
 
-            # Infer buy/sell for Form 4 only (via XML transaction codes P/S)
             if form.startswith("4"):
+                # Try to parse XML transaction codes
                 try:
                     xml_text = sec_get_text(primary_url)
                     buy_ct, sell_ct = parse_form4_buy_sell(xml_text)
@@ -471,7 +497,6 @@ def report_public_leaders():
                 except Exception:
                     label = "FORM4"
 
-            # 13F: do not guess buy/sell from headline filing; just label it
             if form.startswith("13F"):
                 label = "13F FILED"
 
@@ -485,12 +510,10 @@ def report_public_leaders():
                 "sellTxCount": sell_ct,
             })
 
-            # Keep at most 3 events per leader for UI
             if len(events) >= 3:
                 break
 
-            # polite pacing
-            time.sleep(0.2)
+            time.sleep(0.15)
 
         results.append({
             "name": leader["name"],
