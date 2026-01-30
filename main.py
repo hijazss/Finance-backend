@@ -1,3 +1,4 @@
+# main.py
 import os
 import re
 import time
@@ -26,10 +27,11 @@ QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
 SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "FinanceApp/1.0 (contact: hijazss@gmail.com)")
 SEC_TIMEOUT = 20
 
-# Windows
+# Rolling windows
 WINDOW_30_DAYS = 30
-WINDOW_2Y_DAYS = 730
+WINDOW_180_DAYS = 180
 WINDOW_365_DAYS = 365
+WINDOW_2Y_DAYS = 730
 
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
@@ -51,6 +53,7 @@ def pick_first(row: dict, keys: List[str], default=""):
 
 
 def norm_party_from_any(row: dict) -> str:
+    # If explicit Party column exists
     for k in ["Party", "party"]:
         v = row.get(k)
         if v:
@@ -60,6 +63,7 @@ def norm_party_from_any(row: dict) -> str:
             if s.startswith("R"):
                 return "R"
 
+    # Try to parse "Last, First / D" formats
     for k in ["Politician", "politician", "Representative", "Senator", "Name", "name"]:
         v = row.get(k)
         if not v:
@@ -85,7 +89,7 @@ def norm_ticker(row: dict) -> str:
             continue
         s = str(v).strip().upper()
         first = s.split()[0]
-        if 1 <= len(first) <= 10 and first.replace(".", "").replace("-", "").isalnum():
+        if 1 <= len(first) <= 8 and first.replace(".", "").replace("-", "").isalnum():
             return first
         return s
     return ""
@@ -120,23 +124,32 @@ def parse_dt_any(v: Any) -> Optional[datetime]:
         return None
 
     s = s.replace("Z", "+00:00")
-
-    # ISO-ish
     try:
         dt = datetime.fromisoformat(s)
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         pass
 
-    # Common date only
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+    fmts = [
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+    ]
+    for fmt in fmts:
         try:
-            dt = datetime.strptime(s[:10], fmt)
+            # Safe truncation attempt
+            raw = s[:19] if "T" in s else s[:10]
+            dt = datetime.strptime(raw, fmt)
             return dt.replace(tzinfo=timezone.utc)
         except Exception:
             continue
 
     return None
+
+
+def iso_date_only(dt: Optional[datetime]) -> str:
+    return dt.date().isoformat() if dt else ""
 
 
 def row_best_dt(row: dict) -> Optional[datetime]:
@@ -145,8 +158,30 @@ def row_best_dt(row: dict) -> Optional[datetime]:
     return parse_dt_any(traded) or parse_dt_any(filed)
 
 
-def iso_date_only(dt: Optional[datetime]) -> str:
-    return dt.date().isoformat() if dt else ""
+def norm_politician_name(row: dict) -> str:
+    return str(pick_first(row, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
+
+
+def norm_chamber(row: dict) -> str:
+    # Best-effort: some datasets include "Chamber" or "House/Senate"
+    for k in ["Chamber", "chamber", "House", "house", "Senate", "senate"]:
+        v = row.get(k)
+        if not v:
+            continue
+        s = str(v).strip().lower()
+        if "sen" in s or "senate" in s:
+            return "Senate"
+        if "hou" in s or "house" in s:
+            return "House"
+
+    # Fallback: sometimes politician string includes "Sen." or "Rep."
+    p = norm_politician_name(row).lower()
+    if p.startswith("sen") or " sen" in p:
+        return "Senate"
+    if p.startswith("rep") or " rep" in p:
+        return "House"
+
+    return ""
 
 
 def interleave(items: List[dict], limit: int = 80) -> List[dict]:
@@ -164,12 +199,12 @@ def interleave(items: List[dict], limit: int = 80) -> List[dict]:
 
 
 def to_card(x: dict, kind: str) -> dict:
-    dem = 1 if x["party"] == "D" else 0
-    rep = 1 if x["party"] == "R" else 0
+    dem = 1 if x.get("party") == "D" else 0
+    rep = 1 if x.get("party") == "R" else 0
     who = x.get("politician", "")
     last = x.get("filed") or x.get("traded") or ""
     return {
-        "ticker": x["ticker"],
+        "ticker": x.get("ticker", ""),
         "companyName": who,
         "demBuyers": dem if kind == "BUY" else 0,
         "repBuyers": rep if kind == "BUY" else 0,
@@ -182,7 +217,94 @@ def to_card(x: dict, kind: str) -> dict:
 
 
 # --------------------------
-# SEC EDGAR helpers (Leaders tab)
+# Safe price lookup (Stooq)
+# --------------------------
+
+_PRICE_CACHE: Dict[str, List[Tuple[datetime, float]]] = {}
+
+
+def _stooq_symbol(ticker: str) -> str:
+    # Stooq expects lowercase and ".us" suffix for US equities
+    t = (ticker or "").strip().lower()
+    if not t:
+        return ""
+    # For tickers like BRK.B -> brk.b.us is ok on Stooq sometimes; we still try
+    if not t.endswith(".us"):
+        t = f"{t}.us"
+    return t
+
+
+def _fetch_stooq_daily_closes(ticker: str) -> List[Tuple[datetime, float]]:
+    sym = _stooq_symbol(ticker)
+    if not sym:
+        return []
+
+    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+
+    try:
+        r = requests.get(url, timeout=12)
+        if r.status_code != 200:
+            return []
+
+        text = (r.text or "").strip()
+        if not text or "Date,Open" not in text:
+            return []
+
+        lines = text.splitlines()
+        if len(lines) < 2:
+            return []
+
+        out: List[Tuple[datetime, float]] = []
+        for line in lines[1:]:
+            parts = line.split(",")
+            if len(parts) < 5:
+                continue
+
+            dt = parse_dt_any(parts[0])
+            if not dt:
+                continue
+
+            try:
+                close = float(parts[4])
+            except Exception:
+                continue
+
+            out.append((dt.replace(hour=0, minute=0, second=0, microsecond=0), close))
+
+        out.sort(key=lambda x: x[0])
+        return out
+
+    except Exception:
+        # Never allow upstream issues to crash the endpoint
+        return []
+
+
+def get_close_on_or_after(ticker: str, dt: datetime) -> Optional[float]:
+    try:
+        t = (ticker or "").upper().strip()
+        if not t:
+            return None
+
+        if t not in _PRICE_CACHE:
+            _PRICE_CACHE[t] = _fetch_stooq_daily_closes(t)
+
+        series = _PRICE_CACHE.get(t) or []
+        if not series:
+            return None
+
+        target = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        for d, price in series:
+            if d >= target:
+                return price
+
+        return None
+    except Exception:
+        return None
+
+
+# --------------------------
+# SEC EDGAR helpers (Leaders)
 # --------------------------
 
 def sec_get_json(url: str) -> dict:
@@ -255,103 +377,21 @@ def extract_latest_filings(submissions: dict, forms_allow: List[str], max_items:
         form = str(forms[i])
         if form not in forms_allow:
             continue
-        out.append({
-            "form": form,
-            "accession": str(accs[i]),
-            "primaryDocument": str(primary_docs[i]),
-            "filingDate": str(filed_dates[i]),
-        })
+        out.append(
+            {
+                "form": form,
+                "accession": str(accs[i]),
+                "primaryDocument": str(primary_docs[i]),
+                "filingDate": str(filed_dates[i]),
+            }
+        )
 
     out.sort(key=lambda x: x.get("filingDate", ""), reverse=True)
     return out[:max_items]
 
 
 # --------------------------
-# Price helper (Performance tab)
-# Uses Stooq daily closes: https://stooq.com/q/d/l/?s=nvda.us&i=d
-# --------------------------
-
-_PRICE_CACHE: Dict[str, List[Tuple[datetime, float]]] = {}
-
-
-def _stooq_symbol(ticker: str) -> str:
-    # Stooq uses lowercase and .us for most US equities
-    t = (ticker or "").strip().lower()
-    return f"{t}.us"
-
-
-def _fetch_stooq_daily_closes(ticker: str) -> List[Tuple[datetime, float]]:
-    sym = _stooq_symbol(ticker)
-    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-    r = requests.get(url, timeout=12)
-    if r.status_code != 200:
-        return []
-
-    lines = (r.text or "").strip().splitlines()
-    if len(lines) < 2:
-        return []
-
-    # header: Date,Open,High,Low,Close,Volume
-    out: List[Tuple[datetime, float]] = []
-    for line in lines[1:]:
-        parts = line.split(",")
-        if len(parts) < 5:
-            continue
-        dt = parse_dt_any(parts[0])
-        try:
-            close = float(parts[4])
-        except Exception:
-            continue
-        if dt:
-            out.append((dt.replace(hour=0, minute=0, second=0, microsecond=0), close))
-
-    out.sort(key=lambda x: x[0])
-    return out
-
-
-def get_close_on_or_after(ticker: str, dt: datetime) -> Optional[float]:
-    t = (ticker or "").upper().strip()
-    if not t:
-        return None
-
-    if t not in _PRICE_CACHE:
-        _PRICE_CACHE[t] = _fetch_stooq_daily_closes(t)
-
-    series = _PRICE_CACHE.get(t) or []
-    if not series:
-        return None
-
-    target = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    # linear scan is OK because series is daily and we keep limited calls,
-    # but do a simple binary search pattern for speed.
-    lo, hi = 0, len(series) - 1
-    ans_idx = None
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        if series[mid][0] >= target:
-            ans_idx = mid
-            hi = mid - 1
-        else:
-            lo = mid + 1
-
-    if ans_idx is None:
-        return None
-    return series[ans_idx][1]
-
-
-def forward_return(ticker: str, traded_dt: datetime, horizon_days: int) -> Optional[float]:
-    p0 = get_close_on_or_after(ticker, traded_dt)
-    if p0 is None or p0 <= 0:
-        return None
-    p1 = get_close_on_or_after(ticker, traded_dt + timedelta(days=horizon_days))
-    if p1 is None or p1 <= 0:
-        return None
-    return (p1 / p0) - 1.0
-
-
-# --------------------------
-# Endpoint: Congress rolling 30D (Main tab)
+# Endpoint: Congress rolling 30D
 # --------------------------
 
 @app.get("/report/today")
@@ -405,7 +445,7 @@ def report_today():
 
         filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
         traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
-        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
+        pol = norm_politician_name(r)
 
         item = {
             "ticker": ticker,
@@ -425,18 +465,24 @@ def report_today():
     sells.sort(key=lambda x: x["best_dt"], reverse=True)
 
     buy_mixed = interleave(
-        [{"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]} for x in buys],
+        [
+            {"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]}
+            for x in buys
+        ],
         80,
     )
     sell_mixed = interleave(
-        [{"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]} for x in sells],
+        [
+            {"ticker": x["ticker"], "party": x["party"], "filed": x["filed"], "traded": x["traded"], "politician": x["politician"]}
+            for x in sells
+        ],
         80,
     )
 
     buy_cards = [to_card(x, "BUY") for x in buy_mixed]
     sell_cards = [to_card(x, "SELL") for x in sell_mixed]
 
-    # Convergence: overlapping tickers on BUY in last 30D
+    # Convergence = overlapping tickers on BUY in the last 30D
     dem_buy = [x for x in buys if x["party"] == "D"]
     rep_buy = [x for x in buys if x["party"] == "R"]
     overlap = sorted(set(x["ticker"] for x in dem_buy).intersection(set(x["ticker"] for x in rep_buy)))
@@ -453,17 +499,19 @@ def report_today():
             if latest_dt is None or x["best_dt"] > latest_dt:
                 latest_dt = x["best_dt"]
 
-        overlap_cards.append({
-            "ticker": t,
-            "companyName": "",
-            "demBuyers": dem_ct,
-            "repBuyers": rep_ct,
-            "demSellers": 0,
-            "repSellers": 0,
-            "funds": [],
-            "lastFiledAt": iso_date_only(latest_dt),
-            "strength": "OVERLAP",
-        })
+        overlap_cards.append(
+            {
+                "ticker": t,
+                "companyName": "",
+                "demBuyers": dem_ct,
+                "repBuyers": rep_ct,
+                "demSellers": 0,
+                "repSellers": 0,
+                "funds": [],
+                "lastFiledAt": iso_date_only(latest_dt),
+                "strength": "OVERLAP",
+            }
+        )
 
     overlap_cards.sort(key=lambda x: (-(x["demBuyers"] + x["repBuyers"]), x["ticker"]))
 
@@ -472,7 +520,7 @@ def report_today():
         "windowDays": WINDOW_30_DAYS,
         "windowStart": since30.date().isoformat(),
         "windowEnd": now.date().isoformat(),
-        "convergence": overlap_cards[:10],
+        "convergence": overlap_cards[:25],
         "bipartisanTickers": buy_cards[:60],  # backward compatibility
         "politicianBuys": buy_cards[:80],
         "politicianSells": sell_cards[:80],
@@ -481,24 +529,16 @@ def report_today():
 
 
 # --------------------------
-# Endpoint: Performance 2Y (new "Performance at two years" tab)
-# Query param: horizon_days (default 30)
+# Endpoint: Congress performance over last 2 years
+# Computes forward return on buys; sells get "sell alpha" = negative forward return
+# (if price falls after sell, that is positive)
 # --------------------------
 
 @app.get("/report/performance-2y")
 def report_performance_2y(
-    horizon_days: int = Query(default=30, ge=7, le=180),
-    min_trades: int = Query(default=6, ge=2, le=50),
-    max_trades_evaluated: int = Query(default=600, ge=100, le=2000),
+    horizon_days: int = Query(30, ge=7, le=365),
+    limit: int = Query(25, ge=5, le=200),
 ):
-    """
-    Ranks politicians over the last 2 years using a forward-return score.
-
-    - BUY score: forward % return over horizon_days
-    - SELL score: negative forward return (selling before a decline scores positive)
-
-    Output: top performers by average score, plus summary stats.
-    """
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
@@ -507,15 +547,14 @@ def report_performance_2y(
 
     q = quiverquant.quiver(QUIVER_TOKEN)
     df = q.congress_trading()
+
     if df is None or len(df) == 0:
         return {
             "date": now.date().isoformat(),
-            "windowDays": WINDOW_2Y_DAYS,
-            "windowStart": since2y.date().isoformat(),
-            "windowEnd": now.date().isoformat(),
+            "lookbackDays": WINDOW_2Y_DAYS,
             "horizonDays": horizon_days,
             "leaders": [],
-            "note": "No congress trading rows returned.",
+            "note": "No congress data returned from Quiver.",
         }
 
     try:
@@ -523,16 +562,21 @@ def report_performance_2y(
     except Exception:
         rows = list(df)
 
-    # Collect eligible trades with reliable traded date
+    # Gather trades within last 2Y and only tickers we can score
     trades: List[dict] = []
     for r in rows:
         best_dt = row_best_dt(r)
-        if best_dt is None or best_dt < since2y or best_dt > now:
+        if best_dt is None:
+            continue
+        if best_dt < since2y or best_dt > now:
             continue
 
         ticker = norm_ticker(r)
         party = norm_party_from_any(r)
-        if not ticker or not party:
+        pol = norm_politician_name(r)
+        chamber = norm_chamber(r)
+
+        if not ticker or not party or not pol:
             continue
 
         tx = tx_text(r)
@@ -540,137 +584,157 @@ def report_performance_2y(
         if not kind:
             continue
 
-        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
-        chamber = str(pick_first(r, ["Chamber", "chamber", "House", "Senate"], "")).strip()
-
-        # Prefer traded date for performance calculations
-        traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
         filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
+        traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
 
-        base_dt = traded_dt or filed_dt or best_dt
-
-        # Some rows can be missing politician name; skip
-        if not pol:
+        # Use traded date when available, else filing date
+        event_dt = traded_dt or filed_dt or best_dt
+        if event_dt is None:
             continue
 
-        trades.append({
-            "politician": pol,
-            "party": party,
-            "chamber": chamber,
-            "ticker": ticker,
-            "kind": kind,
-            "traded_dt": base_dt,
-            "filed_dt": filed_dt,
-        })
+        # Amount range if present
+        amount = str(pick_first(r, ["Range", "range", "Amount", "amount", "TransactionAmount", "transaction_amount"], "")).strip()
 
-    # Sort newest first and cap work to avoid timeouts
-    trades.sort(key=lambda x: x["traded_dt"], reverse=True)
-    trades = trades[:max_trades_evaluated]
+        trades.append(
+            {
+                "politician": pol,
+                "party": party,
+                "chamber": chamber,
+                "ticker": ticker.upper(),
+                "kind": kind,
+                "tradedDate": iso_date_only(traded_dt),
+                "filedDate": iso_date_only(filed_dt),
+                "event_dt": event_dt,
+                "amount": amount,
+            }
+        )
 
-    # Score each trade using cached price lookups
-    scored: List[dict] = []
-    for t in trades:
-        r = forward_return(t["ticker"], t["traded_dt"], horizon_days)
-        if r is None:
-            continue
+    if not trades:
+        return {
+            "date": now.date().isoformat(),
+            "lookbackDays": WINDOW_2Y_DAYS,
+            "horizonDays": horizon_days,
+            "leaders": [],
+            "note": "No scorable trades found in last 2 years.",
+        }
 
-        # SELL: if price goes down after selling, that is "good" timing, so invert
-        score = r if t["kind"] == "BUY" else (-r)
+    # Score each trade using close on/after event_dt and close on/after (event_dt + horizon)
+    horizon_delta = timedelta(days=horizon_days)
 
-        scored.append({
-            **t,
-            "forward_return": r,
-            "score": score,
-        })
+    # Politician aggregates
+    agg: Dict[str, dict] = {}
 
-        # Tiny pacing to be polite to upstream if cache misses are happening
-        if len(scored) % 25 == 0:
-            time.sleep(0.05)
-
-    # Aggregate per politician
-    by_pol: Dict[str, dict] = {}
-    for s in scored:
-        name = s["politician"]
-        cur = by_pol.get(name)
-        if cur is None:
-            cur = {
-                "name": name,
-                "party": s["party"],
-                "chamber": s["chamber"] or "",
-                "trades": 0,
-                "buys": 0,
-                "sells": 0,
-                "avgScore": 0.0,
+    def ensure(pol_key: str, party: str, chamber: str) -> dict:
+        if pol_key not in agg:
+            agg[pol_key] = {
+                "name": pol_key,
+                "party": party,
+                "chamber": chamber or "",
+                "buyCount": 0,
+                "sellCount": 0,
+                "scoredBuy": 0,
+                "scoredSell": 0,
                 "avgBuyReturn": 0.0,
                 "avgSellAlpha": 0.0,
-                "recentExamples": [],
+                "score": 0.0,
+                "examples": [],
             }
-            by_pol[name] = cur
+        return agg[pol_key]
 
-        cur["trades"] += 1
-        cur["avgScore"] += float(s["score"])
+    # Cache results per (ticker, event_date) to reduce calls
+    price_pair_cache: Dict[Tuple[str, str, int], Optional[Tuple[float, float]]] = {}
 
-        if s["kind"] == "BUY":
-            cur["buys"] += 1
-            cur["avgBuyReturn"] += float(s["forward_return"])
-        else:
-            cur["sells"] += 1
-            # sell alpha = -forward_return
-            cur["avgSellAlpha"] += float(-s["forward_return"])
+    for tr in trades:
+        ticker = tr["ticker"]
+        event_dt = tr["event_dt"]
+        horizon_dt = event_dt + horizon_delta
 
-        # keep a few examples
-        if len(cur["recentExamples"]) < 4:
-            cur["recentExamples"].append({
-                "ticker": s["ticker"],
-                "kind": s["kind"],
-                "tradeDate": iso_date_only(s["traded_dt"]),
-                "filedDate": iso_date_only(s["filed_dt"]),
-                "forwardReturn": round(float(s["forward_return"]), 4),
-                "score": round(float(s["score"]), 4),
-            })
+        key = (ticker, iso_date_only(event_dt), horizon_days)
+        if key not in price_pair_cache:
+            p0 = get_close_on_or_after(ticker, event_dt)
+            p1 = get_close_on_or_after(ticker, horizon_dt)
+            if p0 is None or p1 is None or p0 <= 0:
+                price_pair_cache[key] = None
+            else:
+                price_pair_cache[key] = (p0, p1)
 
-    # Finalize averages
-    out: List[dict] = []
-    for pol, cur in by_pol.items():
-        if cur["trades"] < min_trades:
+        pair = price_pair_cache.get(key)
+        if not pair:
             continue
 
-        cur["avgScore"] = cur["avgScore"] / max(1, cur["trades"])
-        if cur["buys"] > 0:
-            cur["avgBuyReturn"] = cur["avgBuyReturn"] / cur["buys"]
+        p0, p1 = pair
+        fwd_ret = (p1 - p0) / p0  # forward return over horizon
+
+        pol = tr["politician"]
+        party = tr["party"]
+        chamber = tr["chamber"]
+
+        rec = ensure(pol, party, chamber)
+
+        # Track a few example tickers for UI
+        if len(rec["examples"]) < 6:
+            rec["examples"].append(
+                {
+                    "ticker": ticker,
+                    "kind": tr["kind"],
+                    "tradedDate": tr["tradedDate"],
+                    "filedDate": tr["filedDate"],
+                    "amount": tr["amount"],
+                    "horizonReturn": round(fwd_ret, 4),
+                }
+            )
+
+        if tr["kind"] == "BUY":
+            rec["buyCount"] += 1
+            rec["avgBuyReturn"] += fwd_ret
+            rec["scoredBuy"] += 1
         else:
-            cur["avgBuyReturn"] = 0.0
+            rec["sellCount"] += 1
+            # If price drops after a sell, that is good "sell alpha"
+            rec["avgSellAlpha"] += (-fwd_ret)
+            rec["scoredSell"] += 1
 
-        if cur["sells"] > 0:
-            cur["avgSellAlpha"] = cur["avgSellAlpha"] / cur["sells"]
+    leaders = list(agg.values())
+
+    # Finalize averages and score
+    for r in leaders:
+        if r["scoredBuy"] > 0:
+            r["avgBuyReturn"] = r["avgBuyReturn"] / r["scoredBuy"]
         else:
-            cur["avgSellAlpha"] = 0.0
+            r["avgBuyReturn"] = 0.0
 
-        # round for UI
-        cur["avgScore"] = round(cur["avgScore"], 4)
-        cur["avgBuyReturn"] = round(cur["avgBuyReturn"], 4)
-        cur["avgSellAlpha"] = round(cur["avgSellAlpha"], 4)
+        if r["scoredSell"] > 0:
+            r["avgSellAlpha"] = r["avgSellAlpha"] / r["scoredSell"]
+        else:
+            r["avgSellAlpha"] = 0.0
 
-        out.append(cur)
+        # Simple score: buy skill + sell skill, weighted by sample size
+        sample = r["scoredBuy"] + r["scoredSell"]
+        size_boost = min(1.0, sample / 20.0)  # saturates at 20 scored trades
+        r["score"] = (r["avgBuyReturn"] + r["avgSellAlpha"]) * size_boost
 
-    # Sort best performers
-    out.sort(key=lambda x: (x["avgScore"], x["trades"]), reverse=True)
+        # Round for UI
+        r["avgBuyReturn"] = round(r["avgBuyReturn"], 4)
+        r["avgSellAlpha"] = round(r["avgSellAlpha"], 4)
+        r["score"] = round(r["score"], 4)
+
+    # Sort: best score first, then more samples
+    leaders.sort(key=lambda x: (x["score"], x["scoredBuy"] + x["scoredSell"]), reverse=True)
+
+    # Filter out tiny sample sizes so list is not noise
+    leaders = [x for x in leaders if (x["scoredBuy"] + x["scoredSell"]) >= 3]
 
     return {
         "date": now.date().isoformat(),
-        "windowDays": WINDOW_2Y_DAYS,
-        "windowStart": since2y.date().isoformat(),
-        "windowEnd": now.date().isoformat(),
+        "lookbackDays": WINDOW_2Y_DAYS,
         "horizonDays": horizon_days,
-        "minTrades": min_trades,
-        "maxTradesEvaluated": max_trades_evaluated,
-        "leaders": out[:25],
-        "note": "Scores use Stooq daily closes. BUY score = forward return over horizon. SELL score = negative forward return.",
+        "note": "Scores are based on forward returns using Stooq daily closes. Buys use forward return. Sells use negative forward return (price down after sell is positive).",
+        "leaders": leaders[:limit],
     }
 
 
 # --------------------------
-# Endpoint: SEC leaders (Leaders tab)
+# Endpoint: Public filings “Leaders” (SEC EDGAR)
 # --------------------------
 
 @app.get("/report/public-leaders")
@@ -727,26 +791,24 @@ def report_public_leaders():
             if form.startswith("13F"):
                 label = "13F FILED"
 
-            events.append({
-                "form": form,
-                "label": label,
-                "filingDate": filing_date,
-                "indexUrl": index_url,
-                "primaryUrl": primary_url,
-                "buyTxCount": buy_ct,
-                "sellTxCount": sell_ct,
-            })
+            events.append(
+                {
+                    "form": form,
+                    "label": label,
+                    "filingDate": filing_date,
+                    "indexUrl": index_url,
+                    "primaryUrl": primary_url,
+                    "buyTxCount": buy_ct,
+                    "sellTxCount": sell_ct,
+                }
+            )
 
             if len(events) >= 3:
                 break
 
-            time.sleep(0.15)
+            time.sleep(0.2)
 
-        results.append({
-            "name": leader["name"],
-            "cik": cik10(cik),
-            "events": events,
-        })
+        results.append({"name": leader["name"], "cik": cik10(cik), "events": events})
 
     return {
         "date": now.date().isoformat(),
@@ -754,5 +816,5 @@ def report_public_leaders():
         "windowStart": since365.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "leaders": results,
-        "note": "Form 4 infers BUY/SELL from transaction codes (P/S). 13F is shown as filing events.",
+        "note": "Form 4 events infer BUY/SELL from transaction codes (P/S). 13F is quarterly and shown as filing events only.",
     }
