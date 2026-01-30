@@ -26,6 +26,9 @@ SEC_TIMEOUT = 20
 
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
+# --------------------------
+# Root
+# --------------------------
 
 @app.get("/")
 def root():
@@ -185,10 +188,20 @@ def to_card(x: dict, kind: str) -> dict:
 
 
 # --------------------------
-# Crypto detection helpers
+# Crypto detection
 # --------------------------
+# Goal: catch both
+# - crypto ETFs/proxies via ticker (IBIT, FBTC, GBTC, ETHE, etc.)
+# - "direct crypto reporting" via text in asset description/name fields (Bitcoin, Ethereum, SOL, LINK, etc.)
+#
+# We do stricter token matching to reduce false positives.
 
-CRYPTO_MAP = {
+TOP_COINS = [
+    "BTC", "ETH", "SOL", "LINK", "XRP", "ADA", "DOGE", "AVAX", "MATIC", "BNB"
+]
+
+# Words/aliases per coin. We add boundaries for symbols to avoid partial matches.
+CRYPTO_ALIASES: Dict[str, List[str]] = {
     "BTC": ["bitcoin", "btc"],
     "ETH": ["ethereum", "eth", "ether"],
     "SOL": ["solana", "sol"],
@@ -198,35 +211,523 @@ CRYPTO_MAP = {
     "DOGE": ["dogecoin", "doge"],
     "AVAX": ["avalanche", "avax"],
     "MATIC": ["polygon", "matic"],
-    "BNB": ["bnb", "binance coin", "binance"],
+    "BNB": ["bnb", "binance coin"],
 }
 
-CRYPTO_LINKED_TICKERS = set([
-    "GBTC","ETHE","BITO","IBIT","FBTC","ARKB","BTCO","HODL",
-    "ETHA","ETHW","COIN","MSTR","RIOT","MARA","HUT","CLSK"
+# Known crypto-related tickers (ETFs, trusts, miners, exchanges, proxies)
+CRYPTO_RELATED_TICKERS = set([
+    # spot BTC ETFs and products
+    "IBIT", "FBTC", "ARKB", "BITB", "BTCO", "HODL", "GBTC", "BITO",
+    # ETH products
+    "ETHE", "ETHA",
+    # proxies / companies
+    "COIN", "MSTR", "RIOT", "MARA", "HUT", "CLSK",
 ])
 
+# Map tickers to coin tags where reasonable
+TICKER_TO_COINS: Dict[str, List[str]] = {
+    "IBIT": ["BTC"], "FBTC": ["BTC"], "ARKB": ["BTC"], "BITB": ["BTC"], "BTCO": ["BTC"], "HODL": ["BTC"],
+    "GBTC": ["BTC"], "BITO": ["BTC"],
+    "ETHE": ["ETH"], "ETHA": ["ETH"],
+    # proxies are crypto-linked rather than single coin, keep as CRYPTO-LINKED unless text adds coins
+    "COIN": ["CRYPTO-LINKED"], "MSTR": ["BTC", "CRYPTO-LINKED"], "RIOT": ["BTC", "CRYPTO-LINKED"],
+    "MARA": ["BTC", "CRYPTO-LINKED"], "HUT": ["BTC", "CRYPTO-LINKED"], "CLSK": ["BTC", "CRYPTO-LINKED"],
+}
 
-def detect_crypto_from_text(desc: str) -> List[str]:
-    if not desc:
+# Precompile regex patterns
+# For symbols like "SOL" we require word boundaries.
+# For words like "bitcoin" we just search case-insensitive.
+_CRYPTO_PATTERNS: Dict[str, List[re.Pattern]] = {}
+for sym, words in CRYPTO_ALIASES.items():
+    pats: List[re.Pattern] = []
+    for w in words:
+        # If it's an all-caps style symbol alias (btc, eth, sol, link, etc.), do word boundary.
+        # Otherwise plain contains match is usually safe (bitcoin, ethereum, chainlink).
+        if re.fullmatch(r"[a-z]{2,6}", w):
+            pats.append(re.compile(rf"\b{re.escape(w)}\b", re.IGNORECASE))
+        else:
+            pats.append(re.compile(re.escape(w), re.IGNORECASE))
+    _CRYPTO_PATTERNS[sym] = pats
+
+# Some additional generic hints that often show up in disclosures
+_GENERIC_CRYPTO_HINTS = [
+    re.compile(r"\bcryptocurrency\b", re.IGNORECASE),
+    re.compile(r"\bdigital asset\b", re.IGNORECASE),
+    re.compile(r"\bvirtual currency\b", re.IGNORECASE),
+]
+
+
+def collect_crypto_text(row: dict) -> str:
+    """
+    Pull every likely text field from Quiver rows.
+    If Quiver changes column names, this still catches most.
+    """
+    fields = [
+        "AssetDescription", "asset_description", "Description", "description",
+        "Asset", "asset", "Name", "name", "Issuer", "issuer",
+        "Ticker", "ticker", "Stock", "stock", "Symbol", "symbol",
+        "Owner", "owner", "Type", "type",
+    ]
+    parts = []
+    for f in fields:
+        v = row.get(f)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            parts.append(s)
+    return " | ".join(parts)
+
+
+def detect_coins(text: str) -> List[str]:
+    if not text:
         return []
-    d = desc.lower()
-    hits = []
-    for sym, words in CRYPTO_MAP.items():
-        for w in words:
-            if w in d:
+    hits: List[str] = []
+    for sym in TOP_COINS:
+        for pat in _CRYPTO_PATTERNS.get(sym, []):
+            if pat.search(text):
                 hits.append(sym)
                 break
-    # de-dupe, stable order by CRYPTO_MAP insertion
-    out = []
-    for sym in CRYPTO_MAP.keys():
+
+    # stable unique
+    out: List[str] = []
+    for sym in TOP_COINS:
         if sym in hits:
             out.append(sym)
     return out
 
 
+def has_generic_crypto_hint(text: str) -> bool:
+    if not text:
+        return False
+    return any(p.search(text) for p in _GENERIC_CRYPTO_HINTS)
+
+
+def classify_crypto_trade(ticker: str, text: str) -> Tuple[bool, List[str], str]:
+    """
+    Returns:
+      - is_crypto_related: bool
+      - coins: list of coin tags
+      - crypto_kind: "direct" | "etf_or_proxy" | "hint_only"
+    """
+    t = (ticker or "").upper().strip()
+    coins_from_text = detect_coins(text)
+    is_related_ticker = bool(t and t in CRYPTO_RELATED_TICKERS)
+    coins_from_ticker = TICKER_TO_COINS.get(t, []) if is_related_ticker else []
+
+    coins = []
+    # Merge, but keep TOP_COINS ordering and then CRYPTO-LINKED
+    merged = set(coins_from_text + coins_from_ticker)
+    for sym in TOP_COINS:
+        if sym in merged:
+            coins.append(sym)
+    if "CRYPTO-LINKED" in merged:
+        coins.append("CRYPTO-LINKED")
+
+    if coins_from_text:
+        return True, coins, "direct"
+    if is_related_ticker:
+        return True, coins if coins else ["CRYPTO-LINKED"], "etf_or_proxy"
+    if has_generic_crypto_hint(text):
+        return True, coins if coins else ["CRYPTO"], "hint_only"
+
+    return False, [], ""
+
+
+def counts_to_list(m: Dict[str, int]) -> List[dict]:
+    out = [{"symbol": k, "count": v} for k, v in m.items()]
+    out.sort(key=lambda x: (-x["count"], x["symbol"]))
+    return out
+
+
 # --------------------------
-# SEC EDGAR helpers (leaders)
+# Endpoint: Congress rolling window (30/180/365)
+# Accept both window_days and horizon_days so your frontend works.
+# --------------------------
+
+@app.get("/report/today")
+def report_today(
+    window_days: Optional[int] = Query(default=None, ge=1, le=365),
+    horizon_days: Optional[int] = Query(default=None, ge=1, le=365),
+):
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
+
+    # Frontend uses horizon_days, backend used window_days. Support both.
+    days = window_days if window_days is not None else horizon_days if horizon_days is not None else 30
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=days)
+
+    q = quiverquant.quiver(QUIVER_TOKEN)
+    df = q.congress_trading()
+
+    if df is None or len(df) == 0:
+        return {
+            "date": now.date().isoformat(),
+            "windowDays": days,
+            "windowStart": since.date().isoformat(),
+            "windowEnd": now.date().isoformat(),
+            "convergence": [],
+            "politicianBuys": [],
+            "politicianSells": [],
+            "crypto": {"buys": [], "sells": [], "rawBuys": [], "rawSells": [], "raw": []},
+        }
+
+    try:
+        rows = df.to_dict(orient="records")
+    except Exception:
+        rows = list(df)
+
+    buys: List[dict] = []
+    sells: List[dict] = []
+
+    # crypto details
+    crypto_counts_buy: Dict[str, int] = {}
+    crypto_counts_sell: Dict[str, int] = {}
+    crypto_raw: List[dict] = []
+    crypto_raw_buys: List[dict] = []
+    crypto_raw_sells: List[dict] = []
+
+    for r in rows:
+        best_dt = row_best_dt(r)
+        if best_dt is None:
+            continue
+        if best_dt < since or best_dt > now:
+            continue
+
+        party = norm_party_from_any(r)
+        if not party:
+            continue
+
+        tx = tx_text(r)
+        kind = "BUY" if is_buy(tx) else "SELL" if is_sell(tx) else ""
+        if not kind:
+            continue
+
+        ticker = norm_ticker(r)
+        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
+        chamber = str(pick_first(r, ["Chamber", "chamber", "Office", "office"], "")).strip()
+        amount = str(pick_first(r, ["Amount", "amount", "Range", "range", "AmountRange", "amount_range"], "")).strip()
+
+        filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
+        traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
+
+        desc = str(pick_first(r, ["AssetDescription", "asset_description", "Description", "description", "Asset", "asset"], "")).strip()
+
+        item = {
+            "ticker": ticker,
+            "party": party,
+            "filed": iso_date_only(filed_dt),
+            "traded": iso_date_only(traded_dt),
+            "politician": pol,
+            "chamber": chamber,
+            "amountRange": amount,
+            "best_dt": best_dt,
+            "description": desc,
+        }
+
+        # Normal equity-like trades bucket only if ticker exists
+        if ticker:
+            if kind == "BUY":
+                buys.append(item)
+            else:
+                sells.append(item)
+
+        # Crypto detection pass uses full text
+        text_blob = collect_crypto_text(r)
+        is_crypto, coins, crypto_kind = classify_crypto_trade(ticker, text_blob)
+
+        if is_crypto:
+            # count each coin tag
+            target_counts = crypto_counts_buy if kind == "BUY" else crypto_counts_sell
+            for c in coins if coins else ["CRYPTO"]:
+                target_counts[c] = target_counts.get(c, 0) + 1
+
+            rec = {
+                "kind": kind,
+                "coins": coins if coins else ["CRYPTO"],
+                "cryptoKind": crypto_kind,  # direct | etf_or_proxy | hint_only
+                "ticker": (ticker or "").upper(),
+                "description": desc,
+                "party": party,
+                "politician": pol,
+                "chamber": chamber,
+                "amountRange": amount,
+                "traded": iso_date_only(traded_dt),
+                "filed": iso_date_only(filed_dt),
+            }
+            crypto_raw.append(rec)
+            if kind == "BUY":
+                crypto_raw_buys.append(rec)
+            else:
+                crypto_raw_sells.append(rec)
+
+    buys.sort(key=lambda x: x["best_dt"], reverse=True)
+    sells.sort(key=lambda x: x["best_dt"], reverse=True)
+
+    buy_cards = [to_card(x, "BUY") for x in interleave(buys, 140)]
+    sell_cards = [to_card(x, "SELL") for x in interleave(sells, 140)]
+
+    # Convergence = overlap tickers on BUY inside window
+    dem_buy = [x for x in buys if x["party"] == "D"]
+    rep_buy = [x for x in buys if x["party"] == "R"]
+    overlap = set(x["ticker"] for x in dem_buy if x["ticker"]) & set(x["ticker"] for x in rep_buy if x["ticker"])
+
+    overlap_cards: List[dict] = []
+    for t in overlap:
+        dem_ct = sum(1 for x in dem_buy if x["ticker"] == t)
+        rep_ct = sum(1 for x in rep_buy if x["ticker"] == t)
+        latest_dt = None
+        for x in buys:
+            if x["ticker"] == t:
+                if latest_dt is None or x["best_dt"] > latest_dt:
+                    latest_dt = x["best_dt"]
+        overlap_cards.append({
+            "ticker": t,
+            "companyName": "",
+            "demBuyers": dem_ct,
+            "repBuyers": rep_ct,
+            "demSellers": 0,
+            "repSellers": 0,
+            "lastFiledAt": iso_date_only(latest_dt),
+            "strength": "OVERLAP",
+        })
+
+    overlap_cards.sort(key=lambda x: (-(x["demBuyers"] + x["repBuyers"]), x["ticker"]))
+
+    # Crypto sorts
+    crypto_raw.sort(key=lambda x: (x.get("filed") or x.get("traded") or ""), reverse=True)
+    crypto_raw_buys.sort(key=lambda x: (x.get("filed") or x.get("traded") or ""), reverse=True)
+    crypto_raw_sells.sort(key=lambda x: (x.get("filed") or x.get("traded") or ""), reverse=True)
+
+    crypto_payload = {
+        "buys": counts_to_list(crypto_counts_buy),
+        "sells": counts_to_list(crypto_counts_sell),
+        "rawBuys": crypto_raw_buys[:250],
+        "rawSells": crypto_raw_sells[:250],
+        "raw": crypto_raw[:500],
+        "topCoins": TOP_COINS,
+    }
+
+    return {
+        "date": now.date().isoformat(),
+        "windowDays": days,
+        "windowStart": since.date().isoformat(),
+        "windowEnd": now.date().isoformat(),
+        "convergence": overlap_cards[:25],
+        "politicianBuys": buy_cards,
+        "politicianSells": sell_cards,
+        "crypto": crypto_payload,
+    }
+
+
+@app.get("/report/crypto")
+def report_crypto(
+    window_days: Optional[int] = Query(default=None, ge=1, le=365),
+    horizon_days: Optional[int] = Query(default=None, ge=1, le=365),
+):
+    payload = report_today(window_days=window_days, horizon_days=horizon_days)
+    return {
+        "date": payload["date"],
+        "windowDays": payload["windowDays"],
+        "windowStart": payload["windowStart"],
+        "windowEnd": payload["windowEnd"],
+        "crypto": payload["crypto"],
+    }
+
+
+# --------------------------
+# 2-year performance (kept same, but accept both names)
+# --------------------------
+
+def stooq_symbol(ticker: str) -> str:
+    t = (ticker or "").strip().lower()
+    return f"{t}.us" if t else ""
+
+
+def fetch_close_stooq(ticker: str, start: datetime, end: datetime) -> List[Tuple[datetime, float]]:
+    sym = stooq_symbol(ticker)
+    if not sym:
+        return []
+    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    r = requests.get(url, timeout=15)
+    if r.status_code != 200 or "Date,Open" not in r.text:
+        return []
+    lines = r.text.strip().splitlines()
+    out = []
+    for line in lines[1:]:
+        parts = line.split(",")
+        if len(parts) < 5:
+            continue
+        d = parse_dt_any(parts[0])
+        if not d:
+            continue
+        d = d.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+        if d < start or d > end:
+            continue
+        try:
+            close = float(parts[4])
+        except Exception:
+            continue
+        out.append((d, close))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def nearest_close(series: List[Tuple[datetime, float]], target: datetime) -> Optional[float]:
+    if not series:
+        return None
+    for d, c in series:
+        if d >= target:
+            return c
+    return series[-1][1]
+
+
+@app.get("/report/performance-2y")
+def performance_2y(
+    horizon_days: Optional[int] = Query(default=None, ge=7, le=365),
+    window_days: Optional[int] = Query(default=None, ge=7, le=365),
+):
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
+
+    # Support both params, frontend uses horizon_days
+    days = horizon_days if horizon_days is not None else window_days if window_days is not None else 30
+
+    now = datetime.now(timezone.utc)
+    since2y = now - timedelta(days=730)
+
+    q = quiverquant.quiver(QUIVER_TOKEN)
+    df = q.congress_trading()
+
+    if df is None or len(df) == 0:
+        return {"date": now.date().isoformat(), "horizonDays": days, "leaders": []}
+
+    try:
+        rows = df.to_dict(orient="records")
+    except Exception:
+        rows = list(df)
+
+    trades: List[dict] = []
+    tickers_needed = set()
+
+    for r in rows:
+        best_dt = row_best_dt(r)
+        if not best_dt or best_dt < since2y or best_dt > now:
+            continue
+
+        party = norm_party_from_any(r)
+        if not party:
+            continue
+
+        tx = tx_text(r)
+        kind = "BUY" if is_buy(tx) else "SELL" if is_sell(tx) else ""
+        if not kind:
+            continue
+
+        ticker = norm_ticker(r)
+        if not ticker:
+            continue
+
+        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip() or "Unknown"
+        chamber = str(pick_first(r, ["Chamber", "chamber", "Office", "office"], "")).strip()
+
+        traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
+        filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
+
+        base_dt = traded_dt or filed_dt
+        if not base_dt:
+            continue
+
+        base_dt = base_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+        end_dt = base_dt + timedelta(days=days)
+        if end_dt > now:
+            continue
+
+        tickers_needed.add(ticker.upper())
+        trades.append({
+            "politician": pol,
+            "party": party,
+            "chamber": chamber,
+            "ticker": ticker.upper(),
+            "kind": kind,
+            "base_dt": base_dt,
+            "end_dt": end_dt,
+            "traded": iso_date_only(traded_dt),
+            "filed": iso_date_only(filed_dt),
+        })
+
+    if not trades:
+        return {"date": now.date().isoformat(), "horizonDays": days, "leaders": []}
+
+    price_cache: Dict[str, List[Tuple[datetime, float]]] = {}
+    min_start = since2y.replace(hour=0, minute=0, second=0, microsecond=0)
+    max_end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    for t in sorted(tickers_needed):
+        try:
+            price_cache[t] = fetch_close_stooq(t, min_start, max_end)
+        except Exception:
+            price_cache[t] = []
+
+    stats: Dict[str, dict] = {}
+    for tr in trades:
+        t = tr["ticker"]
+        series = price_cache.get(t) or []
+        p0 = nearest_close(series, tr["base_dt"])
+        p1 = nearest_close(series, tr["end_dt"])
+        if p0 is None or p1 is None or p0 <= 0:
+            continue
+
+        ret = (p1 - p0) / p0
+        if tr["kind"] == "SELL":
+            ret = -ret
+
+        key = tr["politician"]
+        cur = stats.get(key) or {
+            "name": key,
+            "party": tr["party"],
+            "chamber": tr["chamber"],
+            "tradeCount": 0,
+            "sumReturn": 0.0,
+            "avgReturn": 0.0,
+            "sample": [],
+        }
+        cur["tradeCount"] += 1
+        cur["sumReturn"] += ret
+        cur["avgReturn"] = cur["sumReturn"] / max(cur["tradeCount"], 1)
+
+        if len(cur["sample"]) < 5:
+            cur["sample"].append({
+                "ticker": t,
+                "kind": tr["kind"],
+                "traded": tr["traded"],
+                "filed": tr["filed"],
+                "scorePct": round(ret * 100, 2),
+            })
+
+        stats[key] = cur
+
+    leaders = list(stats.values())
+    leaders.sort(key=lambda x: (-(x["avgReturn"]), -x["tradeCount"], x["name"]))
+
+    for x in leaders:
+        x["avgReturnPct"] = round(x["avgReturn"] * 100, 2)
+
+    return {
+        "date": now.date().isoformat(),
+        "windowStart": since2y.date().isoformat(),
+        "windowEnd": now.date().isoformat(),
+        "horizonDays": days,
+        "leaders": leaders[:60],
+        "note": "2Y performance score. BUY uses forward return. SELL uses negative forward return over the selected horizon.",
+    }
+
+
+# --------------------------
+# SEC EDGAR endpoints (unchanged placeholders)
+# Keeping them because you already had them, but they are not needed for option A.
 # --------------------------
 
 def sec_get_json(url: str) -> dict:
@@ -308,7 +809,6 @@ def parse_form4_transactions(xml_text: str) -> List[dict]:
         elif tag.endswith("issuertradingsymbol"):
             symbol = (node.text or "").strip().upper()
 
-    # Collect transaction rows
     for tx in root.iter():
         if not tx.tag.lower().endswith("nonderivativetransaction"):
             continue
@@ -351,429 +851,6 @@ def parse_form4_transactions(xml_text: str) -> List[dict]:
     return out
 
 
-def aggregate_form4_by_ticker(txs: List[dict]) -> Tuple[List[dict], List[dict]]:
-    buy_map: Dict[str, int] = {}
-    sell_map: Dict[str, int] = {}
-    last_date: Dict[str, str] = {}
-
-    for t in txs:
-        sym = (t.get("ticker") or "").upper()
-        code = (t.get("code") or "").upper()
-        dt = (t.get("transactionDate") or "").strip()
-        if not sym:
-            continue
-
-        if dt:
-            last_date[sym] = max(last_date.get(sym, ""), dt)
-
-        if code == "P":
-            buy_map[sym] = buy_map.get(sym, 0) + 1
-        elif code == "S":
-            sell_map[sym] = sell_map.get(sym, 0) + 1
-
-    buys = [{"ticker": k, "count": v, "lastTrade": last_date.get(k, "")} for k, v in buy_map.items()]
-    sells = [{"ticker": k, "count": v, "lastTrade": last_date.get(k, "")} for k, v in sell_map.items()]
-
-    buys.sort(key=lambda x: (-x["count"], x["ticker"]))
-    sells.sort(key=lambda x: (-x["count"], x["ticker"]))
-
-    return buys, sells
-
-
-# --------------------------
-# Endpoint: Congress rolling window (30, 180, 365)
-# --------------------------
-
-@app.get("/report/today")
-def report_today(window_days: int = Query(30, ge=1, le=365)):
-    if not QUIVER_TOKEN:
-        raise HTTPException(500, "QUIVER_TOKEN missing")
-
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(days=window_days)
-
-    q = quiverquant.quiver(QUIVER_TOKEN)
-    df = q.congress_trading()
-
-    if df is None or len(df) == 0:
-        return {
-            "date": now.date().isoformat(),
-            "windowDays": window_days,
-            "windowStart": since.date().isoformat(),
-            "windowEnd": now.date().isoformat(),
-            "convergence": [],
-            "politicianBuys": [],
-            "politicianSells": [],
-            "crypto": {"buys": [], "sells": [], "raw": []},
-            "ethers": {"buys": [], "sells": [], "raw": []},
-        }
-
-    try:
-        rows = df.to_dict(orient="records")
-    except Exception:
-        rows = list(df)
-
-    buys: List[dict] = []
-    sells: List[dict] = []
-
-    crypto_raw: List[dict] = []
-    crypto_coin_counts = {"BUY": {}, "SELL": {}}
-
-    for r in rows:
-        best_dt = row_best_dt(r)
-        if best_dt is None:
-            continue
-        if best_dt < since or best_dt > now:
-            continue
-
-        party = norm_party_from_any(r)
-        if not party:
-            continue
-
-        tx = tx_text(r)
-        kind = "BUY" if is_buy(tx) else "SELL" if is_sell(tx) else ""
-        if not kind:
-            continue
-
-        ticker = norm_ticker(r)
-        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
-        chamber = str(pick_first(r, ["Chamber", "chamber", "Office", "office"], "")).strip()
-        amount = str(pick_first(r, ["Amount", "amount", "Range", "range", "AmountRange", "amount_range"], "")).strip()
-
-        filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
-        traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
-
-        desc = str(pick_first(r, ["AssetDescription", "asset_description", "Description", "description", "Asset", "asset"], "")).strip()
-
-        item = {
-            "ticker": ticker,
-            "party": party,
-            "filed": iso_date_only(filed_dt),
-            "traded": iso_date_only(traded_dt),
-            "politician": pol,
-            "chamber": chamber,
-            "amountRange": amount,
-            "best_dt": best_dt,
-            "description": desc,
-        }
-
-        # Normal equity trades bucket (only if ticker present)
-        if ticker:
-            if kind == "BUY":
-                buys.append(item)
-            else:
-                sells.append(item)
-
-        # Crypto detection: from either ticker (crypto-linked tickers) OR description (direct coin mentions)
-        coins = detect_crypto_from_text(desc)
-        is_linked = (ticker.upper() in CRYPTO_LINKED_TICKERS) if ticker else False
-
-        if coins or is_linked:
-            # If linked but no coin keyword, label as "CRYPTO-LINKED"
-            tag_coins = coins if coins else (["CRYPTO-LINKED"] if is_linked else [])
-            for c in tag_coins:
-                m = crypto_coin_counts[kind]
-                m[c] = m.get(c, 0) + 1
-
-            crypto_raw.append({
-                "kind": kind,
-                "coins": tag_coins,
-                "ticker": ticker,
-                "description": desc,
-                "party": party,
-                "politician": pol,
-                "chamber": chamber,
-                "amountRange": amount,
-                "traded": iso_date_only(traded_dt),
-                "filed": iso_date_only(filed_dt),
-            })
-
-    buys.sort(key=lambda x: x["best_dt"], reverse=True)
-    sells.sort(key=lambda x: x["best_dt"], reverse=True)
-
-    buy_cards = [to_card(x, "BUY") for x in interleave(buys, 140)]
-    sell_cards = [to_card(x, "SELL") for x in interleave(sells, 140)]
-
-    # Convergence = overlap tickers on BUY inside window
-    dem_buy = [x for x in buys if x["party"] == "D"]
-    rep_buy = [x for x in buys if x["party"] == "R"]
-
-    overlap = set(x["ticker"] for x in dem_buy if x["ticker"]) & set(x["ticker"] for x in rep_buy if x["ticker"])
-
-    overlap_cards: List[dict] = []
-    for t in overlap:
-        dem_ct = sum(1 for x in dem_buy if x["ticker"] == t)
-        rep_ct = sum(1 for x in rep_buy if x["ticker"] == t)
-        latest_dt = None
-        for x in buys:
-            if x["ticker"] == t:
-                if latest_dt is None or x["best_dt"] > latest_dt:
-                    latest_dt = x["best_dt"]
-        overlap_cards.append({
-            "ticker": t,
-            "companyName": "",
-            "demBuyers": dem_ct,
-            "repBuyers": rep_ct,
-            "demSellers": 0,
-            "repSellers": 0,
-            "lastFiledAt": iso_date_only(latest_dt),
-            "strength": "OVERLAP",
-        })
-
-    overlap_cards.sort(key=lambda x: (-(x["demBuyers"] + x["repBuyers"]), x["ticker"]))
-
-    # Build crypto summary lists
-    def counts_to_list(m: Dict[str, int]) -> List[dict]:
-        out = [{"symbol": k, "count": v} for k, v in m.items()]
-        out.sort(key=lambda x: (-x["count"], x["symbol"]))
-        return out
-
-    crypto_summary = {
-        "buys": counts_to_list(crypto_coin_counts["BUY"]),
-        "sells": counts_to_list(crypto_coin_counts["SELL"]),
-        "raw": crypto_raw[:250],
-    }
-
-    # ETH slice
-    eth_raw = [r for r in crypto_raw if ("ETH" in r.get("coins", []) or "CRYPTO-LINKED" in r.get("coins", [])) and ("eth" in (r.get("description") or "").lower() or r.get("ticker","").upper() in {"ETHE","ETHA"})]
-    eth_buy_ct: Dict[str, int] = {}
-    eth_sell_ct: Dict[str, int] = {}
-    for r in eth_raw:
-        for c in r.get("coins", []) or ["ETH"]:
-            if r["kind"] == "BUY":
-                eth_buy_ct[c] = eth_buy_ct.get(c, 0) + 1
-            else:
-                eth_sell_ct[c] = eth_sell_ct.get(c, 0) + 1
-
-    ethers_summary = {
-        "buys": counts_to_list(eth_buy_ct),
-        "sells": counts_to_list(eth_sell_ct),
-        "raw": eth_raw[:250],
-    }
-
-    return {
-        "date": now.date().isoformat(),
-        "windowDays": window_days,
-        "windowStart": since.date().isoformat(),
-        "windowEnd": now.date().isoformat(),
-        "convergence": overlap_cards[:25],
-        "politicianBuys": buy_cards,
-        "politicianSells": sell_cards,
-        "crypto": crypto_summary,
-        "ethers": ethers_summary,
-    }
-
-
-@app.get("/report/crypto")
-def report_crypto(window_days: int = Query(30, ge=1, le=365)):
-    payload = report_today(window_days=window_days)
-    return {
-        "date": payload["date"],
-        "windowDays": payload["windowDays"],
-        "windowStart": payload["windowStart"],
-        "windowEnd": payload["windowEnd"],
-        "crypto": payload["crypto"],
-    }
-
-
-@app.get("/report/ethers")
-def report_ethers(window_days: int = Query(30, ge=1, le=365)):
-    payload = report_today(window_days=window_days)
-    return {
-        "date": payload["date"],
-        "windowDays": payload["windowDays"],
-        "windowStart": payload["windowStart"],
-        "windowEnd": payload["windowEnd"],
-        "ethers": payload["ethers"],
-    }
-
-
-# --------------------------
-# Endpoint: 2-year performance
-# --------------------------
-
-def stooq_symbol(ticker: str) -> str:
-    t = (ticker or "").strip().lower()
-    return f"{t}.us" if t else ""
-
-
-def fetch_close_stooq(ticker: str, start: datetime, end: datetime) -> List[Tuple[datetime, float]]:
-    sym = stooq_symbol(ticker)
-    if not sym:
-        return []
-    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-    r = requests.get(url, timeout=15)
-    if r.status_code != 200 or "Date,Open" not in r.text:
-        return []
-    lines = r.text.strip().splitlines()
-    out = []
-    for line in lines[1:]:
-        parts = line.split(",")
-        if len(parts) < 5:
-            continue
-        d = parse_dt_any(parts[0])
-        if not d:
-            continue
-        d = d.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-        if d < start or d > end:
-            continue
-        try:
-            close = float(parts[4])
-        except Exception:
-            continue
-        out.append((d, close))
-    out.sort(key=lambda x: x[0])
-    return out
-
-
-def nearest_close(series: List[Tuple[datetime, float]], target: datetime) -> Optional[float]:
-    if not series:
-        return None
-    for d, c in series:
-        if d >= target:
-            return c
-    return series[-1][1]
-
-
-@app.get("/report/performance-2y")
-def performance_2y(horizon_days: int = Query(30, ge=7, le=365)):
-    if not QUIVER_TOKEN:
-        raise HTTPException(500, "QUIVER_TOKEN missing")
-
-    now = datetime.now(timezone.utc)
-    since2y = now - timedelta(days=730)
-
-    q = quiverquant.quiver(QUIVER_TOKEN)
-    df = q.congress_trading()
-
-    if df is None or len(df) == 0:
-        return {"date": now.date().isoformat(), "horizonDays": horizon_days, "leaders": []}
-
-    try:
-        rows = df.to_dict(orient="records")
-    except Exception:
-        rows = list(df)
-
-    trades: List[dict] = []
-    tickers_needed = set()
-
-    for r in rows:
-        best_dt = row_best_dt(r)
-        if not best_dt or best_dt < since2y or best_dt > now:
-            continue
-
-        party = norm_party_from_any(r)
-        if not party:
-            continue
-
-        tx = tx_text(r)
-        kind = "BUY" if is_buy(tx) else "SELL" if is_sell(tx) else ""
-        if not kind:
-            continue
-
-        ticker = norm_ticker(r)
-        if not ticker:
-            continue
-
-        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip() or "Unknown"
-        chamber = str(pick_first(r, ["Chamber", "chamber", "Office", "office"], "")).strip()
-
-        traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
-        filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
-
-        base_dt = traded_dt or filed_dt
-        if not base_dt:
-            continue
-
-        base_dt = base_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-        end_dt = base_dt + timedelta(days=horizon_days)
-        if end_dt > now:
-            continue
-
-        tickers_needed.add(ticker.upper())
-        trades.append({
-            "politician": pol,
-            "party": party,
-            "chamber": chamber,
-            "ticker": ticker.upper(),
-            "kind": kind,
-            "base_dt": base_dt,
-            "end_dt": end_dt,
-            "traded": iso_date_only(traded_dt),
-            "filed": iso_date_only(filed_dt),
-        })
-
-    if not trades:
-        return {"date": now.date().isoformat(), "horizonDays": horizon_days, "leaders": []}
-
-    price_cache: Dict[str, List[Tuple[datetime, float]]] = {}
-    min_start = since2y.replace(hour=0, minute=0, second=0, microsecond=0)
-    max_end = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    for t in sorted(tickers_needed):
-        try:
-            price_cache[t] = fetch_close_stooq(t, min_start, max_end)
-        except Exception:
-            price_cache[t] = []
-
-    stats: Dict[str, dict] = {}
-    for tr in trades:
-        t = tr["ticker"]
-        series = price_cache.get(t) or []
-        p0 = nearest_close(series, tr["base_dt"])
-        p1 = nearest_close(series, tr["end_dt"])
-        if p0 is None or p1 is None or p0 <= 0:
-            continue
-
-        ret = (p1 - p0) / p0
-        if tr["kind"] == "SELL":
-            ret = -ret
-
-        key = tr["politician"]
-        cur = stats.get(key) or {
-            "name": key,
-            "party": tr["party"],
-            "chamber": tr["chamber"],
-            "tradeCount": 0,
-            "sumReturn": 0.0,
-            "avgReturn": 0.0,
-            "sample": [],
-        }
-        cur["tradeCount"] += 1
-        cur["sumReturn"] += ret
-        cur["avgReturn"] = cur["sumReturn"] / max(cur["tradeCount"], 1)
-
-        if len(cur["sample"]) < 5:
-            cur["sample"].append({
-                "ticker": t,
-                "kind": tr["kind"],
-                "traded": tr["traded"],
-                "filed": tr["filed"],
-                "scorePct": round(ret * 100, 2),
-            })
-
-        stats[key] = cur
-
-    leaders = list(stats.values())
-    leaders.sort(key=lambda x: (-(x["avgReturn"]), -x["tradeCount"], x["name"]))
-
-    for x in leaders:
-        x["avgReturnPct"] = round(x["avgReturn"] * 100, 2)
-
-    return {
-        "date": now.date().isoformat(),
-        "windowStart": since2y.date().isoformat(),
-        "windowEnd": now.date().isoformat(),
-        "horizonDays": horizon_days,
-        "leaders": leaders[:60],
-        "note": "2Y performance score. BUY uses forward return. SELL uses negative forward return over the selected horizon.",
-    }
-
-
-# --------------------------
-# Endpoint: Public leaders (SEC EDGAR)
-# --------------------------
-
 @app.get("/report/public-leaders")
 def report_public_leaders():
     now = datetime.now(timezone.utc)
@@ -812,34 +889,23 @@ def report_public_leaders():
                 try:
                     xml_text = sec_get_text(primary_url)
                     txs = parse_form4_transactions(xml_text)
-                    buys_by_ticker, sells_by_ticker = aggregate_form4_by_ticker(txs)
-
-                    buy_ct = sum(x["count"] for x in buys_by_ticker)
-                    sell_ct = sum(x["count"] for x in sells_by_ticker)
-
-                    if buy_ct and not sell_ct:
+                    buys = [t for t in txs if (t.get("code") or "").upper() == "P"]
+                    sells = [t for t in txs if (t.get("code") or "").upper() == "S"]
+                    if buys and not sells:
                         label = "BUY"
-                    elif sell_ct and not buy_ct:
+                    elif sells and not buys:
                         label = "SELL"
-                    elif buy_ct and sell_ct:
+                    elif buys and sells:
                         label = "MIXED"
                     else:
                         label = "FORM4"
-
-                    details = {
-                        "buyTickers": buys_by_ticker[:15],
-                        "sellTickers": sells_by_ticker[:15],
-                        "buyCount": buy_ct,
-                        "sellCount": sell_ct,
-                    }
+                    details = {"transactions": txs[:20], "buyCount": len(buys), "sellCount": len(sells)}
                 except Exception:
                     label = "FORM4"
 
             if form.startswith("13F"):
                 label = "13F FILED"
-                details = {
-                    "note": "13F is quarterly. This endpoint shows filing events. Computing true buys/sells requires comparing consecutive 13F tables.",
-                }
+                details = {"note": "13F is quarterly and not a direct trade feed."}
 
             events.append({
                 "form": form,
@@ -855,11 +921,7 @@ def report_public_leaders():
 
             time.sleep(0.2)
 
-        results.append({
-            "name": leader["name"],
-            "cik": cik10(cik),
-            "events": events,
-        })
+        results.append({"name": leader["name"], "cik": cik10(cik), "events": events})
 
     return {
         "date": now.date().isoformat(),
@@ -867,5 +929,5 @@ def report_public_leaders():
         "windowStart": since365.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "leaders": results,
-        "note": "Form 4 includes buy/sell tickers aggregated by transaction count. 13F is shown as filing events.",
+        "note": "This endpoint is separate from congress crypto extraction (Option A uses Quiver only).",
     }
