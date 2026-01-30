@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +7,6 @@ import quiverquant
 
 app = FastAPI(title="Finance Signals Backend")
 
-# Allow your GitHub Pages frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://hijazss.github.io"],
@@ -20,28 +20,69 @@ QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
 def root():
     return {"status": "ok"}
 
-def _norm_party(p: str) -> str:
-    s = (p or "").strip().lower()
-    if "dem" in s:
-        return "D"
-    if "rep" in s:
-        return "R"
+_party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
+
+def norm_party_from_any(row: dict) -> str:
+    # 1) Direct Party column if present
+    for k in ["Party", "party"]:
+        v = row.get(k)
+        if v:
+            s = str(v).strip().upper()
+            if s.startswith("D"):
+                return "D"
+            if s.startswith("R"):
+                return "R"
+
+    # 2) Parse from Politician field like "Gilbert Cisneros House / D"
+    for k in ["Politician", "politician", "Representative", "Senator", "Name", "name"]:
+        v = row.get(k)
+        if not v:
+            continue
+        s = str(v)
+        m = _party_re.search(s)
+        if m:
+            return m.group(1).upper()
+
+        # fallback: endswith " D" / " R"
+        s2 = s.strip().upper()
+        if s2.endswith(" D"):
+            return "D"
+        if s2.endswith(" R"):
+            return "R"
+
     return ""
 
-def _is_purchase(tx: str) -> bool:
-    s = (tx or "").strip().lower()
-    return ("purchase" in s) or ("buy" in s)
+def norm_ticker(row: dict) -> str:
+    # Quiver python-api shows congress_trading() exists; fields vary.  [oai_citation:1‡GitHub](https://github.com/Quiver-Quantitative/python-api)
+    for k in ["Ticker", "ticker", "Stock", "stock", "Symbol", "symbol"]:
+        v = row.get(k)
+        if not v:
+            continue
+        s = str(v).strip().upper()
 
-def _first_existing(d: dict, keys: list[str], default=None):
+        # If "Stock" is a combined field, try to grab leading ticker token
+        # Example rows often show "APG API GROUP..." where first token is ticker.  [oai_citation:2‡Quiver Quantitative](https://www.quiverquant.com/congresstrading/stock/APG?utm_source=chatgpt.com)
+        first = s.split()[0]
+        if 1 <= len(first) <= 6 and first.isalnum():
+            return first
+        return s
+    return ""
+
+def is_purchase(row: dict) -> bool:
+    for k in ["Transaction", "transaction", "TransactionType", "Type", "type"]:
+        v = row.get(k)
+        if not v:
+            continue
+        s = str(v).lower()
+        if "purchase" in s or "buy" in s:
+            return True
+    return False
+
+def pick_first(row: dict, keys: list[str], default=""):
     for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
+        if k in row and row[k] is not None:
+            return row[k]
     return default
-
-def _to_float_range(amount_str: str):
-    # Quiver often provides ranges like "$1,001 - $15,000"
-    # We will keep it simple and just return the raw string.
-    return (amount_str or "").strip()
 
 @app.get("/report/today")
 def report_today():
@@ -49,9 +90,8 @@ def report_today():
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
     q = quiverquant.quiver(QUIVER_TOKEN)
+    df = q.congress_trading()  # should return recent trades  [oai_citation:3‡GitHub](https://github.com/Quiver-Quantitative/python-api)
 
-    # Pull the latest congress trading table
-    df = q.congress_trading()
     if df is None or len(df) == 0:
         return {
             "date": datetime.now(timezone.utc).date().isoformat(),
@@ -60,80 +100,86 @@ def report_today():
             "fundSignals": [],
         }
 
-    # Convert dataframe rows to dicts, without depending on pandas explicitly
+    # dataframe -> list[dict]
     try:
         rows = df.to_dict(orient="records")
     except Exception:
-        # Fallback if df isn't a pandas DF for some reason
         rows = list(df)
 
-    # Normalize columns across possible Quiver formats
-    normalized = []
+    items = []
     for r in rows:
-        ticker = str(_first_existing(r, ["Ticker", "ticker"], "") or "").upper().strip()
-        party = _norm_party(str(_first_existing(r, ["Party", "party"], "") or ""))
-        tx = str(_first_existing(r, ["Transaction", "TransactionType", "Type", "transaction"], "") or "")
-        is_buy = _is_purchase(tx)
-
-        # Date columns vary
-        filed = _first_existing(r, ["ReportDate", "report_date", "Date", "date", "TransactionDate", "transaction_date"], "")
-        # Amount columns vary
-        amount = _first_existing(r, ["Amount", "amount", "Range", "range"], "")
-
-        # Optional politician name
-        pol = _first_existing(r, ["Representative", "Senator", "Politician", "Name", "name"], "")
-
+        ticker = norm_ticker(r)
+        party = norm_party_from_any(r)
         if not ticker or not party:
             continue
-        if not is_buy:
+        if not is_purchase(r):
             continue
 
-        normalized.append({
+        filed = str(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], "")).strip()
+        traded = str(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], "")).strip()
+        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
+        desc = str(pick_first(r, ["Description", "description"], "")).strip()
+
+        items.append({
             "ticker": ticker,
-            "party": party,  # "D" or "R"
-            "filed": str(filed or "").strip(),
-            "amount": _to_float_range(str(amount or "")),
-            "politician": str(pol or "").strip(),
+            "party": party,          # D or R
+            "filed": filed,
+            "traded": traded,
+            "politician": pol,
+            "description": desc,
         })
 
-    # Sort newest first if we have a usable date; otherwise keep order
-    def sort_key(x):
-        # Try ISO dates first, fall back to string
-        return x["filed"] or ""
+    # If Quiver returned data but we filtered too hard, surface that (helps debugging)
+    if not items:
+        return {
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "convergence": [],
+            "bipartisanTickers": [],
+            "fundSignals": [],
+            "note": "No purchases matched after parsing. Check raw columns via /debug/columns and /debug/sample."
+        }
 
-    normalized.sort(key=sort_key, reverse=True)
+    # Sort by filed (string sort works fine for many formats, otherwise it’s still “recent-ish”)
+    items.sort(key=lambda x: x["filed"], reverse=True)
 
-    dem_buys = [x for x in normalized if x["party"] == "D"]
-    rep_buys = [x for x in normalized if x["party"] == "R"]
+    dem = [x for x in items if x["party"] == "D"]
+    rep = [x for x in items if x["party"] == "R"]
 
-    # Build "latest buys" cards for your frontend
+    # Build cards for frontend
     def card_from(x):
-        # Keep fields your frontend already knows
         return {
             "ticker": x["ticker"],
-            "companyName": "",
+            "companyName": x["politician"],  # shows who made the trade (useful immediately)
             "demBuyers": 1 if x["party"] == "D" else 0,
             "repBuyers": 1 if x["party"] == "R" else 0,
             "funds": [],
-            "lastFiledAt": x["filed"],
-            "strength": "LIVE",
+            "lastFiledAt": x["filed"] or x["traded"],
+            "strength": "BUY",
         }
 
-    # Build overlap tickers (bonus section)
-    dem_tickers = set(x["ticker"] for x in dem_buys)
-    rep_tickers = set(x["ticker"] for x in rep_buys)
-    overlap = sorted(list(dem_tickers.intersection(rep_tickers)))
+    # Interleave Dem + Rep so it feels “both sides”
+    mixed = []
+    for i in range(0, 30):
+        if i < len(dem):
+            mixed.append(card_from(dem[i]))
+        if i < len(rep):
+            mixed.append(card_from(rep[i]))
+        if len(mixed) >= 60:
+            break
+
+    # Overlap tickers (bonus)
+    dem_t = set(x["ticker"] for x in dem)
+    rep_t = set(x["ticker"] for x in rep)
+    overlap = sorted(list(dem_t.intersection(rep_t)))
 
     overlap_cards = []
-    for t in overlap[:25]:
-        # Count number of buys by each side for that ticker in this pull
-        dem_ct = sum(1 for x in dem_buys if x["ticker"] == t)
-        rep_ct = sum(1 for x in rep_buys if x["ticker"] == t)
+    for t in overlap[:20]:
+        dem_ct = sum(1 for x in dem if x["ticker"] == t)
+        rep_ct = sum(1 for x in rep if x["ticker"] == t)
         last = ""
-        # Get latest filed date we saw for this ticker
-        for x in normalized:
-            if x["ticker"] == t and x["filed"]:
-                last = x["filed"]
+        for x in items:
+            if x["ticker"] == t and (x["filed"] or x["traded"]):
+                last = x["filed"] or x["traded"]
                 break
         overlap_cards.append({
             "ticker": t,
@@ -145,22 +191,34 @@ def report_today():
             "strength": "OVERLAP",
         })
 
-    # Option A output mapping:
-    # - convergence: show the OVERLAP tickers (when they exist)
-    # - bipartisanTickers: show latest buys from BOTH sides (mixed list)
-    latest_mixed = []
-    # Interleave D and R so the list looks "both sides" on screen
-    for i in range(0, 20):
-        if i < len(dem_buys):
-            latest_mixed.append(card_from(dem_buys[i]))
-        if i < len(rep_buys):
-            latest_mixed.append(card_from(rep_buys[i]))
-        if len(latest_mixed) >= 40:
-            break
-
     return {
         "date": datetime.now(timezone.utc).date().isoformat(),
-        "convergence": overlap_cards[:10],
-        "bipartisanTickers": latest_mixed[:40],
+        "convergence": overlap_cards,
+        "bipartisanTickers": mixed,
         "fundSignals": [],
     }
+
+# Optional debug helpers (no frontend changes needed)
+@app.get("/debug/columns")
+def debug_columns():
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
+    q = quiverquant.quiver(QUIVER_TOKEN)
+    df = q.congress_trading()
+    try:
+        cols = list(df.columns)
+    except Exception:
+        cols = []
+    return {"columns": cols}
+
+@app.get("/debug/sample")
+def debug_sample():
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
+    q = quiverquant.quiver(QUIVER_TOKEN)
+    df = q.congress_trading()
+    try:
+        rows = df.to_dict(orient="records")[:5]
+    except Exception:
+        rows = []
+    return {"sample": rows}
