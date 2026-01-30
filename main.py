@@ -187,20 +187,63 @@ def to_card(x: dict, kind: str) -> dict:
     }
 
 
+def aggregate_by_ticker(items: List[dict], kind: str) -> List[dict]:
+    """
+    Build full-window aggregates by ticker so the KPI dashboard changes
+    meaningfully between 30D / 180D / 365D.
+    """
+    agg: Dict[str, dict] = {}
+
+    for x in items:
+        t = (x.get("ticker") or "").upper().strip()
+        if not t:
+            continue
+
+        cur = agg.get(t)
+        if not cur:
+            cur = {
+                "ticker": t,
+                "companyName": "",
+                "demBuyers": 0, "repBuyers": 0,
+                "demSellers": 0, "repSellers": 0,
+                "lastFiledAt": "",
+            }
+            agg[t] = cur
+
+        party = (x.get("party") or "").upper().strip()
+        if kind == "BUY":
+            if party == "D":
+                cur["demBuyers"] += 1
+            elif party == "R":
+                cur["repBuyers"] += 1
+        else:
+            if party == "D":
+                cur["demSellers"] += 1
+            elif party == "R":
+                cur["repSellers"] += 1
+
+        last = x.get("filed") or x.get("traded") or ""
+        if last and last > (cur["lastFiledAt"] or ""):
+            cur["lastFiledAt"] = last
+
+    out = list(agg.values())
+    out.sort(
+        key=lambda r: -(
+            (r["demBuyers"] + r["repBuyers"]) +
+            (r["demSellers"] + r["repSellers"])
+        )
+    )
+    return out
+
+
 # --------------------------
 # Crypto detection
 # --------------------------
-# Goal: catch both
-# - crypto ETFs/proxies via ticker (IBIT, FBTC, GBTC, ETHE, etc.)
-# - "direct crypto reporting" via text in asset description/name fields (Bitcoin, Ethereum, SOL, LINK, etc.)
-#
-# We do stricter token matching to reduce false positives.
 
 TOP_COINS = [
     "BTC", "ETH", "SOL", "LINK", "XRP", "ADA", "DOGE", "AVAX", "MATIC", "BNB"
 ]
 
-# Words/aliases per coin. We add boundaries for symbols to avoid partial matches.
 CRYPTO_ALIASES: Dict[str, List[str]] = {
     "BTC": ["bitcoin", "btc"],
     "ETH": ["ethereum", "eth", "ether"],
@@ -214,42 +257,30 @@ CRYPTO_ALIASES: Dict[str, List[str]] = {
     "BNB": ["bnb", "binance coin"],
 }
 
-# Known crypto-related tickers (ETFs, trusts, miners, exchanges, proxies)
 CRYPTO_RELATED_TICKERS = set([
-    # spot BTC ETFs and products
     "IBIT", "FBTC", "ARKB", "BITB", "BTCO", "HODL", "GBTC", "BITO",
-    # ETH products
     "ETHE", "ETHA",
-    # proxies / companies
     "COIN", "MSTR", "RIOT", "MARA", "HUT", "CLSK",
 ])
 
-# Map tickers to coin tags where reasonable
 TICKER_TO_COINS: Dict[str, List[str]] = {
     "IBIT": ["BTC"], "FBTC": ["BTC"], "ARKB": ["BTC"], "BITB": ["BTC"], "BTCO": ["BTC"], "HODL": ["BTC"],
     "GBTC": ["BTC"], "BITO": ["BTC"],
     "ETHE": ["ETH"], "ETHA": ["ETH"],
-    # proxies are crypto-linked rather than single coin, keep as CRYPTO-LINKED unless text adds coins
     "COIN": ["CRYPTO-LINKED"], "MSTR": ["BTC", "CRYPTO-LINKED"], "RIOT": ["BTC", "CRYPTO-LINKED"],
     "MARA": ["BTC", "CRYPTO-LINKED"], "HUT": ["BTC", "CRYPTO-LINKED"], "CLSK": ["BTC", "CRYPTO-LINKED"],
 }
 
-# Precompile regex patterns
-# For symbols like "SOL" we require word boundaries.
-# For words like "bitcoin" we just search case-insensitive.
 _CRYPTO_PATTERNS: Dict[str, List[re.Pattern]] = {}
 for sym, words in CRYPTO_ALIASES.items():
     pats: List[re.Pattern] = []
     for w in words:
-        # If it's an all-caps style symbol alias (btc, eth, sol, link, etc.), do word boundary.
-        # Otherwise plain contains match is usually safe (bitcoin, ethereum, chainlink).
         if re.fullmatch(r"[a-z]{2,6}", w):
             pats.append(re.compile(rf"\b{re.escape(w)}\b", re.IGNORECASE))
         else:
             pats.append(re.compile(re.escape(w), re.IGNORECASE))
     _CRYPTO_PATTERNS[sym] = pats
 
-# Some additional generic hints that often show up in disclosures
 _GENERIC_CRYPTO_HINTS = [
     re.compile(r"\bcryptocurrency\b", re.IGNORECASE),
     re.compile(r"\bdigital asset\b", re.IGNORECASE),
@@ -258,10 +289,6 @@ _GENERIC_CRYPTO_HINTS = [
 
 
 def collect_crypto_text(row: dict) -> str:
-    """
-    Pull every likely text field from Quiver rows.
-    If Quiver changes column names, this still catches most.
-    """
     fields = [
         "AssetDescription", "asset_description", "Description", "description",
         "Asset", "asset", "Name", "name", "Issuer", "issuer",
@@ -289,7 +316,6 @@ def detect_coins(text: str) -> List[str]:
                 hits.append(sym)
                 break
 
-    # stable unique
     out: List[str] = []
     for sym in TOP_COINS:
         if sym in hits:
@@ -304,20 +330,14 @@ def has_generic_crypto_hint(text: str) -> bool:
 
 
 def classify_crypto_trade(ticker: str, text: str) -> Tuple[bool, List[str], str]:
-    """
-    Returns:
-      - is_crypto_related: bool
-      - coins: list of coin tags
-      - crypto_kind: "direct" | "etf_or_proxy" | "hint_only"
-    """
     t = (ticker or "").upper().strip()
     coins_from_text = detect_coins(text)
     is_related_ticker = bool(t and t in CRYPTO_RELATED_TICKERS)
     coins_from_ticker = TICKER_TO_COINS.get(t, []) if is_related_ticker else []
 
-    coins = []
-    # Merge, but keep TOP_COINS ordering and then CRYPTO-LINKED
     merged = set(coins_from_text + coins_from_ticker)
+    coins: List[str] = []
+
     for sym in TOP_COINS:
         if sym in merged:
             coins.append(sym)
@@ -342,7 +362,7 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 # --------------------------
 # Endpoint: Congress rolling window (30/180/365)
-# Accept both window_days and horizon_days so your frontend works.
+# Accept both window_days and horizon_days.
 # --------------------------
 
 @app.get("/report/today")
@@ -353,7 +373,6 @@ def report_today(
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    # Frontend uses horizon_days, backend used window_days. Support both.
     days = window_days if window_days is not None else horizon_days if horizon_days is not None else 30
 
     now = datetime.now(timezone.utc)
@@ -371,7 +390,10 @@ def report_today(
             "convergence": [],
             "politicianBuys": [],
             "politicianSells": [],
+            "tickerBuysAgg": [],
+            "tickerSellsAgg": [],
             "crypto": {"buys": [], "sells": [], "rawBuys": [], "rawSells": [], "raw": []},
+            "debug": {"totalBuysInWindow": 0, "totalSellsInWindow": 0, "returnedBuyCards": 0, "returnedSellCards": 0},
         }
 
     try:
@@ -382,7 +404,6 @@ def report_today(
     buys: List[dict] = []
     sells: List[dict] = []
 
-    # crypto details
     crypto_counts_buy: Dict[str, int] = {}
     crypto_counts_sell: Dict[str, int] = {}
     crypto_raw: List[dict] = []
@@ -427,19 +448,16 @@ def report_today(
             "description": desc,
         }
 
-        # Normal equity-like trades bucket only if ticker exists
         if ticker:
             if kind == "BUY":
                 buys.append(item)
             else:
                 sells.append(item)
 
-        # Crypto detection pass uses full text
         text_blob = collect_crypto_text(r)
         is_crypto, coins, crypto_kind = classify_crypto_trade(ticker, text_blob)
 
         if is_crypto:
-            # count each coin tag
             target_counts = crypto_counts_buy if kind == "BUY" else crypto_counts_sell
             for c in coins if coins else ["CRYPTO"]:
                 target_counts[c] = target_counts.get(c, 0) + 1
@@ -447,7 +465,7 @@ def report_today(
             rec = {
                 "kind": kind,
                 "coins": coins if coins else ["CRYPTO"],
-                "cryptoKind": crypto_kind,  # direct | etf_or_proxy | hint_only
+                "cryptoKind": crypto_kind,
                 "ticker": (ticker or "").upper(),
                 "description": desc,
                 "party": party,
@@ -469,7 +487,9 @@ def report_today(
     buy_cards = [to_card(x, "BUY") for x in interleave(buys, 140)]
     sell_cards = [to_card(x, "SELL") for x in interleave(sells, 140)]
 
-    # Convergence = overlap tickers on BUY inside window
+    ticker_buys_agg = aggregate_by_ticker(buys, "BUY")
+    ticker_sells_agg = aggregate_by_ticker(sells, "SELL")
+
     dem_buy = [x for x in buys if x["party"] == "D"]
     rep_buy = [x for x in buys if x["party"] == "R"]
     overlap = set(x["ticker"] for x in dem_buy if x["ticker"]) & set(x["ticker"] for x in rep_buy if x["ticker"])
@@ -496,7 +516,6 @@ def report_today(
 
     overlap_cards.sort(key=lambda x: (-(x["demBuyers"] + x["repBuyers"]), x["ticker"]))
 
-    # Crypto sorts
     crypto_raw.sort(key=lambda x: (x.get("filed") or x.get("traded") or ""), reverse=True)
     crypto_raw_buys.sort(key=lambda x: (x.get("filed") or x.get("traded") or ""), reverse=True)
     crypto_raw_sells.sort(key=lambda x: (x.get("filed") or x.get("traded") or ""), reverse=True)
@@ -516,9 +535,23 @@ def report_today(
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "convergence": overlap_cards[:25],
+
+        # recent-card lists (interleaved by party)
         "politicianBuys": buy_cards,
         "politicianSells": sell_cards,
+
+        # full-window ticker aggregates (used for KPI/dashboard ranking)
+        "tickerBuysAgg": ticker_buys_agg[:500],
+        "tickerSellsAgg": ticker_sells_agg[:500],
+
         "crypto": crypto_payload,
+
+        "debug": {
+            "totalBuysInWindow": len(buys),
+            "totalSellsInWindow": len(sells),
+            "returnedBuyCards": len(buy_cards),
+            "returnedSellCards": len(sell_cards),
+        },
     }
 
 
@@ -538,7 +571,7 @@ def report_crypto(
 
 
 # --------------------------
-# 2-year performance (kept same, but accept both names)
+# 2-year performance
 # --------------------------
 
 def stooq_symbol(ticker: str) -> str:
@@ -592,7 +625,6 @@ def performance_2y(
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    # Support both params, frontend uses horizon_days
     days = horizon_days if horizon_days is not None else window_days if window_days is not None else 30
 
     now = datetime.now(timezone.utc)
@@ -727,7 +759,6 @@ def performance_2y(
 
 # --------------------------
 # SEC EDGAR endpoints (unchanged placeholders)
-# Keeping them because you already had them, but they are not needed for option A.
 # --------------------------
 
 def sec_get_json(url: str) -> dict:
