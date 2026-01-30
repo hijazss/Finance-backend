@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import quiverquant
 
+
 app = FastAPI(title="Finance Signals Backend")
 
 app.add_middleware(
@@ -20,24 +21,18 @@ app.add_middleware(
 )
 
 QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
+SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY", "")
 
-# SEC requires identifying User-Agent (include contact email)
 SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "FinanceApp/1.0 (contact: hijazss@gmail.com)")
 SEC_TIMEOUT = 20
 
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
-# --------------------------
-# In-memory caches (Render instance local)
-# --------------------------
 
-# Price cache: { "TICKER": (cached_at_dt, [(date, close), ...]) }
-PRICE_CACHE: Dict[str, Tuple[datetime, List[Tuple[datetime, float]]]] = {}
-PRICE_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
-
-# Congress trades cache to avoid re-fetching from Quiver repeatedly
-CONGRESS_CACHE: Tuple[Optional[datetime], Optional[List[dict]]] = (None, None)
-CONGRESS_CACHE_TTL_SECONDS = 5 * 60  # 5 minutes
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
 
 # --------------------------
@@ -52,10 +47,6 @@ def pick_first(row: dict, keys: List[str], default=""):
 
 
 def parse_dt_any(v: Any) -> Optional[datetime]:
-    """
-    Robust date parsing for Quiver rows:
-    supports ISO, 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM:SS', and common US formats like 'MM/DD/YYYY'.
-    """
     if v is None:
         return None
     if isinstance(v, datetime):
@@ -87,7 +78,6 @@ def parse_dt_any(v: Any) -> Optional[datetime]:
             return dt.replace(tzinfo=timezone.utc)
         except Exception:
             continue
-
     return None
 
 
@@ -193,324 +183,42 @@ def to_card(x: dict, kind: str) -> dict:
         "amountRange": x.get("amountRange", ""),
         "traded": x.get("traded", ""),
         "filed": x.get("filed", ""),
+        "description": x.get("description", ""),
     }
 
 
 # --------------------------
-# Quiver fetch with caching
+# Congress rolling window
+# Supports 30 / 180 / 365 by query param
 # --------------------------
 
-def fetch_congress_rows_cached() -> List[dict]:
-    global CONGRESS_CACHE
-    cached_at, cached_rows = CONGRESS_CACHE
-
-    now = datetime.now(timezone.utc)
-    if cached_at and cached_rows and (now - cached_at).total_seconds() < CONGRESS_CACHE_TTL_SECONDS:
-        return cached_rows
-
+@app.get("/report/today")
+def report_today(window_days: int = Query(30, ge=1, le=365)):
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=window_days)
 
     q = quiverquant.quiver(QUIVER_TOKEN)
     df = q.congress_trading()
 
     if df is None or len(df) == 0:
-        CONGRESS_CACHE = (now, [])
-        return []
-
-    try:
-        rows = df.to_dict(orient="records")
-    except Exception:
-        rows = list(df)
-
-    CONGRESS_CACHE = (now, rows)
-    return rows
-
-
-# --------------------------
-# SEC EDGAR helpers
-# --------------------------
-
-def sec_get_json(url: str) -> dict:
-    headers = {
-        "User-Agent": SEC_USER_AGENT,
-        "Accept-Encoding": "gzip, deflate",
-        "Host": "data.sec.gov",
-    }
-    r = requests.get(url, headers=headers, timeout=SEC_TIMEOUT)
-    if r.status_code != 200:
-        raise HTTPException(502, f"SEC fetch failed HTTP {r.status_code} for {url}")
-    return r.json()
-
-
-def sec_get_text(url: str) -> str:
-    headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
-    r = requests.get(url, headers=headers, timeout=SEC_TIMEOUT)
-    if r.status_code != 200:
-        raise HTTPException(502, f"SEC fetch failed HTTP {r.status_code} for {url}")
-    return r.text
-
-
-def cik10(cik: str) -> str:
-    s = re.sub(r"\D", "", str(cik).strip())
-    return s.zfill(10)
-
-
-def accession_no_dashes(acc: str) -> str:
-    return (acc or "").replace("-", "").strip()
-
-
-def build_filing_index_url(cik: str, accession: str) -> str:
-    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dashes(accession)}/{accession}-index.html"
-
-
-def build_primary_doc_url(cik: str, accession: str, primary_doc: str) -> str:
-    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dashes(accession)}/{primary_doc}"
-
-
-def pull_recent_filings_for_cik(cik: str) -> dict:
-    url = f"https://data.sec.gov/submissions/CIK{cik10(cik)}.json"
-    return sec_get_json(url)
-
-
-def extract_latest_filings(submissions: dict, forms_allow: List[str], max_items: int = 20) -> List[dict]:
-    filings = (submissions.get("filings") or {}).get("recent") or {}
-    forms = filings.get("form") or []
-    accs = filings.get("accessionNumber") or []
-    primary_docs = filings.get("primaryDocument") or []
-    filed_dates = filings.get("filingDate") or []
-
-    out = []
-    for i in range(min(len(forms), len(accs), len(primary_docs), len(filed_dates))):
-        form = str(forms[i])
-        if form not in forms_allow:
-            continue
-        out.append(
-            {
-                "form": form,
-                "accession": str(accs[i]),
-                "primaryDocument": str(primary_docs[i]),
-                "filingDate": str(filed_dates[i]),
-            }
-        )
-
-    out.sort(key=lambda x: x.get("filingDate", ""), reverse=True)
-    return out[:max_items]
-
-
-def parse_form4_transactions(xml_text: str) -> List[dict]:
-    """
-    Parse Form 4 XML into per-transaction rows:
-      - issuerName, issuerTradingSymbol
-      - transactionDate
-      - code P/S
-      - shares, price
-    """
-    out: List[dict] = []
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception:
-        return out
-
-    issuer = ""
-    symbol = ""
-
-    for node in root.iter():
-        t = node.tag.lower()
-        if t.endswith("issuername"):
-            issuer = (node.text or "").strip()
-        elif t.endswith("issuertradingsymbol"):
-            symbol = (node.text or "").strip().upper()
-
-    # Collect non-derivative transactions
-    for tx in root.iter():
-        if not tx.tag.lower().endswith("nonderivativetransaction"):
-            continue
-
-        code = ""
-        date = ""
-        shares = ""
-        price = ""
-
-        for node in tx.iter():
-            t = node.tag.lower()
-
-            if t.endswith("transactioncode"):
-                code = (node.text or "").strip().upper()
-
-            if t.endswith("transactiondate"):
-                for c in node.iter():
-                    if c.tag.lower().endswith("value"):
-                        date = (c.text or "").strip()
-
-            if t.endswith("transactionshares"):
-                for c in node.iter():
-                    if c.tag.lower().endswith("value"):
-                        shares = (c.text or "").strip()
-
-            if t.endswith("transactionpricepershare"):
-                for c in node.iter():
-                    if c.tag.lower().endswith("value"):
-                        price = (c.text or "").strip()
-
-        if code in ["P", "S"]:
-            out.append(
-                {
-                    "issuerName": issuer,
-                    "ticker": symbol,
-                    "code": code,  # P or S
-                    "transactionDate": date,
-                    "shares": shares,
-                    "price": price,
-                }
-            )
-
-    return out
-
-
-def parse_13f_info_table(xml_text: str) -> List[dict]:
-    """
-    Parse 13F information table XML holdings.
-    Returns list of holdings. This usually uses CUSIP, not ticker.
-    """
-    out: List[dict] = []
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception:
-        return out
-
-    for node in root.iter():
-        if node.tag.lower().endswith("infotable"):
-            rec = {"nameOfIssuer": "", "cusip": "", "value": "", "sshPrnamt": ""}
-            for c in node.iter():
-                t = c.tag.lower()
-                if t.endswith("nameofissuer"):
-                    rec["nameOfIssuer"] = (c.text or "").strip()
-                elif t.endswith("cusip"):
-                    rec["cusip"] = (c.text or "").strip()
-                elif t.endswith("value"):
-                    rec["value"] = (c.text or "").strip()
-                elif t.endswith("sshprnamt"):
-                    rec["sshPrnamt"] = (c.text or "").strip()
-            if rec["nameOfIssuer"] or rec["cusip"]:
-                out.append(rec)
-
-    def val_num(x):
-        try:
-            return float(str(x.get("value", "")).replace(",", ""))
-        except Exception:
-            return 0.0
-
-    out.sort(key=val_num, reverse=True)
-    return out
-
-
-# --------------------------
-# Prices for performance (Stooq)
-# --------------------------
-
-def stooq_symbol(ticker: str) -> str:
-    t = (ticker or "").strip().lower()
-    if not t:
-        return ""
-    return f"{t}.us"
-
-
-def fetch_close_stooq(ticker: str) -> List[Tuple[datetime, float]]:
-    """
-    Fetch full daily close series from Stooq CSV.
-    Returns list of (date, close) sorted by date asc.
-    Cached by ticker with TTL.
-    """
-    t = (ticker or "").strip().upper()
-    if not t:
-        return []
-
-    now = datetime.now(timezone.utc)
-    cached = PRICE_CACHE.get(t)
-    if cached:
-        cached_at, series = cached
-        if (now - cached_at).total_seconds() < PRICE_CACHE_TTL_SECONDS:
-            return series
-
-    sym = stooq_symbol(t)
-    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-
-    # Stooq can occasionally be slow; keep timeout tight to avoid Render timeouts.
-    r = requests.get(url, timeout=12)
-    if r.status_code != 200 or "Date,Open" not in r.text:
-        PRICE_CACHE[t] = (now, [])
-        return []
-
-    lines = r.text.strip().splitlines()
-    out: List[Tuple[datetime, float]] = []
-    for line in lines[1:]:
-        parts = line.split(",")
-        if len(parts) < 5:
-            continue
-        d = parse_dt_any(parts[0])
-        if not d:
-            continue
-        d = d.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-        try:
-            close = float(parts[4])
-        except Exception:
-            continue
-        out.append((d, close))
-
-    out.sort(key=lambda x: x[0])
-    PRICE_CACHE[t] = (now, out)
-    return out
-
-
-def nearest_close(series: List[Tuple[datetime, float]], target: datetime) -> Optional[float]:
-    if not series:
-        return None
-    for d, c in series:
-        if d >= target:
-            return c
-    return series[-1][1]
-
-
-# --------------------------
-# Root
-# --------------------------
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
-
-
-# --------------------------
-# Endpoint: Congress rolling window (supports horizon_days OR window_days)
-# --------------------------
-
-@app.get("/report/today")
-def report_today(
-    horizon_days: Optional[int] = Query(None, ge=1, le=365),
-    window_days: Optional[int] = Query(None, ge=1, le=365),
-):
-    # Accept either query param name. Frontend currently uses horizon_days.
-    days = horizon_days or window_days or 30
-    days = int(days)
-
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(days=days)
-
-    rows = fetch_congress_rows_cached()
-
-    if not rows:
         return {
             "date": now.date().isoformat(),
-            "windowDays": days,
+            "windowDays": window_days,
             "windowStart": since.date().isoformat(),
             "windowEnd": now.date().isoformat(),
             "convergence": [],
             "politicianBuys": [],
             "politicianSells": [],
-            "cryptoDirect": [],
-            "cryptoLinked": [],
+            "cryptoDisclosures": {"direct": [], "linked": []},
         }
+
+    try:
+        rows = df.to_dict(orient="records")
+    except Exception:
+        rows = list(df)
 
     buys: List[dict] = []
     sells: List[dict] = []
@@ -518,16 +226,22 @@ def report_today(
     crypto_linked: List[dict] = []
 
     crypto_words = [
-        "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "dogecoin", "doge",
-        "litecoin", "ltc", "xrp", "ripple", "avax", "polygon", "matic", "bnb",
-        "binance", "cardano", "ada",
+        "bitcoin", "btc",
+        "ethereum", "eth",
+        "solana", "sol",
+        "chainlink", "link",
+        "dogecoin", "doge",
+        "litecoin", "ltc",
+        "xrp", "ripple",
+        "avalanche", "avax",
+        "polygon", "matic",
+        "bnb", "binance",
+        "cardano", "ada",
     ]
 
-    # Crypto-linked tickers, can expand anytime
     crypto_linked_tickers = {
-        "COIN","MSTR","RIOT","MARA","HUT","CLSK",
-        "GBTC","ETHE","IBIT","FBTC","ARKB","BITO","BTCO","HODL","BITB",
-        "ETHA",
+        "GBTC","ETHE","IBIT","FBTC","ARKB","BITO","BTCO","HODL","BTF",
+        "MSTR","COIN"
     }
 
     for r in rows:
@@ -547,20 +261,14 @@ def report_today(
             continue
 
         ticker = norm_ticker(r)
-        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
-        chamber = str(pick_first(r, ["Chamber", "chamber", "Office", "office"], "")).strip()
-        amount = str(pick_first(r, ["Amount", "amount", "Range", "range", "AmountRange", "amount_range"], "")).strip()
+        pol = str(pick_first(r, ["Politician","politician","Representative","Senator","Name","name"], "")).strip()
+        chamber = str(pick_first(r, ["Chamber","chamber","Office","office"], "")).strip()
+        amount = str(pick_first(r, ["Amount","amount","Range","range","AmountRange","amount_range"], "")).strip()
 
-        filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
-        traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
+        filed_dt = parse_dt_any(pick_first(r, ["Filed","filed","ReportDate","report_date","Date","date"], ""))
+        traded_dt = parse_dt_any(pick_first(r, ["Traded","traded","TransactionDate","transaction_date"], ""))
 
-        desc = str(
-            pick_first(
-                r,
-                ["AssetDescription", "asset_description", "Description", "description", "Asset", "asset"],
-                "",
-            )
-        ).strip()
+        desc = str(pick_first(r, ["AssetDescription","asset_description","Description","description","Asset","asset"], "")).strip()
         desc_l = desc.lower()
 
         item = {
@@ -575,7 +283,6 @@ def report_today(
             "description": desc,
         }
 
-        # Equity-like trades bucket
         if ticker:
             if kind == "BUY":
                 buys.append(item)
@@ -583,37 +290,30 @@ def report_today(
                 sells.append(item)
 
             if ticker in crypto_linked_tickers:
-                crypto_linked.append(item)
+                crypto_linked.append({**item, "kind": kind})
 
-        # Attempt to detect direct crypto mentions even when no ticker
         if desc and any(w in desc_l for w in crypto_words):
             sym = ""
-            if ("bitcoin" in desc_l) or ("btc" in desc_l):
+            if "bitcoin" in desc_l or "btc" in desc_l:
                 sym = "BTC"
-            elif ("ethereum" in desc_l) or ("eth" in desc_l):
+            elif "ethereum" in desc_l or "eth" in desc_l:
                 sym = "ETH"
-            elif ("solana" in desc_l) or (" sol" in desc_l):
+            elif "solana" in desc_l or "sol" in desc_l:
                 sym = "SOL"
-            elif ("dogecoin" in desc_l) or ("doge" in desc_l):
-                sym = "DOGE"
-            elif ("xrp" in desc_l) or ("ripple" in desc_l):
-                sym = "XRP"
-            elif ("cardano" in desc_l) or (" ada" in desc_l):
-                sym = "ADA"
+            elif "chainlink" in desc_l or "link" in desc_l:
+                sym = "LINK"
 
-            crypto_direct.append(
-                {
-                    "crypto": sym or "CRYPTO",
-                    "description": desc,
-                    "party": party,
-                    "politician": pol,
-                    "chamber": chamber,
-                    "amountRange": amount,
-                    "traded": iso_date_only(traded_dt),
-                    "filed": iso_date_only(filed_dt),
-                    "kind": kind,
-                }
-            )
+            crypto_direct.append({
+                "crypto": sym or "CRYPTO",
+                "description": desc,
+                "party": party,
+                "politician": pol,
+                "chamber": chamber,
+                "amountRange": amount,
+                "traded": iso_date_only(traded_dt),
+                "filed": iso_date_only(filed_dt),
+                "kind": kind,
+            })
 
     buys.sort(key=lambda x: x["best_dt"], reverse=True)
     sells.sort(key=lambda x: x["best_dt"], reverse=True)
@@ -621,7 +321,6 @@ def report_today(
     buy_cards = [to_card(x, "BUY") for x in interleave(buys, 120)]
     sell_cards = [to_card(x, "SELL") for x in interleave(sells, 120)]
 
-    # Convergence = overlapping tickers on BUY within window
     dem_buy = [x for x in buys if x["party"] == "D" and x.get("ticker")]
     rep_buy = [x for x in buys if x["party"] == "R" and x.get("ticker")]
     overlap = set(x["ticker"] for x in dem_buy) & set(x["ticker"] for x in rep_buy)
@@ -635,383 +334,284 @@ def report_today(
             if x.get("ticker") == t:
                 if latest_dt is None or x["best_dt"] > latest_dt:
                     latest_dt = x["best_dt"]
-        overlap_cards.append(
-            {
-                "ticker": t,
-                "companyName": "",
-                "demBuyers": dem_ct,
-                "repBuyers": rep_ct,
-                "demSellers": 0,
-                "repSellers": 0,
-                "funds": [],
-                "lastFiledAt": iso_date_only(latest_dt),
-                "strength": "OVERLAP",
-            }
-        )
+        overlap_cards.append({
+            "ticker": t,
+            "companyName": "",
+            "demBuyers": dem_ct,
+            "repBuyers": rep_ct,
+            "demSellers": 0,
+            "repSellers": 0,
+            "funds": [],
+            "lastFiledAt": iso_date_only(latest_dt),
+            "strength": "OVERLAP",
+        })
 
     overlap_cards.sort(key=lambda x: (-(x["demBuyers"] + x["repBuyers"]), x["ticker"]))
 
     crypto_direct.sort(key=lambda x: (x.get("filed") or ""), reverse=True)
-    crypto_linked.sort(key=lambda x: x.get("best_dt") or datetime(1970, 1, 1, tzinfo=timezone.utc), reverse=True)
+    crypto_linked.sort(key=lambda x: x.get("best_dt") or datetime(1970,1,1,tzinfo=timezone.utc), reverse=True)
 
     return {
         "date": now.date().isoformat(),
-        "windowDays": days,
+        "windowDays": window_days,
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "convergence": overlap_cards[:25],
         "politicianBuys": buy_cards,
         "politicianSells": sell_cards,
-        "cryptoDirect": crypto_direct[:200],
-        "cryptoLinked": crypto_linked[:200],
+        "cryptoDisclosures": {
+            "direct": crypto_direct[:300],
+            "linked": crypto_linked[:300],
+        },
     }
 
 
 # --------------------------
-# Endpoint: 2-year performance (stable)
+# Top-10 crypto list (programmatic)
 # --------------------------
 
-@app.get("/report/performance-2y")
-def performance_2y(horizon_days: int = Query(30, ge=7, le=365)):
+def fetch_top10_crypto() -> List[dict]:
     """
-    Computes a simple performance score per politician from the past 2 years:
-      - BUY: forward return from base date to base+horizon_days
-      - SELL: negative forward return (selling before upside is bad; before downside is good)
-    Equal-weight per trade, prices via Stooq.
-
-    Stability improvements:
-      - Limit number of trades processed
-      - Limit tickers priced
-      - Cache Stooq series in memory
+    Uses CoinGecko markets endpoint for a simple top-10 by market cap.
+    No key required for basic usage.
     """
-    if not QUIVER_TOKEN:
-        raise HTTPException(500, "QUIVER_TOKEN missing")
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": 10,
+        "page": 1,
+        "sparkline": "false",
+    }
+    r = requests.get(url, params=params, timeout=15)
+    if r.status_code != 200:
+        return []
+    data = r.json()
+    out = []
+    for x in data:
+        out.append({
+            "id": x.get("id",""),
+            "symbol": str(x.get("symbol","")).upper(),
+            "name": x.get("name",""),
+            "marketCap": x.get("market_cap", None),
+        })
+    return out
 
+
+# --------------------------
+# On-chain: BTC via mempool.space
+# --------------------------
+
+def btc_address_txs(address: str) -> List[dict]:
+    address = address.strip()
+    if not address:
+        return []
+    url = f"https://mempool.space/api/address/{address}/txs"
+    r = requests.get(url, timeout=20)
+    if r.status_code != 200:
+        return []
+    txs = r.json()
+    out = []
+    for tx in txs:
+        status = tx.get("status", {}) or {}
+        block_time = status.get("block_time")
+        ts = None
+        if block_time:
+            ts = datetime.fromtimestamp(int(block_time), tz=timezone.utc)
+        out.append({
+            "hash": tx.get("txid",""),
+            "timestamp": ts.isoformat() if ts else "",
+            "confirmed": bool(status.get("confirmed", False)),
+        })
+    return out
+
+
+# --------------------------
+# On-chain: ETH + ERC20 via Etherscan
+# --------------------------
+
+def etherscan_get(params: Dict[str, str]) -> dict:
+    if not ETHERSCAN_API_KEY:
+        raise HTTPException(500, "ETHERSCAN_API_KEY missing")
+    base = "https://api.etherscan.io/api"
+    p = dict(params)
+    p["apikey"] = ETHERSCAN_API_KEY
+    r = requests.get(base, params=p, timeout=25)
+    if r.status_code != 200:
+        raise HTTPException(502, f"Etherscan HTTP {r.status_code}")
+    return r.json()
+
+
+def eth_normal_txs(address: str) -> List[dict]:
+    js = etherscan_get({
+        "module": "account",
+        "action": "txlist",
+        "address": address,
+        "startblock": "0",
+        "endblock": "99999999",
+        "sort": "desc",
+    })
+    if str(js.get("status")) != "1":
+        return []
+    out = []
+    for t in js.get("result", [])[:1000]:
+        ts = datetime.fromtimestamp(int(t.get("timeStamp","0")), tz=timezone.utc)
+        out.append({
+            "hash": t.get("hash",""),
+            "timestamp": ts.isoformat(),
+            "from": t.get("from",""),
+            "to": t.get("to",""),
+            "valueWei": t.get("value","0"),
+            "isError": t.get("isError","0"),
+        })
+    return out
+
+
+def eth_erc20_txs(address: str, contract: Optional[str] = None) -> List[dict]:
+    params = {
+        "module": "account",
+        "action": "tokentx",
+        "address": address,
+        "page": "1",
+        "offset": "1000",
+        "sort": "desc",
+    }
+    if contract:
+        params["contractaddress"] = contract
+    js = etherscan_get(params)
+    if str(js.get("status")) != "1":
+        return []
+    out = []
+    for t in js.get("result", []):
+        ts = datetime.fromtimestamp(int(t.get("timeStamp","0")), tz=timezone.utc)
+        out.append({
+            "hash": t.get("hash",""),
+            "timestamp": ts.isoformat(),
+            "from": t.get("from",""),
+            "to": t.get("to",""),
+            "tokenSymbol": t.get("tokenSymbol",""),
+            "tokenName": t.get("tokenName",""),
+            "contract": t.get("contractAddress",""),
+            "value": t.get("value",""),
+            "decimals": t.get("tokenDecimal",""),
+        })
+    return out
+
+
+# Chainlink ERC-20 contract on Ethereum mainnet
+LINK_CONTRACT = "0x514910771AF9Ca656af840dff83E8264EcF986CA"
+
+
+# --------------------------
+# On-chain: SOL (Solscan Pro if key, else Solana JSON-RPC)
+# --------------------------
+
+def solana_rpc(method: str, params: list) -> dict:
+    url = "https://api.mainnet-beta.solana.com"
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    }
+    r = requests.post(url, json=payload, timeout=25)
+    if r.status_code != 200:
+        return {}
+    return r.json()
+
+
+def sol_signatures(address: str, limit: int = 50) -> List[dict]:
+    js = solana_rpc("getSignaturesForAddress", [address, {"limit": limit}])
+    res = (js.get("result") or [])
+    out = []
+    for x in res:
+        bt = x.get("blockTime")
+        ts = ""
+        if bt:
+            ts = datetime.fromtimestamp(int(bt), tz=timezone.utc).isoformat()
+        out.append({
+            "signature": x.get("signature",""),
+            "timestamp": ts,
+            "err": x.get("err", None),
+        })
+    return out
+
+
+# --------------------------
+# On-chain aggregation endpoint
+# --------------------------
+
+def filter_window(items: List[dict], window_start: datetime, ts_key: str) -> List[dict]:
+    out = []
+    for x in items:
+        ts = x.get(ts_key, "")
+        dt = parse_dt_any(ts)
+        if dt and dt >= window_start:
+            out.append(x)
+    return out
+
+
+@app.get("/report/crypto-onchain")
+def crypto_onchain(
+    window_days: int = Query(30, ge=1, le=365),
+    btc_addresses: str = Query("", description="Comma-separated BTC addresses"),
+    eth_addresses: str = Query("", description="Comma-separated ETH addresses"),
+    sol_addresses: str = Query("", description="Comma-separated SOL addresses"),
+):
+    """
+    True on-chain wallet monitor.
+    You must provide address lists. This does NOT infer politician wallets.
+    Returns activity in the last N days for:
+      - BTC transactions (mempool.space)
+      - ETH normal tx + LINK ERC20 transfers (Etherscan)
+      - SOL recent signatures (Solana RPC)
+    """
     now = datetime.now(timezone.utc)
-    since2y = now - timedelta(days=730)
+    since = now - timedelta(days=window_days)
 
-    rows = fetch_congress_rows_cached()
-    if not rows:
-        return {"date": now.date().isoformat(), "horizonDays": horizon_days, "leaders": []}
+    btc_list = [x.strip() for x in (btc_addresses or "").split(",") if x.strip()]
+    eth_list = [x.strip() for x in (eth_addresses or "").split(",") if x.strip()]
+    sol_list = [x.strip() for x in (sol_addresses or "").split(",") if x.strip()]
 
-    trades: List[dict] = []
-    ticker_counts: Dict[str, int] = {}
-
-    # First pass: collect trades in last 2 years
-    for r in rows:
-        best_dt = row_best_dt(r)
-        if not best_dt:
-            continue
-        if best_dt < since2y or best_dt > now:
-            continue
-
-        party = norm_party_from_any(r)
-        if not party:
-            continue
-
-        tx = tx_text(r)
-        kind = "BUY" if is_buy(tx) else "SELL" if is_sell(tx) else ""
-        if not kind:
-            continue
-
-        ticker = norm_ticker(r)
-        if not ticker:
-            continue
-
-        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
-        chamber = str(pick_first(r, ["Chamber", "chamber", "Office", "office"], "")).strip()
-
-        traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
-        filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
-
-        base_dt = traded_dt or filed_dt
-        if not base_dt:
-            continue
-
-        base_dt = base_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-        end_dt = base_dt + timedelta(days=horizon_days)
-        if end_dt > now:
-            continue
-
-        t = ticker.upper()
-        ticker_counts[t] = ticker_counts.get(t, 0) + 1
-
-        trades.append(
-            {
-                "politician": pol or "Unknown",
-                "party": party,
-                "chamber": chamber,
-                "ticker": t,
-                "kind": kind,
-                "base_dt": base_dt,
-                "end_dt": end_dt,
-                "traded": iso_date_only(traded_dt),
-                "filed": iso_date_only(filed_dt),
-            }
-        )
-
-    if not trades:
-        return {"date": now.date().isoformat(), "horizonDays": horizon_days, "leaders": []}
-
-    # Hard limits for stability on Render
-    MAX_TRADES = 2200
-    MAX_TICKERS = 70
-
-    # Keep most frequent tickers only
-    top_tickers = sorted(ticker_counts.items(), key=lambda x: x[1], reverse=True)[:MAX_TICKERS]
-    allowed_tickers = set(t for t, _ in top_tickers)
-
-    trades = [tr for tr in trades if tr["ticker"] in allowed_tickers][:MAX_TRADES]
-
-    # Fetch price series once per ticker (cached)
-    price_series: Dict[str, List[Tuple[datetime, float]]] = {}
-    for t in sorted(allowed_tickers):
-        try:
-            series = fetch_close_stooq(t)
-            price_series[t] = series
-        except Exception:
-            price_series[t] = []
-
-    # Score per politician
-    stats: Dict[str, dict] = {}
-    for tr in trades:
-        t = tr["ticker"]
-        series = price_series.get(t) or []
-        p0 = nearest_close(series, tr["base_dt"])
-        p1 = nearest_close(series, tr["end_dt"])
-        if p0 is None or p1 is None or p0 <= 0:
-            continue
-
-        ret = (p1 - p0) / p0
-        if tr["kind"] == "SELL":
-            ret = -ret
-
-        key = tr["politician"]
-        cur = stats.get(key) or {
-            "name": key,
-            "party": tr["party"],
-            "chamber": tr["chamber"],
-            "tradeCount": 0,
-            "sumReturn": 0.0,
-            "avgReturn": 0.0,
-            "avgReturnPct": 0.0,
-            "sample": [],
-        }
-
-        cur["tradeCount"] += 1
-        cur["sumReturn"] += ret
-        cur["avgReturn"] = cur["sumReturn"] / max(cur["tradeCount"], 1)
-        cur["avgReturnPct"] = round(cur["avgReturn"] * 100, 2)
-
-        if len(cur["sample"]) < 5:
-            cur["sample"].append(
-                {
-                    "ticker": t,
-                    "kind": tr["kind"],
-                    "traded": tr["traded"],
-                    "filed": tr["filed"],
-                    "horizonDays": horizon_days,
-                    "scorePct": round(ret * 100, 2),
-                }
-            )
-
-        stats[key] = cur
-
-    leaders = list(stats.values())
-    # Require at least a few trades to reduce noise
-    leaders = [x for x in leaders if x.get("tradeCount", 0) >= 3]
-    leaders.sort(key=lambda x: (-(x["avgReturn"]), -x["tradeCount"], x["name"]))
-
-    return {
+    result = {
         "date": now.date().isoformat(),
-        "windowStart": since2y.date().isoformat(),
+        "windowDays": window_days,
+        "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
-        "horizonDays": horizon_days,
-        "leaders": leaders[:60],
-        "note": (
-            "Performance is a simple equal-weight score from 2y of trades. "
-            "BUY uses forward return; SELL uses negative forward return over the selected horizon. "
-            "Ticker universe is limited for stability."
-        ),
+        "top10": fetch_top10_crypto(),
+        "btc": [],
+        "eth": [],
+        "sol": [],
+        "note": "On-chain monitoring requires wallet addresses. Congress disclosures do not provide wallet addresses.",
     }
 
+    # BTC
+    for addr in btc_list[:25]:
+        txs = btc_address_txs(addr)
+        txs = filter_window(txs, since, "timestamp")
+        result["btc"].append({"address": addr, "txs": txs[:200]})
+        time.sleep(0.15)
 
-# --------------------------
-# Endpoint: Public leaders (SEC EDGAR) enriched
-# --------------------------
+    # ETH + LINK
+    for addr in eth_list[:25]:
+        normal = eth_normal_txs(addr)
+        normal = filter_window(normal, since, "timestamp")
 
-@app.get("/report/public-leaders")
-def report_public_leaders():
-    """
-    Returns recent SEC filings for curated public figures/funds.
-    - Form 4: parses XML to list tickers and buy/sell transactions (P/S)
-    - 13F: parses info table and compares newest vs prior 13F within the pulled list (CUSIP deltas)
-    """
-    now = datetime.now(timezone.utc)
-    since365 = now - timedelta(days=365)
+        link = eth_erc20_txs(addr, LINK_CONTRACT)
+        link = filter_window(link, since, "timestamp")
 
-    leaders = [
-        {"key": "musk", "name": "Elon Musk", "cik": "1494730", "forms": ["4", "4/A"]},
-        {"key": "berkshire", "name": "Berkshire Hathaway", "cik": "1067983", "forms": ["13F-HR", "13F-HR/A"]},
-        {"key": "bridgewater", "name": "Bridgewater Associates", "cik": "1350694", "forms": ["13F-HR", "13F-HR/A"]},
-    ]
+        result["eth"].append({
+            "address": addr,
+            "normalTxs": normal[:300],
+            "linkTransfers": link[:300],
+        })
+        time.sleep(0.2)
 
-    results = []
+    # SOL
+    for addr in sol_list[:25]:
+        sigs = sol_signatures(addr, limit=100)
+        sigs = filter_window(sigs, since, "timestamp")
+        result["sol"].append({"address": addr, "signatures": sigs[:200]})
+        time.sleep(0.15)
 
-    for leader in leaders:
-        cik = leader["cik"]
-        subs = pull_recent_filings_for_cik(cik)
-        filings = extract_latest_filings(subs, leader["forms"], max_items=14)
-
-        # For 13F: prefetch newest two 13F xmls to compute deltas
-        last_13f_holdings = None
-        prev_13f_holdings = None
-        last_13f_date = None
-        prev_13f_date = None
-
-        thirteen = [f for f in filings if str(f.get("form", "")).startswith("13F")]
-        if len(thirteen) >= 1:
-            last_13f_date = thirteen[0].get("filingDate", "")
-            try:
-                primary_url = build_primary_doc_url(cik, thirteen[0]["accession"], thirteen[0]["primaryDocument"])
-                xml_text = sec_get_text(primary_url)
-                last_13f_holdings = parse_13f_info_table(xml_text)
-            except Exception:
-                last_13f_holdings = None
-            time.sleep(0.2)
-
-        if len(thirteen) >= 2:
-            prev_13f_date = thirteen[1].get("filingDate", "")
-            try:
-                primary_url = build_primary_doc_url(cik, thirteen[1]["accession"], thirteen[1]["primaryDocument"])
-                xml_text = sec_get_text(primary_url)
-                prev_13f_holdings = parse_13f_info_table(xml_text)
-            except Exception:
-                prev_13f_holdings = None
-            time.sleep(0.2)
-
-        events = []
-
-        for f in filings:
-            filed_dt = parse_dt_any(f.get("filingDate"))
-            if filed_dt is not None and filed_dt < since365:
-                continue
-
-            accession = f["accession"]
-            primary_doc = f["primaryDocument"]
-            form = f["form"]
-            filing_date = f["filingDate"]
-
-            index_url = build_filing_index_url(cik, accession)
-            primary_url = build_primary_doc_url(cik, accession, primary_doc)
-
-            label = "FILED"
-            details: Dict[str, Any] = {}
-
-            if form.startswith("4"):
-                try:
-                    xml_text = sec_get_text(primary_url)
-                    txs = parse_form4_transactions(xml_text)
-
-                    buys = [t for t in txs if t.get("code") == "P"]
-                    sells = [t for t in txs if t.get("code") == "S"]
-
-                    label = "BUY" if buys and not sells else "SELL" if sells and not buys else "MIXED" if buys and sells else "FORM4"
-
-                    # Summaries for UI: what was bought/sold
-                    def unique_pairs(rows: List[dict]) -> List[dict]:
-                        seen = set()
-                        outp = []
-                        for r0 in rows:
-                            sym = (r0.get("ticker") or "").strip().upper()
-                            name = (r0.get("issuerName") or "").strip()
-                            keyp = (sym, name)
-                            if keyp in seen:
-                                continue
-                            seen.add(keyp)
-                            if sym or name:
-                                outp.append({"ticker": sym, "issuerName": name})
-                        return outp[:20]
-
-                    details = {
-                        "buyCount": len(buys),
-                        "sellCount": len(sells),
-                        "bought": unique_pairs(buys),
-                        "sold": unique_pairs(sells),
-                        "transactions": txs[:40],
-                    }
-                except Exception:
-                    label = "FORM4"
-
-            if form.startswith("13F"):
-                label = "13F FILED"
-
-                holdings_top = (last_13f_holdings or [])[:15] if last_13f_holdings else []
-                deltas = []
-
-                if last_13f_holdings and prev_13f_holdings:
-                    prev_map = {h.get("cusip", ""): h for h in prev_13f_holdings if h.get("cusip")}
-                    for h in last_13f_holdings[:250]:
-                        cusip = h.get("cusip", "")
-                        if not cusip:
-                            continue
-
-                        def to_float(v):
-                            try:
-                                return float(str(v).replace(",", "") or 0)
-                            except Exception:
-                                return 0.0
-
-                        v_now = to_float(h.get("value", "0"))
-                        v_prev = to_float((prev_map.get(cusip) or {}).get("value", "0"))
-                        dv = v_now - v_prev
-                        if dv != 0:
-                            deltas.append(
-                                {
-                                    "nameOfIssuer": h.get("nameOfIssuer", ""),
-                                    "cusip": cusip,
-                                    "valueNow": v_now,
-                                    "valuePrev": v_prev,
-                                    "deltaValue": dv,
-                                }
-                            )
-                    deltas.sort(key=lambda x: abs(x.get("deltaValue", 0)), reverse=True)
-                    deltas = deltas[:15]
-
-                details = {
-                    "latest13FDate": last_13f_date,
-                    "prev13FDate": prev_13f_date,
-                    "topHoldings": holdings_top,
-                    "topDeltas": deltas,
-                    "note": "13F deltas are by CUSIP and value field, not exact trade buys/sells.",
-                }
-
-            events.append(
-                {
-                    "form": form,
-                    "label": label,
-                    "filingDate": filing_date,
-                    "indexUrl": index_url,
-                    "primaryUrl": primary_url,
-                    "details": details,
-                }
-            )
-
-            if len(events) >= 4:
-                break
-
-            time.sleep(0.2)
-
-        results.append({"name": leader["name"], "cik": cik10(cik), "events": events})
-
-    return {
-        "date": now.date().isoformat(),
-        "windowDays": 365,
-        "windowStart": since365.date().isoformat(),
-        "windowEnd": now.date().isoformat(),
-        "leaders": results,
-        "note": (
-            "Form 4 includes issuer symbol and P/S transactions when provided. "
-            "13F includes top holdings and deltas vs prior 13F when available."
-        ),
-    }
+    return result
