@@ -3,16 +3,27 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
+import quiverquant
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-import quiverquant
 
 
-app = FastAPI(title="Finance Signals Backend")
+app = FastAPI(title="Finance Signals Backend", version="2.0.0")
+
+# --------------------------
+# CORS
+# --------------------------
+# Add any other origins you use for testing (localhost, custom domain, etc.)
+ALLOWED_ORIGINS = [
+    "https://hijazss.github.io",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://hijazss.github.io"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -30,7 +41,6 @@ def root():
 # --------------------------
 # Helpers
 # --------------------------
-
 def pick_first(row: dict, keys: List[str], default=""):
     for k in keys:
         if k in row and row[k] is not None:
@@ -113,7 +123,7 @@ def norm_ticker(row: dict) -> str:
             continue
         s = str(v).strip().upper()
         first = s.split()[0]
-        if 1 <= len(first) <= 10 and first.replace(".", "").replace("-", "").isalnum():
+        if 1 <= len(first) <= 12 and first.replace(".", "").replace("-", "").isalnum():
             return first
         return s
     return ""
@@ -180,12 +190,9 @@ def to_card(x: dict, kind: str) -> dict:
 
 
 # --------------------------
-# Crypto detection (unchanged)
+# Crypto detection (same behavior as your current backend)
 # --------------------------
-
-TOP_COINS = [
-    "BTC", "ETH", "SOL", "LINK", "XRP", "ADA", "DOGE", "AVAX", "MATIC", "BNB"
-]
+TOP_COINS = ["BTC", "ETH", "SOL", "LINK", "XRP", "ADA", "DOGE", "AVAX", "MATIC", "BNB"]
 
 CRYPTO_ALIASES: Dict[str, List[str]] = {
     "BTC": ["bitcoin", "btc"],
@@ -307,9 +314,8 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 
 # --------------------------
-# Congress rolling window (Main / Crypto)
+# Main Congress rolling window
 # --------------------------
-
 @app.get("/report/today")
 def report_today(
     window_days: Optional[int] = Query(default=None, ge=1, le=365),
@@ -496,23 +502,33 @@ def report_crypto(
 
 
 # --------------------------
-# NEW: Congress "Holdings Overlap" (proxy via disclosed activity)
+# FIX: Holdings overlap endpoint your frontend calls
+# Frontend calls: /report/holdings/common?window_days=365
 # --------------------------
-
-@app.get("/report/congress-holdings")
-def report_congress_holdings(
-    window_days: Optional[int] = Query(default=365, ge=30, le=365),
-    top_n: Optional[int] = Query(default=30, ge=5, le=100),
+@app.get("/report/holdings/common")
+def report_holdings_common(
+    window_days: int = Query(default=365, ge=30, le=365),
+    top_n: int = Query(default=30, ge=5, le=100),
 ):
     """
-    "Holdings" proxy:
-      counts how many unique members disclosed activity in a ticker within window_days.
-    This supports a "common holdings overlap" UI even if we do not have a true holdings endpoint.
+    "Common holdings" proxy, computed from congress trading disclosures:
+    holders = unique politicians who disclosed activity in ticker in the window.
+
+    Returns the shape your frontend expects:
+      {
+        "date": "...",
+        "windowDays": 365,
+        "commonHoldings": [
+          {"ticker":"NVDA","companyName":"","holders":42},
+          ...
+        ],
+        "meta": {...}
+      }
     """
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    days = window_days or 365
+    days = window_days
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
 
@@ -525,12 +541,8 @@ def report_congress_holdings(
             "windowDays": days,
             "windowStart": since.date().isoformat(),
             "windowEnd": now.date().isoformat(),
-            "breadth": {
-                "uniquePoliticians": 0,
-                "uniqueTickers": 0,
-            },
-            "topHoldings": [],
-            "holdings": [],
+            "commonHoldings": [],
+            "meta": {"uniquePoliticians": 0, "uniqueTickers": 0},
             "note": "No congress trading rows returned for this window.",
         }
 
@@ -539,17 +551,13 @@ def report_congress_holdings(
     except Exception:
         rows = list(df)
 
-    # Track unique politicians overall in-window
-    pol_set_all = set()
-
-    # Per ticker: sets of politicians, per party holders, and last seen date
-    per: Dict[str, dict] = {}
+    # ticker -> set(politician)
+    per_ticker: Dict[str, set] = {}
+    all_pol: set = set()
 
     for r in rows:
         best_dt = row_best_dt(r)
-        if best_dt is None:
-            continue
-        if best_dt < since or best_dt > now:
+        if best_dt is None or best_dt < since or best_dt > now:
             continue
 
         ticker = norm_ticker(r)
@@ -560,93 +568,197 @@ def report_congress_holdings(
         if not pol:
             continue
 
-        party = norm_party_from_any(r)
-
-        pol_set_all.add(pol)
-
         t = ticker.upper()
-        cur = per.get(t)
-        if not cur:
-            cur = {
-                "ticker": t,
-                "politicians": set(),
-                "dems": set(),
-                "reps": set(),
-                "lastSeen": None,     # datetime
-                "tradeCount": 0,
-            }
-            per[t] = cur
+        all_pol.add(pol)
+        if t not in per_ticker:
+            per_ticker[t] = set()
+        per_ticker[t].add(pol)
 
-        cur["politicians"].add(pol)
-        if party == "D":
-            cur["dems"].add(pol)
-        elif party == "R":
-            cur["reps"].add(pol)
-
-        cur["tradeCount"] += 1
-        if cur["lastSeen"] is None or best_dt > cur["lastSeen"]:
-            cur["lastSeen"] = best_dt
-
-    total_unique_pol = len(pol_set_all)
-    holdings: List[dict] = []
-
-    # Score scaling:
-    # - holderCount drives most of the score
-    # - small boost for bipartisan breadth
-    # This yields stable 0-100.
-    def holdings_score(holder_count: int, dem_count: int, rep_count: int) -> int:
-        if total_unique_pol <= 0:
-            return 0
-        breadth_pct = holder_count / total_unique_pol  # 0..1
-        base = breadth_pct * 85.0
-        bipartisan = 0.0
-        if dem_count > 0 and rep_count > 0:
-            # up to +15 depending on balance
-            balance = min(dem_count, rep_count) / max(dem_count, rep_count)
-            bipartisan = 15.0 * balance
-        score = int(round(min(100.0, base + bipartisan)))
-        return score
-
-    for t, cur in per.items():
-        holder_count = len(cur["politicians"])
-        dem_count = len(cur["dems"])
-        rep_count = len(cur["reps"])
-        last_seen = cur["lastSeen"]
-
-        breadth_pct = (holder_count / total_unique_pol) if total_unique_pol else 0.0
-
-        holdings.append({
+    common = []
+    for t, pols in per_ticker.items():
+        common.append({
             "ticker": t,
-            "holderCount": holder_count,
-            "demHolders": dem_count,
-            "repHolders": rep_count,
-            "breadthPct": round(breadth_pct * 100.0, 2),     # percent of active politicians in window
-            "holdingsScore": holdings_score(holder_count, dem_count, rep_count),
-            "tradeCount": int(cur["tradeCount"]),
-            "lastActivity": iso_date_only(last_seen),
+            "companyName": "",          # optional in UI
+            "holders": len(pols),       # frontend reads holders/holderCount
         })
 
-    holdings.sort(key=lambda x: (-int(x["holderCount"]), -int(x["holdingsScore"]), x["ticker"]))
-
-    top_holdings = holdings[: int(top_n or 30)]
+    common.sort(key=lambda x: (-int(x["holders"]), x["ticker"]))
+    common = common[:top_n]
 
     return {
         "date": now.date().isoformat(),
         "windowDays": days,
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
-        "breadth": {
-            "uniquePoliticians": total_unique_pol,
-            "uniqueTickers": len(holdings),
+        "commonHoldings": common,
+        "meta": {
+            "uniquePoliticians": len(all_pol),
+            "uniqueTickers": len(per_ticker),
+            "topN": top_n,
         },
-        "topHoldings": top_holdings,
-        "holdings": holdings,
         "note": (
-            "Holdings are a proxy computed from disclosed congress trading activity: "
-            "holderCount = unique members who disclosed activity in that ticker within the window."
+            "Holdings are a proxy from disclosures: holders = unique members who disclosed activity in ticker within the window."
         ),
-        "scoring": {
-            "holdingsScoreMeaning": "0-100. Mostly breadth (holderCount/uniquePoliticians), with a bipartisan boost when both parties participate.",
-            "maxScore": 100,
+    }
+
+
+# --------------------------
+# Market Entry Index (simple, stable)
+# Uses Stooq CSV for SPY + VIX
+# --------------------------
+def _stooq_daily_close(symbol: str, lookback_days: int = 260) -> List[Tuple[datetime, float]]:
+    """
+    Fetch daily closes from Stooq. Symbol examples:
+      SPY -> "spy.us"
+      VIX -> "^vix"
+    Returns list of (date, close) sorted ascending.
+    """
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+
+    lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
+    if len(lines) < 5:
+        return []
+
+    header = lines[0].lower().split(",")
+    try:
+        date_i = header.index("date")
+        close_i = header.index("close")
+    except ValueError:
+        return []
+
+    out: List[Tuple[datetime, float]] = []
+    for ln in lines[1:]:
+        parts = ln.split(",")
+        if len(parts) <= max(date_i, close_i):
+            continue
+        try:
+            dt = datetime.strptime(parts[date_i], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            cl = float(parts[close_i])
+            out.append((dt, cl))
+        except Exception:
+            continue
+
+    out.sort(key=lambda x: x[0])
+    if lookback_days and len(out) > lookback_days:
+        out = out[-lookback_days:]
+    return out
+
+
+def _sma(vals: List[float], n: int) -> Optional[float]:
+    if n <= 0 or len(vals) < n:
+        return None
+    return sum(vals[-n:]) / n
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+@app.get("/market/entry")
+def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
+    """
+    Simple entry score 0-100:
+      - Trend (SPY): 50d SMA vs 200d SMA and price vs 200d
+      - Vol (VIX): lower VIX = higher score (scaled by typical range)
+
+    Returns:
+      {
+        "date": "YYYY-MM-DD",
+        "score": 0..100,
+        "regime": "RISK-ON|NEUTRAL|RISK-OFF",
+        "signal": "...",
+        "components": { spxTrend, vix, breadth, credit, rates, buffettProxy }
+      }
+    """
+    try:
+        spy = _stooq_daily_close("spy.us", lookback_days=260)
+        vix = _stooq_daily_close("^vix", lookback_days=260)
+    except Exception as e:
+        return {
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "score": 0,
+            "regime": "NEUTRAL",
+            "signal": "DATA UNAVAILABLE",
+            "notes": f"Market data fetch failed: {str(e)}",
+            "components": {
+                "spxTrend": 0.5,
+                "vix": 0.5,
+                "breadth": 0.5,
+                "credit": 0.5,
+                "rates": 0.5,
+                "buffettProxy": 0.5,
+            },
         }
+
+    if len(spy) < 210 or len(vix) < 30:
+        return {
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "score": 0,
+            "regime": "NEUTRAL",
+            "signal": "INSUFFICIENT DATA",
+            "notes": "Not enough history returned for SPY/VIX.",
+            "components": {
+                "spxTrend": 0.5,
+                "vix": 0.5,
+                "breadth": 0.5,
+                "credit": 0.5,
+                "rates": 0.5,
+                "buffettProxy": 0.5,
+            },
+        }
+
+    spy_dates, spy_close = zip(*spy)
+    vix_dates, vix_close = zip(*vix)
+
+    price = float(spy_close[-1])
+    sma50 = _sma(list(spy_close), 50) or price
+    sma200 = _sma(list(spy_close), 200) or price
+
+    # Trend score 0..1
+    # - +0.5 if 50 > 200
+    # - +0.5 scaled by price vs 200
+    trend_cross = 1.0 if sma50 >= sma200 else 0.0
+    price_vs_200 = _clamp01((price / sma200 - 0.90) / (1.10 - 0.90))  # maps 0.90x..1.10x to 0..1
+    spx_trend_01 = _clamp01(0.55 * trend_cross + 0.45 * price_vs_200)
+
+    # Vol score 0..1 (lower VIX is better). Typical VIX 12..35.
+    v = float(vix_close[-1])
+    vix_01 = _clamp01(1.0 - ((v - 12.0) / (35.0 - 12.0)))
+
+    # Simple proxies for unused fields (keep stable for UI)
+    breadth_01 = spx_trend_01
+    credit_01 = 0.55
+    rates_01 = 0.50
+    buffett_01 = 0.55
+
+    # Total score
+    score_01 = 0.65 * spx_trend_01 + 0.35 * vix_01
+    score = int(round(100.0 * score_01))
+
+    if score >= 75:
+        regime = "RISK-ON"
+        signal = "ACCUMULATE"
+    elif score >= 55:
+        regime = "NEUTRAL"
+        signal = "ACCUMULATE SLOWLY"
+    else:
+        regime = "RISK-OFF"
+        signal = "WAIT / SMALL DCA"
+
+    return {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "score": score,
+        "regime": regime,
+        "signal": signal,
+        "notes": f"SPY={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={v:.2f}",
+        "components": {
+            "spxTrend": float(spx_trend_01),
+            "vix": float(vix_01),
+            "breadth": float(breadth_01),
+            "credit": float(credit_01),
+            "rates": float(rates_01),
+            "buffettProxy": float(buffett_01),
+        },
     }
