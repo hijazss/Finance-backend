@@ -1,5 +1,7 @@
 import os
 import re
+import time
+import math
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.0.0")
+app = FastAPI(title="Finance Signals Backend", version="4.2.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -31,12 +33,43 @@ app.add_middleware(
 )
 
 QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
+
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
+
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.0.0"}
+    return {"status": "ok", "version": "4.2.0"}
+
+
+# =========================================================
+# Small TTL cache (Render-friendly)
+# =========================================================
+_CACHE: Dict[str, Tuple[float, Any]] = {}
+
+
+def cache_get(key: str) -> Optional[Any]:
+    now = time.time()
+    rec = _CACHE.get(key)
+    if not rec:
+        return None
+    exp, val = rec
+    if now > exp:
+        _CACHE.pop(key, None)
+        return None
+    return val
+
+
+def cache_set(key: str, val: Any, ttl_seconds: int = 120) -> Any:
+    _CACHE[key] = (time.time() + ttl_seconds, val)
+    return val
 
 
 # =========================================================
@@ -191,7 +224,7 @@ def to_card(x: dict, kind: str) -> dict:
 
 
 # =========================================================
-# Crypto detection
+# Crypto detection (unchanged)
 # =========================================================
 TOP_COINS = ["BTC", "ETH", "SOL", "LINK", "XRP", "ADA", "DOGE", "AVAX", "MATIC", "BNB"]
 
@@ -315,7 +348,599 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 
 # =========================================================
-# Congress: /report/today
+# Market data (Yahoo chart)
+# =========================================================
+def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
+    params = {"range": range_str, "interval": interval}
+    r = requests.get(url, params=params, timeout=14, headers=UA_HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+
+def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> List[Tuple[datetime, float]]:
+    j = _yahoo_chart(symbol, range_str=range_str, interval=interval)
+    res = (j.get("chart") or {}).get("result") or []
+    if not res:
+        return []
+    result = res[0]
+    ts = result.get("timestamp") or []
+    q = (result.get("indicators") or {}).get("quote") or []
+    if not ts or not q:
+        return []
+    closes = (q[0] or {}).get("close") or []
+    out: List[Tuple[datetime, float]] = []
+    for t, c in zip(ts, closes):
+        if c is None:
+            continue
+        dt = datetime.fromtimestamp(int(t), tz=timezone.utc)
+        out.append((dt, float(c)))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return 100.0 * (a / b - 1.0)
+
+
+def _sma(vals: List[float], n: int) -> Optional[float]:
+    if n <= 0 or len(vals) < n:
+        return None
+    return sum(vals[-n:]) / n
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+# =========================================================
+# CNN Fear & Greed
+# =========================================================
+def _cnn_fear_greed_graphdata(date_str: Optional[str] = None) -> dict:
+    # CNN endpoint commonly used by dashboards
+    # Example: https://production.dataviz.cnn.io/index/fearandgreed/graphdata/2026-01-31
+    d = date_str or datetime.now(timezone.utc).date().isoformat()
+    url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{d}"
+    r = requests.get(url, timeout=14, headers=UA_HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+
+@app.get("/market/fear-greed")
+def market_fear_greed(date: Optional[str] = Query(default=None)):
+    key = f"feargreed:{date or 'today'}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        data = _cnn_fear_greed_graphdata(date)
+        fg = (data or {}).get("fear_and_greed") or {}
+        now_val = fg.get("now") or {}
+        out = {
+            "date": (data or {}).get("date") or (date or datetime.now(timezone.utc).date().isoformat()),
+            "score": now_val.get("value"),
+            "rating": now_val.get("valueText") or now_val.get("rating"),
+            "raw": data,
+        }
+        return cache_set(key, out, ttl_seconds=300)
+    except Exception as e:
+        return cache_set(
+            key,
+            {"date": date or datetime.now(timezone.utc).date().isoformat(), "score": None, "rating": None, "error": f"{type(e).__name__}: {str(e)}"},
+            ttl_seconds=60,
+        )
+
+
+@app.get("/market/snapshot")
+def market_snapshot():
+    """
+    Quick market context for News tab:
+    - SPY (proxy for S&P 500) level + 1D/5D/1M returns
+    - VIX level
+    - Fear & Greed score + label (best effort)
+    """
+    key = "market:snapshot"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    now = datetime.now(timezone.utc)
+    out = {"date": now.date().isoformat(), "sp500": {}, "vix": {}, "fearGreed": {}}
+    errors: List[str] = []
+
+    try:
+        spy = _yahoo_closes("SPY", range_str="3mo", interval="1d")
+        if len(spy) >= 25:
+            closes = [c for _, c in spy]
+            last = closes[-1]
+            out["sp500"] = {
+                "symbol": "SPY",
+                "last": round(last, 4),
+                "ret1dPct": round(_pct(closes[-1], closes[-2]), 4) if len(closes) >= 2 else None,
+                "ret5dPct": round(_pct(closes[-1], closes[-6]), 4) if len(closes) >= 6 else None,
+                "ret1mPct": round(_pct(closes[-1], closes[-22]), 4) if len(closes) >= 22 else None,
+            }
+    except Exception as e:
+        errors.append(f"SPY: {type(e).__name__}: {str(e)}")
+
+    try:
+        vix = _yahoo_closes("^VIX", range_str="3mo", interval="1d")
+        if len(vix) >= 2:
+            closes = [c for _, c in vix]
+            out["vix"] = {
+                "symbol": "^VIX",
+                "last": round(closes[-1], 4),
+                "chg1d": round(closes[-1] - closes[-2], 4),
+            }
+    except Exception as e:
+        errors.append(f"VIX: {type(e).__name__}: {str(e)}")
+
+    try:
+        fg = market_fear_greed(None)
+        out["fearGreed"] = {
+            "score": fg.get("score"),
+            "rating": fg.get("rating"),
+        }
+    except Exception as e:
+        errors.append(f"FearGreed: {type(e).__name__}: {str(e)}")
+
+    out["errors"] = errors
+    return cache_set(key, out, ttl_seconds=180)
+
+
+# =========================================================
+# Market Entry Index (your existing endpoint, upgraded slightly)
+# =========================================================
+@app.get("/market/entry")
+def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
+    now = datetime.now(timezone.utc)
+
+    err_notes = []
+    try:
+        spy = _yahoo_closes("SPY", range_str="1y", interval="1d")
+        vix = _yahoo_closes("^VIX", range_str="1y", interval="1d")
+    except Exception as e:
+        err_notes.append(f"Yahoo chart failed: {type(e).__name__}: {str(e)}")
+        spy, vix = [], []
+
+    if len(spy) < 210 or len(vix) < 30:
+        return {
+            "date": now.date().isoformat(),
+            "score": 0,
+            "regime": "NEUTRAL",
+            "signal": "DATA UNAVAILABLE",
+            "notes": " | ".join(err_notes) if err_notes else "Insufficient market data.",
+            "components": {
+                "spxTrend": 0.5,
+                "vix": 0.5,
+                "breadth": 0.5,
+                "credit": 0.5,
+                "rates": 0.5,
+                "buffettProxy": 0.5,
+            },
+        }
+
+    _, spy_close = zip(*spy)
+    _, vix_close = zip(*vix)
+
+    price = float(spy_close[-1])
+    sma50 = _sma(list(spy_close), 50) or price
+    sma200 = _sma(list(spy_close), 200) or price
+
+    trend_cross = 1.0 if sma50 >= sma200 else 0.0
+    price_vs_200 = _clamp01((price / sma200 - 0.90) / (1.10 - 0.90))
+    spx_trend_01 = _clamp01(0.55 * trend_cross + 0.45 * price_vs_200)
+
+    v = float(vix_close[-1])
+    vix_01 = _clamp01(1.0 - ((v - 12.0) / (35.0 - 12.0)))
+
+    breadth_01 = spx_trend_01
+    credit_01 = 0.55
+    rates_01 = 0.50
+    buffett_01 = 0.55
+
+    score_01 = 0.65 * spx_trend_01 + 0.35 * vix_01
+    score = int(round(100.0 * score_01))
+
+    if score >= 75:
+        regime = "RISK-ON"
+        signal = "ACCUMULATE"
+    elif score >= 55:
+        regime = "NEUTRAL"
+        signal = "ACCUMULATE SLOWLY"
+    else:
+        regime = "RISK-OFF"
+        signal = "WAIT / SMALL DCA"
+
+    notes = f"SPY={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={v:.2f}"
+    if err_notes:
+        notes = notes + " | " + " | ".join(err_notes)
+
+    return {
+        "date": now.date().isoformat(),
+        "score": score,
+        "regime": regime,
+        "signal": signal,
+        "notes": notes,
+        "components": {
+            "spxTrend": float(spx_trend_01),
+            "vix": float(vix_01),
+            "breadth": float(breadth_01),
+            "credit": float(credit_01),
+            "rates": float(rates_01),
+            "buffettProxy": float(buffett_01),
+        },
+    }
+
+
+# =========================================================
+# RSS + sentiment (your existing approach)
+# =========================================================
+def _fetch_rss_items(url: str, timeout: int = 12, max_items: int = 30) -> List[dict]:
+    r = requests.get(url, timeout=timeout, headers=UA_HEADERS)
+    r.raise_for_status()
+
+    text = r.text.strip()
+    root = ET.fromstring(text)
+
+    channel = root.find("channel")
+    if channel is None:
+        entries = root.findall("{http://www.w3.org/2005/Atom}entry")
+        out = []
+        for e in entries[:max_items]:
+            title = (e.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
+            link_el = e.find("{http://www.w3.org/2005/Atom}link")
+            link = (link_el.get("href") if link_el is not None else "") or ""
+            pub = (e.findtext("{http://www.w3.org/2005/Atom}updated") or "").strip()
+            out.append({"title": title, "link": link, "published": pub})
+        return out
+
+    out = []
+    for item in channel.findall("item")[:max_items]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        out.append({"title": title, "link": link, "published": pub})
+    return out
+
+
+_POS_WORDS = set([
+    "beat", "beats", "surge", "surges", "rally", "rallies", "gain", "gains", "up",
+    "upgrade", "upgrades", "record", "strong", "bull", "bullish", "growth",
+    "profit", "profits", "outperform", "buy", "wins", "win", "breakout"
+])
+_NEG_WORDS = set([
+    "miss", "misses", "drop", "drops", "plunge", "plunges", "down",
+    "downgrade", "downgrades", "warning", "weak", "bear", "bearish",
+    "lawsuit", "probe", "investigation", "fraud", "loss", "losses",
+    "cut", "cuts", "layoff", "layoffs", "recession", "crash"
+])
+
+
+def _headline_sentiment(headlines: List[str]) -> Dict[str, Any]:
+    score = 0
+    pos = 0
+    neg = 0
+    total = 0
+
+    for h in headlines:
+        if not h:
+            continue
+        total += 1
+        tokens = re.findall(r"[a-zA-Z]+", h.lower())
+        tset = set(tokens)
+        p = len(tset & _POS_WORDS)
+        n = len(tset & _NEG_WORDS)
+        if p > n:
+            pos += 1
+            score += 1
+        elif n > p:
+            neg += 1
+            score -= 1
+
+    if total == 0:
+        return {"label": "NEUTRAL", "score": 0, "pos": 0, "neg": 0, "total": 0}
+
+    raw = score / max(1, total)
+    gauge = int(round(50 + 50 * raw))
+    gauge = max(0, min(100, gauge))
+
+    if gauge >= 60:
+        label = "POSITIVE"
+    elif gauge <= 40:
+        label = "NEGATIVE"
+    else:
+        label = "NEUTRAL"
+
+    return {"label": label, "score": gauge, "pos": pos, "neg": neg, "total": total}
+
+
+@app.get("/news/top")
+def news_top(max_items: int = Query(default=30, ge=10, le=100)):
+    feeds = [
+        "https://www.yahoo.com/news/rss/finance",
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        "https://www.marketwatch.com/rss/topstories",
+    ]
+
+    items: List[dict] = []
+    errors: List[str] = []
+
+    for f in feeds:
+        try:
+            it = _fetch_rss_items(f, max_items=max_items)
+            for x in it:
+                x["sourceFeed"] = f
+            items.extend(it)
+        except Exception as e:
+            errors.append(f"{f} -> {type(e).__name__}: {str(e)}")
+
+    seen = set()
+    deduped = []
+    for x in items:
+        lk = (x.get("link") or "").strip()
+        if not lk or lk in seen:
+            continue
+        seen.add(lk)
+        deduped.append(x)
+
+    deduped = deduped[:max_items]
+    sentiment = _headline_sentiment([x.get("title", "") for x in deduped])
+
+    return {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "items": deduped,
+        "sentiment": sentiment,
+        "errors": errors,
+        "note": "Sentiment is a lightweight headline-based gauge, not a price predictor.",
+    }
+
+
+@app.get("/news/watchlist")
+def news_watchlist(
+    tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
+    max_items_per_ticker: int = Query(default=8, ge=3, le=25),
+):
+    syms = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    syms = syms[:40]
+
+    all_items: Dict[str, List[dict]] = {}
+    errors: List[str] = []
+
+    for t in syms:
+        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(t)}&region=US&lang=en-US"
+        try:
+            it = _fetch_rss_items(url, max_items=max_items_per_ticker)
+            for x in it:
+                x["ticker"] = t
+                x["sourceFeed"] = "yahoo_ticker_rss"
+            all_items[t] = it
+        except Exception as e:
+            errors.append(f"{t}: {type(e).__name__}: {str(e)}")
+            all_items[t] = []
+
+    headlines = []
+    for t in syms:
+        headlines.extend([x.get("title", "") for x in all_items.get(t, [])])
+
+    sentiment = _headline_sentiment(headlines)
+
+    return {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "tickers": syms,
+        "itemsByTicker": all_items,
+        "sentiment": sentiment,
+        "errors": errors,
+        "note": "Ticker news via Yahoo RSS. If a ticker has no feed items, it may be temporarily empty.",
+    }
+
+
+# =========================================================
+# News briefing (NEW): sector-friendly daily summary
+# =========================================================
+DEFAULT_SECTORS = [
+    "AI",
+    "Medical",
+    "Energy",
+    "Robotics",
+    "Infrastructure",
+    "Semiconductors",
+    "Cloud",
+    "Cybersecurity",
+    "Defense",
+    "Financials",
+    "Consumer",
+]
+
+SECTOR_QUERIES = {
+    "AI": [
+        "artificial intelligence OR AI chips OR foundation models OR inference OR datacenter AI",
+        "NVIDIA OR NVDA OR AMD OR ARM OR hyperscalers AI",
+    ],
+    "Medical": [
+        "biotech OR medtech OR medical devices OR FDA approval OR clinical trial",
+        "healthcare AI OR radiology AI OR genomics",
+    ],
+    "Energy": [
+        "oil OR OPEC OR crude OR LNG OR refinery",
+        "solar OR wind OR nuclear OR grid OR battery storage",
+    ],
+    "Robotics": [
+        "robotics OR humanoid robots OR automation OR industrial robots",
+        "warehouse robots OR autonomous systems",
+    ],
+    "Infrastructure": [
+        "infrastructure spending OR data center buildout OR power grid upgrade",
+        "construction materials OR industrials",
+    ],
+    "Semiconductors": [
+        "semiconductor OR chip shortage OR fab OR foundry OR lithography",
+        "TSMC OR ASML OR Intel OR Samsung foundry",
+    ],
+    "Cloud": [
+        "cloud computing OR AWS OR Azure OR Google Cloud OR enterprise software",
+    ],
+    "Cybersecurity": [
+        "cybersecurity OR ransomware OR breach OR zero trust",
+    ],
+    "Defense": [
+        "defense spending OR missiles OR drones OR aerospace defense",
+    ],
+    "Financials": [
+        "banks OR credit OR regional banks OR liquidity OR net interest margin",
+    ],
+    "Consumer": [
+        "retail OR consumer spending OR inflation impact OR pricing power",
+    ],
+}
+
+def _google_news_rss(query: str) -> str:
+    # Google News RSS search endpoint
+    # https://news.google.com/rss/search?q=...&hl=en-US&gl=US&ceid=US:en
+    q = quote_plus(query)
+    return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+
+_TICKER_MENTION_RE = re.compile(r"\b([A-Z]{1,5})\b")
+_STOP_TICKERS = set(["A", "I", "AI", "US", "FED", "USA", "CEO", "EPS", "IPO", "ETF", "FDA", "SEC", "DOJ", "EU"])
+
+def _extract_tickers_from_titles(titles: List[str], watchlist: List[str]) -> Dict[str, int]:
+    wl = set([t.upper() for t in watchlist if t])
+    counts: Dict[str, int] = {}
+    for title in titles:
+        for m in _TICKER_MENTION_RE.findall(title or ""):
+            t = m.upper()
+            if t in _STOP_TICKERS:
+                continue
+            if t in wl:
+                counts[t] = counts.get(t, 0) + 1
+    return counts
+
+def _brief_paragraph_from_headlines(headlines: List[str], sector: str) -> str:
+    # Simple deterministic summarizer: groups by recurring terms
+    if not headlines:
+        return f"No major {sector} headlines in the current pull."
+    h = " ".join(headlines[:10]).lower()
+    themes = []
+    def has_any(words):
+        return any(w in h for w in words)
+
+    if has_any(["earnings", "revenue", "guidance", "forecast", "margin"]):
+        themes.append("earnings and guidance are a key driver")
+    if has_any(["rates", "yield", "inflation", "fed", "cuts", "hike"]):
+        themes.append("rates and inflation expectations remain influential")
+    if has_any(["data center", "datacenter", "gpu", "chips", "semiconductor", "foundry"]):
+        themes.append("compute supply chain and data center buildout are in focus")
+    if has_any(["regulation", "doj", "sec", "antitrust", "probe", "lawsuit"]):
+        themes.append("regulatory and legal risk is present")
+    if has_any(["geopolitical", "china", "taiwan", "ukraine", "middle east"]):
+        themes.append("geopolitical risk is affecting sentiment")
+    if has_any(["capex", "spending", "buildout", "infrastructure", "grid"]):
+        themes.append("capex and buildout signals are showing up")
+
+    if not themes:
+        themes = ["headlines are mixed and mostly event-driven"]
+
+    s = "; ".join(themes[:3])
+    return f"{sector}: {s}."
+
+def _implications(sector: str, sentiment_score: int) -> str:
+    if sentiment_score >= 60:
+        return f"{sector}: headline tone is supportive. If it persists, the next 1 to 3 months often favor momentum and multiple expansion in the strongest names."
+    if sentiment_score <= 40:
+        return f"{sector}: headline tone is risk-off. If it persists, expect choppier price action and a preference for quality balance sheets and clear catalysts."
+    return f"{sector}: headline tone is neutral. If the macro backdrop stays steady, relative winners tend to be those with near-term catalysts or strong guidance."
+
+@app.get("/news/briefing")
+def news_briefing(
+    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
+    watchlist: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
+    max_items_per_sector: int = Query(default=12, ge=5, le=40),
+):
+    """
+    One call your News tab can render visually:
+    - Market snapshot (SPY, VIX, Fear&Greed)
+    - Sector tiles with: sentiment, short summary, top headlines, watchlist ticker mentions
+    """
+    key = f"briefing:{sectors}:{watchlist}:{max_items_per_sector}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    sector_list = [s.strip() for s in sectors.split(",") if s.strip()]
+    if not sector_list:
+        sector_list = DEFAULT_SECTORS
+
+    wl = [t.strip().upper() for t in watchlist.split(",") if t.strip()]
+    wl = wl[:60]
+
+    market = market_snapshot()
+    sector_tiles: List[dict] = []
+    errors: List[str] = []
+
+    for sec in sector_list:
+        queries = SECTOR_QUERIES.get(sec, [sec])
+        items: List[dict] = []
+        for q in queries[:2]:
+            url = _google_news_rss(q)
+            try:
+                got = _fetch_rss_items(url, max_items=max_items_per_sector)
+                for x in got:
+                    x["sourceFeed"] = "google_news_rss"
+                    x["sector"] = sec
+                items.extend(got)
+            except Exception as e:
+                errors.append(f"{sec}: {type(e).__name__}: {str(e)}")
+
+        # dedupe by link
+        seen = set()
+        ded = []
+        for x in items:
+            lk = (x.get("link") or "").strip()
+            if not lk or lk in seen:
+                continue
+            seen.add(lk)
+            ded.append(x)
+
+        ded = ded[:max_items_per_sector]
+        titles = [x.get("title", "") for x in ded]
+        sent = _headline_sentiment(titles)
+
+        ticker_mentions = _extract_tickers_from_titles(titles, wl)
+        top_mentions = [{"ticker": k, "count": v} for k, v in sorted(ticker_mentions.items(), key=lambda kv: (-kv[1], kv[0]))][:6]
+
+        tile = {
+            "sector": sec,
+            "sentiment": sent,
+            "summary": _brief_paragraph_from_headlines(titles, sec),
+            "implications": _implications(sec, int(sent.get("score", 50) or 50)),
+            "topHeadlines": ded[:8],
+            "watchlistMentions": top_mentions,
+        }
+        sector_tiles.append(tile)
+
+    # overall rollup
+    all_titles = []
+    for t in sector_tiles:
+        for h in t.get("topHeadlines", [])[:6]:
+            all_titles.append(h.get("title", "") or "")
+    overall_sent = _headline_sentiment(all_titles)
+
+    out = {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "market": market,
+        "overallSentiment": overall_sent,
+        "sectors": sector_tiles,
+        "errors": errors,
+        "note": "Briefing uses RSS headline signals. Treat as context, not prediction.",
+    }
+    return cache_set(key, out, ttl_seconds=180)
+
+
+# =========================================================
+# Congress: /report/today (your existing endpoint)
 # =========================================================
 @app.get("/report/today")
 def report_today(
@@ -489,7 +1114,6 @@ def report_today(
 
 # =========================================================
 # Congress: holdings proxy endpoint your UI expects
-# GET /report/holdings/common?window_days=365
 # =========================================================
 @app.get("/report/holdings/common")
 def report_holdings_common(
@@ -558,7 +1182,6 @@ def report_holdings_common(
 
 # =========================================================
 # Congress: day-by-day activity feed for UI
-# GET /report/congress/daily?window_days=14
 # =========================================================
 @app.get("/report/congress/daily")
 def report_congress_daily(
@@ -667,547 +1290,141 @@ def report_congress_daily(
 
 
 # =========================================================
-# Market Entry Index
-# Uses Yahoo Finance chart API first, then falls back to Stooq
+# Signals (NEW): bring back scored list for Main tab
+# Combines congress participation + watchlist news mentions + sector briefing mentions
 # =========================================================
-def _yahoo_chart_daily_close(symbol: str, range_str: str = "1y", interval: str = "1d") -> List[Tuple[datetime, float]]:
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
-    params = {"range": range_str, "interval": interval}
-    r = requests.get(url, params=params, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    j = r.json()
-    res = (j.get("chart") or {}).get("result") or []
-    if not res:
-        return []
-    result = res[0]
-    ts = result.get("timestamp") or []
-    q = (result.get("indicators") or {}).get("quote") or []
-    if not ts or not q:
-        return []
-    closes = (q[0] or {}).get("close") or []
-    out: List[Tuple[datetime, float]] = []
-    for t, c in zip(ts, closes):
-        if c is None:
+def _congress_ticker_agg(congress_payload: dict) -> Dict[str, dict]:
+    agg: Dict[str, dict] = {}
+    for arr_name, buy_mode in [("politicianBuys", True), ("politicianSells", False)]:
+        arr = congress_payload.get(arr_name) or []
+        if not isinstance(arr, list):
             continue
-        dt = datetime.fromtimestamp(int(t), tz=timezone.utc)
-        out.append((dt, float(c)))
-    out.sort(key=lambda x: x[0])
-    return out
-
-
-def _stooq_daily_close(symbol: str, lookback_days: int = 260) -> List[Tuple[datetime, float]]:
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-
-    lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
-    if len(lines) < 5:
-        return []
-
-    header = lines[0].lower().split(",")
-    try:
-        date_i = header.index("date")
-        close_i = header.index("close")
-    except ValueError:
-        return []
-
-    out: List[Tuple[datetime, float]] = []
-    for ln in lines[1:]:
-        parts = ln.split(",")
-        if len(parts) <= max(date_i, close_i):
-            continue
-        try:
-            dt = datetime.strptime(parts[date_i], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            cl = float(parts[close_i])
-            out.append((dt, cl))
-        except Exception:
-            continue
-
-    out.sort(key=lambda x: x[0])
-    if lookback_days and len(out) > lookback_days:
-        out = out[-lookback_days:]
-    return out
-
-
-def _sma(vals: List[float], n: int) -> Optional[float]:
-    if n <= 0 or len(vals) < n:
-        return None
-    return sum(vals[-n:]) / n
-
-
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, float(x)))
-
-
-@app.get("/market/entry")
-def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
-    now = datetime.now(timezone.utc)
-
-    spy = []
-    vix = []
-    err_notes = []
-
-    try:
-        spy = _yahoo_chart_daily_close("SPY", range_str="1y", interval="1d")
-        vix = _yahoo_chart_daily_close("^VIX", range_str="1y", interval="1d")
-    except Exception as e:
-        err_notes.append(f"Yahoo chart failed: {type(e).__name__}: {str(e)}")
-
-    if len(spy) < 210 or len(vix) < 30:
-        try:
-            spy = _stooq_daily_close("spy.us", lookback_days=260)
-            vix = _stooq_daily_close("^vix", lookback_days=260)
-        except Exception as e:
-            err_notes.append(f"Stooq failed: {type(e).__name__}: {str(e)}")
-
-    if len(spy) < 210 or len(vix) < 30:
-        return {
-            "date": now.date().isoformat(),
-            "score": 0,
-            "regime": "NEUTRAL",
-            "signal": "DATA UNAVAILABLE",
-            "notes": " | ".join(err_notes) if err_notes else "Insufficient market data.",
-            "components": {
-                "spxTrend": 0.5,
-                "vix": 0.5,
-                "breadth": 0.5,
-                "credit": 0.5,
-                "rates": 0.5,
-                "buffettProxy": 0.5,
-            },
-        }
-
-    _, spy_close = zip(*spy)
-    _, vix_close = zip(*vix)
-
-    price = float(spy_close[-1])
-    sma50 = _sma(list(spy_close), 50) or price
-    sma200 = _sma(list(spy_close), 200) or price
-
-    trend_cross = 1.0 if sma50 >= sma200 else 0.0
-    price_vs_200 = _clamp01((price / sma200 - 0.90) / (1.10 - 0.90))
-    spx_trend_01 = _clamp01(0.55 * trend_cross + 0.45 * price_vs_200)
-
-    v = float(vix_close[-1])
-    vix_01 = _clamp01(1.0 - ((v - 12.0) / (35.0 - 12.0)))
-
-    breadth_01 = spx_trend_01
-    credit_01 = 0.55
-    rates_01 = 0.50
-    buffett_01 = 0.55
-
-    score_01 = 0.65 * spx_trend_01 + 0.35 * vix_01
-    score = int(round(100.0 * score_01))
-
-    if score >= 75:
-        regime = "RISK-ON"
-        signal = "ACCUMULATE"
-    elif score >= 55:
-        regime = "NEUTRAL"
-        signal = "ACCUMULATE SLOWLY"
-    else:
-        regime = "RISK-OFF"
-        signal = "WAIT / SMALL DCA"
-
-    notes = f"SPY={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={v:.2f}"
-    if err_notes:
-        notes = notes + " | " + " | ".join(err_notes)
-
-    return {
-        "date": now.date().isoformat(),
-        "score": score,
-        "regime": regime,
-        "signal": signal,
-        "notes": notes,
-        "components": {
-            "spxTrend": float(spx_trend_01),
-            "vix": float(vix_01),
-            "breadth": float(breadth_01),
-            "credit": float(credit_01),
-            "rates": float(rates_01),
-            "buffettProxy": float(buffett_01),
-        },
-    }
-
-
-# =========================================================
-# News + Sentiment (RSS)
-# =========================================================
-def _fetch_rss_items(url: str, timeout: int = 12, max_items: int = 30) -> List[dict]:
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-
-    text = r.text.strip()
-    root = ET.fromstring(text)
-
-    channel = root.find("channel")
-    if channel is None:
-        entries = root.findall("{http://www.w3.org/2005/Atom}entry")
-        out = []
-        for e in entries[:max_items]:
-            title = (e.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
-            link_el = e.find("{http://www.w3.org/2005/Atom}link")
-            link = (link_el.get("href") if link_el is not None else "") or ""
-            pub = (e.findtext("{http://www.w3.org/2005/Atom}updated") or "").strip()
-            out.append({"title": title, "link": link, "published": pub})
-        return out
-
-    out = []
-    for item in channel.findall("item")[:max_items]:
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        pub = (item.findtext("pubDate") or "").strip()
-        out.append({"title": title, "link": link, "published": pub})
-    return out
-
-
-_POS_WORDS = set([
-    "beat", "beats", "surge", "surges", "rally", "rallies", "gain", "gains", "up",
-    "upgrade", "upgrades", "record", "strong", "bull", "bullish", "growth",
-    "profit", "profits", "outperform", "buy", "wins", "win", "breakout"
-])
-_NEG_WORDS = set([
-    "miss", "misses", "drop", "drops", "plunge", "plunges", "down",
-    "downgrade", "downgrades", "warning", "weak", "bear", "bearish",
-    "lawsuit", "probe", "investigation", "fraud", "loss", "losses",
-    "cut", "cuts", "layoff", "layoffs", "recession", "crash"
-])
-
-
-def _headline_sentiment(headlines: List[str]) -> Dict[str, Any]:
-    score = 0
-    pos = 0
-    neg = 0
-    total = 0
-
-    for h in headlines:
-        if not h:
-            continue
-        total += 1
-        tokens = re.findall(r"[a-zA-Z]+", h.lower())
-        tset = set(tokens)
-        p = len(tset & _POS_WORDS)
-        n = len(tset & _NEG_WORDS)
-        if p > n:
-            pos += 1
-            score += 1
-        elif n > p:
-            neg += 1
-            score -= 1
-
-    if total == 0:
-        return {"label": "NEUTRAL", "score": 0, "pos": 0, "neg": 0, "total": 0}
-
-    raw = score / max(1, total)
-    gauge = int(round(50 + 50 * raw))
-    gauge = max(0, min(100, gauge))
-
-    if gauge >= 60:
-        label = "POSITIVE"
-    elif gauge <= 40:
-        label = "NEGATIVE"
-    else:
-        label = "NEUTRAL"
-
-    return {"label": label, "score": gauge, "pos": pos, "neg": neg, "total": total}
-
-
-@app.get("/news/top")
-def news_top(max_items: int = Query(default=30, ge=10, le=150)):
-    feeds = [
-        "https://www.yahoo.com/news/rss/finance",
-        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-        "https://www.marketwatch.com/rss/topstories",
-    ]
-
-    items: List[dict] = []
-    errors: List[str] = []
-
-    for f in feeds:
-        try:
-            it = _fetch_rss_items(f, max_items=max_items)
-            for x in it:
-                x["sourceFeed"] = f
-            items.extend(it)
-        except Exception as e:
-            errors.append(f"{f} -> {type(e).__name__}: {str(e)}")
-
-    seen = set()
-    deduped = []
-    for x in items:
-        lk = (x.get("link") or "").strip()
-        if not lk or lk in seen:
-            continue
-        seen.add(lk)
-        deduped.append(x)
-
-    deduped = deduped[:max_items]
-    sentiment = _headline_sentiment([x.get("title", "") for x in deduped])
-
-    return {
-        "date": datetime.now(timezone.utc).date().isoformat(),
-        "items": deduped,
-        "sentiment": sentiment,
-        "errors": errors,
-        "note": "Sentiment is a lightweight headline-based gauge, not a price predictor.",
-    }
-
-
-@app.get("/news/watchlist")
-def news_watchlist(
-    tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
-    max_items_per_ticker: int = Query(default=8, ge=3, le=25),
-):
-    syms = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-    syms = syms[:40]
-
-    all_items: Dict[str, List[dict]] = {}
-    errors: List[str] = []
-
-    for t in syms:
-        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(t)}&region=US&lang=en-US"
-        try:
-            it = _fetch_rss_items(url, max_items=max_items_per_ticker)
-            for x in it:
-                x["ticker"] = t
-                x["sourceFeed"] = "yahoo_ticker_rss"
-            all_items[t] = it
-        except Exception as e:
-            errors.append(f"{t}: {type(e).__name__}: {str(e)}")
-            all_items[t] = []
-
-    headlines = []
-    for t in syms:
-        headlines.extend([x.get("title", "") for x in all_items.get(t, [])])
-
-    sentiment = _headline_sentiment(headlines)
-
-    return {
-        "date": datetime.now(timezone.utc).date().isoformat(),
-        "tickers": syms,
-        "itemsByTicker": all_items,
-        "sentiment": sentiment,
-        "errors": errors,
-        "note": "Ticker news via Yahoo RSS. If a ticker has no feed items, it may be temporarily empty.",
-    }
-
-
-# =========================================================
-# News briefing: sector summaries + implications
-# GET /news/briefing?watchlist=...&max_items=60
-# =========================================================
-_SECTOR_KEYWORDS: Dict[str, List[str]] = {
-    "AI": [
-        "ai", "artificial intelligence", "machine learning", "ml", "llm", "chatgpt",
-        "nvidia", "gpu", "data center", "datacenter", "semiconductor", "chip",
-        "openai", "anthropic", "google", "microsoft", "amazon", "meta",
-        "cloud", "hyperscaler"
-    ],
-    "Medical": [
-        "medical", "health", "healthcare", "biotech", "pharma", "drug", "fda",
-        "medtech", "device", "hospital", "diagnostic", "imaging", "mri", "ct",
-        "robotic surgery", "surgery", "clinical trial"
-    ],
-    "Energy": [
-        "energy", "oil", "crude", "gas", "lng", "opec", "refinery",
-        "renewable", "solar", "wind", "nuclear", "uranium",
-        "battery", "lithium", "grid", "power"
-    ],
-    "Robotics": [
-        "robot", "robotics", "automation", "industrial", "factory",
-        "humanoid", "drone", "autonomous", "self-driving"
-    ],
-    "Infrastructure": [
-        "infrastructure", "construction", "transport", "rail", "bridge",
-        "semiconductor fab", "fab", "foundry", "data center build",
-        "utilities", "water", "broadband", "5g", "telecom"
-    ],
-}
-
-def _norm_text(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
-
-def _tag_sectors(title: str) -> List[str]:
-    t = _norm_text(title)
-    hits: List[str] = []
-    for sector, kws in _SECTOR_KEYWORDS.items():
-        for kw in kws:
-            k = _norm_text(kw)
-            if not k:
+        for x in arr:
+            t = str(x.get("ticker") or "").upper().strip()
+            if not t:
                 continue
-            if re.search(rf"\b{re.escape(k)}\b", t) if re.fullmatch(r"[a-z0-9\- ]+", k) else (k in t):
-                hits.append(sector)
-                break
-    return hits
+            cur = agg.get(t) or {"ticker": t, "buy": 0, "sell": 0, "dem": 0, "rep": 0, "last": ""}
+            dem = int(x.get("demBuyers") or 0) + int(x.get("demSellers") or 0)
+            rep = int(x.get("repBuyers") or 0) + int(x.get("repSellers") or 0)
+            cur["dem"] += dem
+            cur["rep"] += rep
+            if buy_mode:
+                cur["buy"] += int(x.get("demBuyers") or 0) + int(x.get("repBuyers") or 0)
+            else:
+                cur["sell"] += int(x.get("demSellers") or 0) + int(x.get("repSellers") or 0)
+            last = str(x.get("lastFiledAt") or "")
+            if last and (not cur["last"] or last > cur["last"]):
+                cur["last"] = last
+            agg[t] = cur
+    return agg
 
-def _build_sector_summary(headlines: List[str]) -> str:
-    # very lightweight: highlight recurring themes by keyword
-    blob = " ".join(_norm_text(h) for h in headlines if h)
-    if not blob:
-        return "No meaningful sector headlines in the sample."
 
-    themes = []
-    theme_map = [
-        ("earnings/guidance", ["earnings", "guidance", "forecast", "revenue", "margin"]),
-        ("rates/liquidity", ["fed", "rates", "yields", "inflation", "treasury"]),
-        ("regulation/legal", ["sec", "doj", "ftc", "lawsuit", "probe", "regulation", "ban"]),
-        ("capex/expansion", ["capex", "build", "data center", "factory", "plant", "expansion"]),
-        ("m&a/partnerships", ["acquire", "acquisition", "merger", "deal", "partnership"]),
-        ("supply chain", ["supply", "shortage", "shipments", "inventory"]),
-    ]
-    for name, kws in theme_map:
-        if any(k in blob for k in kws):
-            themes.append(name)
+def _score_row(cong: dict, news_mentions: int, sector_mentions: int) -> dict:
+    buy = int(cong.get("buy") or 0)
+    sell = int(cong.get("sell") or 0)
+    dem = int(cong.get("dem") or 0)
+    rep = int(cong.get("rep") or 0)
 
-    if not themes:
-        themes = ["sector-specific developments"]
+    participation = buy + sell
+    net = buy - sell
+    bipartisan = min(dem, rep)
 
-    return "Themes: " + ", ".join(themes) + "."
+    # Scoring: congress dominates, news boosts relevance
+    score = 0.0
+    score += 6.0 * participation
+    score += 5.0 * max(0, net)
+    score += 2.5 * bipartisan
+    score += 2.0 * news_mentions
+    score += 1.5 * sector_mentions
 
-def _build_implications(sector: str, headlines: List[str], sentiment_score: int) -> List[str]:
-    # generic but useful, bounded to 2–4 bullets
-    out: List[str] = []
-    if sector == "AI":
-        out.append("If cloud and chip demand headlines stay strong, AI infrastructure leaders can keep momentum.")
-        out.append("Watch valuation sensitivity: higher yields or weaker guidance can trigger fast multiple compression.")
-        out.append("Regulatory scrutiny or export controls can create sudden dispersion inside the sector.")
-    elif sector == "Medical":
-        out.append("FDA, trial readouts, and reimbursement headlines can dominate near-term moves more than macro.")
-        out.append("If rates stay elevated, early-stage and high cash-burn names may remain volatile.")
-        out.append("Device utilization trends can be a tell for procedure volumes and hospital capex appetite.")
-    elif sector == "Energy":
-        out.append("Oil, gas, and LNG are headline-driven: supply shocks and geopolitics can overwhelm fundamentals short term.")
-        out.append("Grid and power buildout headlines can support electrification suppliers even if crude drifts.")
-        out.append("If inflation re-accelerates, energy can act as a hedge but tends to stay choppy.")
-    elif sector == "Robotics":
-        out.append("Robotics tends to track industrial demand and capex cycles: watch PMI, orders, and guidance.")
-        out.append("If labor tightness persists, automation adoption can stay durable even in slower growth.")
-        out.append("AI coupling is key: perception and autonomy headlines often re-rate winners quickly.")
-    elif sector == "Infrastructure":
-        out.append("Infrastructure names can benefit from multi-quarter backlogs, but are sensitive to rates and funding pace.")
-        out.append("Data center and grid buildout headlines can create persistent demand pockets.")
-        out.append("Cost inflation in labor and materials can pressure margins unless contracts pass-through.")
-    else:
-        out.append("Macro headlines can set the tape: rates, inflation, and earnings guidance matter most over weeks to months.")
-        out.append("If sentiment turns risk-off, high-beta growth themes typically underperform.")
-    # sentiment tilt
-    if sentiment_score >= 60:
-        out.insert(0, "Headlines skew constructive; dips may be bought if liquidity stays supportive.")
-    elif sentiment_score <= 40:
-        out.insert(0, "Headlines skew cautious; expect higher volatility and more selectivity.")
-    return out[:4]
+    # Soft clamp to 0..100 for UI friendliness
+    score_100 = int(max(0, min(100, round(100.0 * (1.0 - math.exp(-score / 25.0))))))
 
-@app.get("/news/briefing")
-def news_briefing(
-    watchlist: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
-    max_items: int = Query(default=60, ge=20, le=200),
-    max_watch_items_per_ticker: int = Query(default=6, ge=2, le=20),
-):
-    # Pull both general + watchlist RSS (reuse the same feed logic)
-    general_feeds = [
-        "https://www.yahoo.com/news/rss/finance",
-        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-        "https://www.marketwatch.com/rss/topstories",
-    ]
-
-    general_items: List[dict] = []
-    general_errors: List[str] = []
-    for f in general_feeds:
-        try:
-            it = _fetch_rss_items(f, max_items=max_items)
-            for x in it:
-                x["sourceFeed"] = f
-                x["source"] = "general"
-            general_items.extend(it)
-        except Exception as e:
-            general_errors.append(f"{f} -> {type(e).__name__}: {str(e)}")
-
-    syms = [t.strip().upper() for t in (watchlist or "").split(",") if t.strip()][:40]
-    watch_items_by: Dict[str, List[dict]] = {}
-    watch_errors: List[str] = []
-    for t in syms:
-        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(t)}&region=US&lang=en-US"
-        try:
-            it = _fetch_rss_items(url, max_items=max_watch_items_per_ticker)
-            for x in it:
-                x["sourceFeed"] = "yahoo_ticker_rss"
-                x["source"] = "watchlist"
-                x["ticker"] = t
-            watch_items_by[t] = it
-        except Exception as e:
-            watch_errors.append(f"{t}: {type(e).__name__}: {str(e)}")
-            watch_items_by[t] = []
-
-    merged: List[dict] = []
-    merged.extend(general_items)
-
-    for t in syms:
-        merged.extend(watch_items_by.get(t, []))
-
-    # de-dupe by link
-    seen = set()
-    deduped: List[dict] = []
-    for x in merged:
-        lk = (x.get("link") or "").strip()
-        if not lk or lk in seen:
-            continue
-        seen.add(lk)
-        deduped.append(x)
-
-    # tag sectors
-    for x in deduped:
-        title = str(x.get("title") or "")
-        x["sectors"] = _tag_sectors(title)
-        x["bucket"] = "sector" if x["sectors"] else "general"
-
-    overall_sent = _headline_sentiment([str(x.get("title") or "") for x in deduped])
-
-    # Build sector payloads
-    sector_rows: List[dict] = []
-    for sector in ["AI", "Medical", "Energy", "Robotics", "Infrastructure"]:
-        sector_items = [x for x in deduped if sector in (x.get("sectors") or [])]
-        titles = [str(x.get("title") or "") for x in sector_items]
-        sent = _headline_sentiment(titles)
-        summary = _build_sector_summary(titles[:20])
-        implications = _build_implications(sector, titles[:20], int(sent.get("score") or 50))
-
-        sector_rows.append({
-            "sector": sector,
-            "count": len(sector_items),
-            "sentiment": sent,
-            "summary": summary,
-            "implications_2_12_weeks": implications,
-            "headlines": sector_items[:40],
-        })
-
-    # General / leftover headlines
-    general_left = [x for x in deduped if not (x.get("sectors") or [])]
-    general_titles = [str(x.get("title") or "") for x in general_left]
-    general_sent = _headline_sentiment(general_titles)
-    general_summary = _build_sector_summary(general_titles[:20])
-    general_imp = _build_implications("General", general_titles[:20], int(general_sent.get("score") or 50))
-
-    # Sort sectors by count descending
-    sector_rows.sort(key=lambda x: (-int(x.get("count") or 0), x.get("sector") or ""))
+    drivers = []
+    if participation >= 4:
+        drivers.append("high participation")
+    if net >= 2:
+        drivers.append("net accumulation")
+    if bipartisan >= 2:
+        drivers.append("bipartisan")
+    if news_mentions >= 2:
+        drivers.append("watchlist headlines")
+    if sector_mentions >= 2:
+        drivers.append("sector headlines")
 
     return {
-        "date": datetime.now(timezone.utc).date().isoformat(),
-        "overallSentiment": overall_sent,
-        "sectors": sector_rows,
-        "general": {
-            "count": len(general_left),
-            "sentiment": general_sent,
-            "summary": general_summary,
-            "implications_2_12_weeks": general_imp,
-            "headlines": general_left[:50],
+        "ticker": cong.get("ticker"),
+        "score": score_100,
+        "congress": {
+            "buys": buy,
+            "sells": sell,
+            "net": net,
+            "bipartisan": bipartisan,
+            "lastFiledAt": cong.get("last") or "",
         },
-        "sources": {
-            "general_feeds": general_feeds,
-            "watchlist": syms,
+        "news": {
+            "watchlistMentions": int(news_mentions),
+            "sectorMentions": int(sector_mentions),
         },
-        "errors": {
-            "general": general_errors,
-            "watchlist": watch_errors,
-        },
-        "note": "Briefing uses RSS headlines + keyword sector tagging + lightweight sentiment. It is not investment advice.",
+        "drivers": drivers[:4],
     }
+
+
+@app.get("/signals/ideas")
+def signals_ideas(
+    window_days: int = Query(default=30, ge=1, le=365),
+    watchlist: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
+    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense"),
+    limit: int = Query(default=25, ge=5, le=100),
+):
+    """
+    Returns a scored list you can render under Market Entry on Main tab.
+    """
+    key = f"ideas:{window_days}:{watchlist}:{sectors}:{limit}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    wl = [t.strip().upper() for t in watchlist.split(",") if t.strip()]
+    sec_str = sectors
+
+    # Pull congress
+    congress = report_today(window_days=window_days, horizon_days=None)
+
+    # Aggregate congress tickers
+    cong_agg = _congress_ticker_agg(congress)
+
+    # Pull watchlist headlines
+    wnews = news_watchlist(tickers=",".join(wl), max_items_per_ticker=8)
+    watch_titles: List[str] = []
+    for t, arr in (wnews.get("itemsByTicker") or {}).items():
+        for x in (arr or [])[:8]:
+            watch_titles.append(x.get("title", "") or "")
+
+    # Pull sector briefing and count mentions of watchlist tickers in sector headlines
+    briefing = news_briefing(sectors=sec_str, watchlist=",".join(wl), max_items_per_sector=12)
+    sector_titles: List[str] = []
+    for sec in briefing.get("sectors") or []:
+        for x in (sec.get("topHeadlines") or [])[:10]:
+            sector_titles.append(x.get("title", "") or "")
+
+    watch_counts = _extract_tickers_from_titles(watch_titles, wl)
+    sector_counts = _extract_tickers_from_titles(sector_titles, wl)
+
+    # Score all congress tickers, plus any watchlist tickers mentioned in news
+    tickers = set(cong_agg.keys()) | set(watch_counts.keys()) | set(sector_counts.keys())
+
+    rows = []
+    for t in tickers:
+        cong = cong_agg.get(t) or {"ticker": t, "buy": 0, "sell": 0, "dem": 0, "rep": 0, "last": ""}
+        rows.append(_score_row(cong, watch_counts.get(t, 0), sector_counts.get(t, 0)))
+
+    rows.sort(key=lambda x: (-int(x.get("score") or 0), x.get("ticker") or ""))
+    out = {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "windowDays": window_days,
+        "limit": limit,
+        "ideas": rows[:limit],
+        "note": "Score blends congress activity with relevance from watchlist + sector headlines.",
+    }
+    return cache_set(key, out, ttl_seconds=180)
