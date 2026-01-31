@@ -1,7 +1,5 @@
 import os
 import re
-import json
-import math
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="3.0.0")
+app = FastAPI(title="Finance Signals Backend", version="4.0.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -32,14 +30,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
+QUIVER_TOKEN = os.getenv("QUIVER_TOKEN", "").strip()
 
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "4.0.0"}
 
 
 # =========================================================
@@ -211,11 +209,11 @@ CRYPTO_ALIASES: Dict[str, List[str]] = {
     "BNB": ["bnb", "binance coin"],
 }
 
-CRYPTO_RELATED_TICKERS = set([
+CRYPTO_RELATED_TICKERS = {
     "IBIT", "FBTC", "ARKB", "BITB", "BTCO", "HODL", "GBTC", "BITO",
     "ETHE", "ETHA",
     "COIN", "MSTR", "RIOT", "MARA", "HUT", "CLSK",
-])
+}
 
 TICKER_TO_COINS: Dict[str, List[str]] = {
     "IBIT": ["BTC"], "FBTC": ["BTC"], "ARKB": ["BTC"], "BITB": ["BTC"], "BTCO": ["BTC"], "HODL": ["BTC"],
@@ -293,11 +291,8 @@ def classify_crypto_trade(ticker: str, text: str) -> Tuple[bool, List[str], str]
     is_related_ticker = bool(t and t in CRYPTO_RELATED_TICKERS)
     coins_from_ticker = TICKER_TO_COINS.get(t, []) if is_related_ticker else []
 
-    coins = []
     merged = set(coins_from_text + coins_from_ticker)
-    for sym in TOP_COINS:
-        if sym in merged:
-            coins.append(sym)
+    coins = [sym for sym in TOP_COINS if sym in merged]
     if "CRYPTO-LINKED" in merged:
         coins.append("CRYPTO-LINKED")
 
@@ -307,7 +302,6 @@ def classify_crypto_trade(ticker: str, text: str) -> Tuple[bool, List[str], str]
         return True, coins if coins else ["CRYPTO-LINKED"], "etf_or_proxy"
     if has_generic_crypto_hint(text):
         return True, coins if coins else ["CRYPTO"], "hint_only"
-
     return False, [], ""
 
 
@@ -315,6 +309,17 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
     out = [{"symbol": k, "count": v} for k, v in m.items()]
     out.sort(key=lambda x: (-x["count"], x["symbol"]))
     return out
+
+
+def _require_quiver():
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
+
+
+def _get_congress_df():
+    _require_quiver()
+    q = quiverquant.quiver(QUIVER_TOKEN)
+    return q.congress_trading()
 
 
 # =========================================================
@@ -325,16 +330,12 @@ def report_today(
     window_days: Optional[int] = Query(default=None, ge=1, le=365),
     horizon_days: Optional[int] = Query(default=None, ge=1, le=365),
 ):
-    if not QUIVER_TOKEN:
-        raise HTTPException(500, "QUIVER_TOKEN missing")
-
     days = window_days if window_days is not None else horizon_days if horizon_days is not None else 30
 
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
 
-    q = quiverquant.quiver(QUIVER_TOKEN)
-    df = q.congress_trading()
+    df = _get_congress_df()
 
     if df is None or len(df) == 0:
         return {
@@ -364,9 +365,7 @@ def report_today(
 
     for r in rows:
         best_dt = row_best_dt(r)
-        if best_dt is None:
-            continue
-        if best_dt < since or best_dt > now:
+        if best_dt is None or best_dt < since or best_dt > now:
             continue
 
         party = norm_party_from_any(r)
@@ -401,14 +400,10 @@ def report_today(
         }
 
         if ticker:
-            if kind == "BUY":
-                buys.append(item)
-            else:
-                sells.append(item)
+            (buys if kind == "BUY" else sells).append(item)
 
         text_blob = collect_crypto_text(r)
         is_crypto, coins, crypto_kind = classify_crypto_trade(ticker, text_blob)
-
         if is_crypto:
             target_counts = crypto_counts_buy if kind == "BUY" else crypto_counts_sell
             for c in coins if coins else ["CRYPTO"]:
@@ -428,10 +423,7 @@ def report_today(
                 "filed": iso_date_only(filed_dt),
             }
             crypto_raw.append(rec)
-            if kind == "BUY":
-                crypto_raw_buys.append(rec)
-            else:
-                crypto_raw_sells.append(rec)
+            (crypto_raw_buys if kind == "BUY" else crypto_raw_sells).append(rec)
 
     buys.sort(key=lambda x: x["best_dt"], reverse=True)
     sells.sort(key=lambda x: x["best_dt"], reverse=True)
@@ -490,24 +482,30 @@ def report_today(
     }
 
 
-# =========================================================
-# Congress: holdings proxy endpoint your UI expects
-# GET /report/holdings/common?window_days=365
-# =========================================================
-@app.get("/report/holdings/common")
-def report_holdings_common(
-    window_days: int = Query(default=365, ge=30, le=365),
-    top_n: int = Query(default=30, ge=5, le=100),
+@app.get("/report/crypto")
+def report_crypto(
+    window_days: Optional[int] = Query(default=None, ge=1, le=365),
+    horizon_days: Optional[int] = Query(default=None, ge=1, le=365),
 ):
-    if not QUIVER_TOKEN:
-        raise HTTPException(500, "QUIVER_TOKEN missing")
+    payload = report_today(window_days=window_days, horizon_days=horizon_days)
+    return {
+        "date": payload["date"],
+        "windowDays": payload["windowDays"],
+        "windowStart": payload["windowStart"],
+        "windowEnd": payload["windowEnd"],
+        "crypto": payload["crypto"],
+    }
 
+
+# =========================================================
+# Holdings proxy endpoints
+# Provides BOTH routes, same data shape
+# =========================================================
+def _compute_common_holdings(window_days: int, top_n: int) -> dict:
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=window_days)
 
-    q = quiverquant.quiver(QUIVER_TOKEN)
-    df = q.congress_trading()
-
+    df = _get_congress_df()
     if df is None or len(df) == 0:
         return {
             "date": now.date().isoformat(),
@@ -515,6 +513,7 @@ def report_holdings_common(
             "windowStart": since.date().isoformat(),
             "windowEnd": now.date().isoformat(),
             "commonHoldings": [],
+            "topHoldings": [],
             "meta": {"uniquePoliticians": 0, "uniqueTickers": 0, "topN": top_n},
             "note": "No congress trading rows returned for this window.",
         }
@@ -544,39 +543,52 @@ def report_holdings_common(
         all_pol.add(pol)
         per_ticker.setdefault(t, set()).add(pol)
 
-    common = [{"ticker": t, "companyName": "", "holders": len(pols)} for t, pols in per_ticker.items()]
+    common = [{"ticker": t, "companyName": "", "holders": len(pols), "holderCount": len(pols)} for t, pols in per_ticker.items()]
     common.sort(key=lambda x: (-int(x["holders"]), x["ticker"]))
     common = common[:top_n]
 
+    # Include both keys so old and new front ends work without edits
     return {
         "date": now.date().isoformat(),
         "windowDays": window_days,
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "commonHoldings": common,
+        "topHoldings": common,
         "meta": {"uniquePoliticians": len(all_pol), "uniqueTickers": len(per_ticker), "topN": top_n},
-        "note": "Holdings are a proxy from disclosures: holders = unique members who disclosed activity in ticker within the window.",
+        "note": "Holdings are a proxy from disclosures: holders = unique members who disclosed any activity in ticker within the window.",
     }
 
 
+@app.get("/report/holdings/common")
+def report_holdings_common(
+    window_days: int = Query(default=365, ge=30, le=365),
+    top_n: int = Query(default=30, ge=5, le=100),
+):
+    return _compute_common_holdings(window_days, top_n)
+
+
+@app.get("/report/congress-holdings")
+def report_congress_holdings_alias(
+    window_days: int = Query(default=365, ge=30, le=365),
+    top_n: int = Query(default=30, ge=5, le=100),
+):
+    # alias for older front ends
+    return _compute_common_holdings(window_days, top_n)
+
+
 # =========================================================
-# Congress: day-by-day activity feed for UI
-# GET /report/congress/daily?window_days=14
+# Congress: day-by-day activity feed
 # =========================================================
 @app.get("/report/congress/daily")
 def report_congress_daily(
     window_days: int = Query(default=14, ge=1, le=365),
     limit: int = Query(default=200, ge=50, le=1000),
 ):
-    if not QUIVER_TOKEN:
-        raise HTTPException(500, "QUIVER_TOKEN missing")
-
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=window_days)
 
-    q = quiverquant.quiver(QUIVER_TOKEN)
-    df = q.congress_trading()
-
+    df = _get_congress_df()
     if df is None or len(df) == 0:
         return {
             "date": now.date().isoformat(),
@@ -617,14 +629,8 @@ def report_congress_daily(
 
         desc = str(pick_first(r, ["AssetDescription", "asset_description", "Description", "description", "Asset", "asset"], "")).strip()
 
-        # Source links (best effort)
-        cap_url = ""
-        if pol:
-            cap_url = "https://www.capitoltrades.com/politicians/" + quote_plus(pol)
-
-        ticker_url = ""
-        if ticker:
-            ticker_url = "https://www.capitoltrades.com/trades?search=" + quote_plus(ticker)
+        cap_pol = "https://www.capitoltrades.com/politicians/" + quote_plus(pol) if pol else ""
+        cap_ticker = "https://www.capitoltrades.com/trades?search=" + quote_plus(ticker) if ticker else ""
 
         items.append({
             "kind": kind,
@@ -638,29 +644,25 @@ def report_congress_daily(
             "description": desc,
             "bestDate": iso_date_only(best_dt),
             "links": {
-                "capitoltrades_politician": cap_url,
-                "capitoltrades_ticker": ticker_url,
+                "capitoltrades_politician": cap_pol,
+                "capitoltrades_ticker": cap_ticker,
                 "quiver_congresstrading": "https://www.quiverquant.com/congresstrading/",
                 "senate_efd_search": "https://efdsearch.senate.gov/search/home/",
                 "house_disclosures": "https://disclosures-clerk.house.gov/",
             }
         })
 
-    # Sort newest first by filed/traded fallback
     def sort_key(x):
-        s = x.get("filed") or x.get("traded") or x.get("bestDate") or ""
-        return s
+        return x.get("filed") or x.get("traded") or x.get("bestDate") or ""
 
     items.sort(key=sort_key, reverse=True)
     items = items[:limit]
 
-    # Group by filed date (or traded if filed missing)
     days: Dict[str, List[dict]] = {}
     for it in items:
         d = it.get("filed") or it.get("traded") or it.get("bestDate") or now.date().isoformat()
         days.setdefault(d, []).append(it)
 
-    # Convert to ordered list
     day_list = [{"date": d, "items": days[d]} for d in sorted(days.keys(), reverse=True)]
 
     return {
@@ -669,19 +671,25 @@ def report_congress_daily(
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "days": day_list,
-        "note": "Grouped by filed date when available. Links are best-effort jump links.",
+        "note": "Grouped by filed date when available. Links are jump links to public sources.",
     }
 
 
 # =========================================================
-# Market Entry Index
-# Uses Yahoo Finance chart API first (more reliable on Render),
-# then falls back to Stooq.
+# Market Entry Index with caching fallback
+# Yahoo chart first, Stooq fallback, then cache fallback
 # =========================================================
+MARKET_CACHE: Dict[str, Any] = {
+    "ts": 0.0,
+    "payload": None,  # last good payload
+}
+MARKET_CACHE_TTL_SEC = 6 * 60 * 60  # 6 hours
+
+
 def _yahoo_chart_daily_close(symbol: str, range_str: str = "1y", interval: str = "1d") -> List[Tuple[datetime, float]]:
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
     params = {"range": range_str, "interval": interval}
-    r = requests.get(url, params=params, timeout=12)
+    r = requests.get(url, params=params, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     j = r.json()
     res = (j.get("chart") or {}).get("result") or []
@@ -705,7 +713,7 @@ def _yahoo_chart_daily_close(symbol: str, range_str: str = "1y", interval: str =
 
 def _stooq_daily_close(symbol: str, lookback_days: int = 260) -> List[Tuple[datetime, float]]:
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    r = requests.get(url, timeout=20)
+    r = requests.get(url, timeout=18, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
 
     lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
@@ -750,11 +758,10 @@ def _clamp01(x: float) -> float:
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     now = datetime.now(timezone.utc)
-
-    # Prefer Yahoo (Render-friendly), fallback to Stooq
-    spy = []
-    vix = []
     err_notes = []
+
+    spy: List[Tuple[datetime, float]] = []
+    vix: List[Tuple[datetime, float]] = []
 
     try:
         spy = _yahoo_chart_daily_close("SPY", range_str="1y", interval="1d")
@@ -769,13 +776,25 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         except Exception as e:
             err_notes.append(f"Stooq failed: {type(e).__name__}: {str(e)}")
 
+    # If still insufficient, return cached payload if available
     if len(spy) < 210 or len(vix) < 30:
+        cached = MARKET_CACHE.get("payload")
+        if cached and isinstance(cached, dict):
+            out = dict(cached)
+            out["notes"] = (out.get("notes") or "") + " | USING CACHED MARKET DATA"
+            if err_notes:
+                out["notes"] = (out.get("notes") or "") + " | " + " | ".join(err_notes)
+            out["date"] = now.date().isoformat()
+            out["cached"] = True
+            return out
+
         return {
             "date": now.date().isoformat(),
             "score": 0,
             "regime": "NEUTRAL",
             "signal": "DATA UNAVAILABLE",
             "notes": " | ".join(err_notes) if err_notes else "Insufficient market data.",
+            "cached": False,
             "components": {
                 "spxTrend": 0.5,
                 "vix": 0.5,
@@ -822,12 +841,13 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     if err_notes:
         notes = notes + " | " + " | ".join(err_notes)
 
-    return {
+    payload = {
         "date": now.date().isoformat(),
         "score": score,
         "regime": regime,
         "signal": signal,
         "notes": notes,
+        "cached": False,
         "components": {
             "spxTrend": float(spx_trend_01),
             "vix": float(vix_01),
@@ -838,6 +858,10 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         },
     }
 
+    MARKET_CACHE["ts"] = time.time()
+    MARKET_CACHE["payload"] = payload
+    return payload
+
 
 # =========================================================
 # News + Sentiment
@@ -846,14 +870,12 @@ def _fetch_rss_items(url: str, timeout: int = 12, max_items: int = 30) -> List[d
     r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
 
-    # Some RSS feeds have leading whitespace or BOM, strip for safety
-    text = r.text.strip()
+    text = (r.text or "").strip()
     root = ET.fromstring(text)
 
-    # RSS: <rss><channel><item>...
     channel = root.find("channel")
     if channel is None:
-        # Atom fallback: <feed><entry>...
+        # Atom fallback
         entries = root.findall("{http://www.w3.org/2005/Atom}entry")
         out = []
         for e in entries[:max_items]:
@@ -873,17 +895,17 @@ def _fetch_rss_items(url: str, timeout: int = 12, max_items: int = 30) -> List[d
     return out
 
 
-_POS_WORDS = set([
+_POS_WORDS = {
     "beat", "beats", "surge", "surges", "rally", "rallies", "gain", "gains", "up",
     "upgrade", "upgrades", "record", "strong", "bull", "bullish", "growth",
     "profit", "profits", "outperform", "buy", "wins", "win", "breakout"
-])
-_NEG_WORDS = set([
+}
+_NEG_WORDS = {
     "miss", "misses", "drop", "drops", "plunge", "plunges", "down",
     "downgrade", "downgrades", "warning", "weak", "bear", "bearish",
     "lawsuit", "probe", "investigation", "fraud", "loss", "losses",
     "cut", "cuts", "layoff", "layoffs", "recession", "crash"
-])
+}
 
 
 def _headline_sentiment(headlines: List[str]) -> Dict[str, Any]:
@@ -908,9 +930,8 @@ def _headline_sentiment(headlines: List[str]) -> Dict[str, Any]:
             score -= 1
 
     if total == 0:
-        return {"label": "NEUTRAL", "score": 0, "pos": 0, "neg": 0, "total": 0}
+        return {"label": "NEUTRAL", "score": 50, "pos": 0, "neg": 0, "total": 0}
 
-    # normalize into 0..100-ish gauge
     raw = score / max(1, total)
     gauge = int(round(50 + 50 * raw))
     gauge = max(0, min(100, gauge))
@@ -926,18 +947,10 @@ def _headline_sentiment(headlines: List[str]) -> Dict[str, Any]:
 
 
 @app.get("/news/top")
-def news_top(
-    max_items: int = Query(default=30, ge=10, le=100),
-):
-    """
-    General market news headlines and a simple sentiment gauge.
-    """
+def news_top(max_items: int = Query(default=30, ge=10, le=100)):
     feeds = [
-        # Yahoo general finance RSS
         "https://www.yahoo.com/news/rss/finance",
-        # CNBC Top News RSS (often works)
         "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-        # MarketWatch Top Stories RSS (often works)
         "https://www.marketwatch.com/rss/topstories",
     ]
 
@@ -953,7 +966,6 @@ def news_top(
         except Exception as e:
             errors.append(f"{f} -> {type(e).__name__}: {str(e)}")
 
-    # dedupe by link
     seen = set()
     deduped = []
     for x in items:
@@ -963,9 +975,7 @@ def news_top(
         seen.add(lk)
         deduped.append(x)
 
-    # newest-ish first: RSS pubDate formats vary, so keep stable order (already feed order)
     deduped = deduped[:max_items]
-
     sentiment = _headline_sentiment([x.get("title", "") for x in deduped])
 
     return {
@@ -973,7 +983,7 @@ def news_top(
         "items": deduped,
         "sentiment": sentiment,
         "errors": errors,
-        "note": "Sentiment is a lightweight headline-based gauge, not a price predictor.",
+        "note": "Sentiment is a lightweight headline gauge, not a predictor.",
     }
 
 
@@ -982,10 +992,6 @@ def news_watchlist(
     tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
     max_items_per_ticker: int = Query(default=8, ge=3, le=25),
 ):
-    """
-    Yahoo Finance per-ticker RSS feed.
-    Uses: https://feeds.finance.yahoo.com/rss/2.0/headline?s=SPY&region=US&lang=en-US
-    """
     syms = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     syms = syms[:40]
 
@@ -1004,7 +1010,6 @@ def news_watchlist(
             errors.append(f"{t}: {type(e).__name__}: {str(e)}")
             all_items[t] = []
 
-    # sentiment across all watchlist headlines
     headlines = []
     for t in syms:
         headlines.extend([x.get("title", "") for x in all_items.get(t, [])])
@@ -1017,5 +1022,5 @@ def news_watchlist(
         "itemsByTicker": all_items,
         "sentiment": sentiment,
         "errors": errors,
-        "note": "Ticker news via Yahoo RSS. If a ticker has no feed items, it may be temporarily empty.",
+        "note": "Ticker news via Yahoo RSS.",
     }
