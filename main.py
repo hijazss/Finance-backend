@@ -9,12 +9,11 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 
-app = FastAPI(title="Finance Signals Backend", version="2.0.0")
+# =========================================================
+# App
+# =========================================================
+app = FastAPI(title="Finance Signals Backend", version="3.0.0")
 
-# --------------------------
-# CORS
-# --------------------------
-# Add any other origins you use for testing (localhost, custom domain, etc.)
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
     "http://localhost:5173",
@@ -29,18 +28,17 @@ app.add_middleware(
 )
 
 QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
-
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
 
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {"status": "ok", "service": "finance-signals-backend"}
 
 
-# --------------------------
+# =========================================================
 # Helpers
-# --------------------------
+# =========================================================
 def pick_first(row: dict, keys: List[str], default=""):
     for k in keys:
         if k in row and row[k] is not None:
@@ -189,9 +187,9 @@ def to_card(x: dict, kind: str) -> dict:
     }
 
 
-# --------------------------
-# Crypto detection (same behavior as your current backend)
-# --------------------------
+# =========================================================
+# Crypto detection
+# =========================================================
 TOP_COINS = ["BTC", "ETH", "SOL", "LINK", "XRP", "ADA", "DOGE", "AVAX", "MATIC", "BNB"]
 
 CRYPTO_ALIASES: Dict[str, List[str]] = {
@@ -313,25 +311,30 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
     return out
 
 
-# --------------------------
-# Main Congress rolling window
-# --------------------------
+# =========================================================
+# Quiver wrapper
+# =========================================================
+def _get_congress_df():
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing (set env var QUIVER_TOKEN)")
+    q = quiverquant.quiver(QUIVER_TOKEN)
+    return q.congress_trading()
+
+
+# =========================================================
+# Endpoints
+# =========================================================
 @app.get("/report/today")
 def report_today(
     window_days: Optional[int] = Query(default=None, ge=1, le=365),
     horizon_days: Optional[int] = Query(default=None, ge=1, le=365),
 ):
-    if not QUIVER_TOKEN:
-        raise HTTPException(500, "QUIVER_TOKEN missing")
-
     days = window_days if window_days is not None else horizon_days if horizon_days is not None else 30
 
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
 
-    q = quiverquant.quiver(QUIVER_TOKEN)
-    df = q.congress_trading()
-
+    df = _get_congress_df()
     if df is None or len(df) == 0:
         return {
             "date": now.date().isoformat(),
@@ -404,7 +407,6 @@ def report_today(
 
         text_blob = collect_crypto_text(r)
         is_crypto, coins, crypto_kind = classify_crypto_trade(ticker, text_blob)
-
         if is_crypto:
             target_counts = crypto_counts_buy if kind == "BUY" else crypto_counts_sell
             for c in coins if coins else ["CRYPTO"]:
@@ -443,11 +445,13 @@ def report_today(
     for t in overlap:
         dem_ct = sum(1 for x in dem_buy if x["ticker"] == t)
         rep_ct = sum(1 for x in rep_buy if x["ticker"] == t)
+
         latest_dt = None
         for x in buys:
             if x["ticker"] == t:
                 if latest_dt is None or x["best_dt"] > latest_dt:
                     latest_dt = x["best_dt"]
+
         overlap_cards.append({
             "ticker": t,
             "companyName": "",
@@ -501,48 +505,32 @@ def report_crypto(
     }
 
 
-# --------------------------
-# FIX: Holdings overlap endpoint your frontend calls
-# Frontend calls: /report/holdings/common?window_days=365
-# --------------------------
 @app.get("/report/holdings/common")
 def report_holdings_common(
     window_days: int = Query(default=365, ge=30, le=365),
     top_n: int = Query(default=30, ge=5, le=100),
 ):
     """
-    "Common holdings" proxy, computed from congress trading disclosures:
-    holders = unique politicians who disclosed activity in ticker in the window.
+    This fixes your 404.
 
-    Returns the shape your frontend expects:
-      {
-        "date": "...",
-        "windowDays": 365,
-        "commonHoldings": [
-          {"ticker":"NVDA","companyName":"","holders":42},
-          ...
-        ],
-        "meta": {...}
-      }
+    "Common holdings" here is a proxy from disclosure activity:
+    holders = unique politicians who disclosed any trade in ticker within the window.
+
+    Frontend expects:
+      { windowDays, commonHoldings: [ {ticker, companyName, holders}, ... ] }
     """
-    if not QUIVER_TOKEN:
-        raise HTTPException(500, "QUIVER_TOKEN missing")
-
-    days = window_days
     now = datetime.now(timezone.utc)
-    since = now - timedelta(days=days)
+    since = now - timedelta(days=window_days)
 
-    q = quiverquant.quiver(QUIVER_TOKEN)
-    df = q.congress_trading()
-
+    df = _get_congress_df()
     if df is None or len(df) == 0:
         return {
             "date": now.date().isoformat(),
-            "windowDays": days,
+            "windowDays": window_days,
             "windowStart": since.date().isoformat(),
             "windowEnd": now.date().isoformat(),
             "commonHoldings": [],
-            "meta": {"uniquePoliticians": 0, "uniqueTickers": 0},
+            "meta": {"uniquePoliticians": 0, "uniqueTickers": 0, "topN": top_n},
             "note": "No congress trading rows returned for this window.",
         }
 
@@ -551,7 +539,6 @@ def report_holdings_common(
     except Exception:
         rows = list(df)
 
-    # ticker -> set(politician)
     per_ticker: Dict[str, set] = {}
     all_pol: set = set()
 
@@ -570,24 +557,18 @@ def report_holdings_common(
 
         t = ticker.upper()
         all_pol.add(pol)
-        if t not in per_ticker:
-            per_ticker[t] = set()
-        per_ticker[t].add(pol)
+        per_ticker.setdefault(t, set()).add(pol)
 
-    common = []
-    for t, pols in per_ticker.items():
-        common.append({
-            "ticker": t,
-            "companyName": "",          # optional in UI
-            "holders": len(pols),       # frontend reads holders/holderCount
-        })
-
+    common = [
+        {"ticker": t, "companyName": "", "holders": len(pols)}
+        for t, pols in per_ticker.items()
+    ]
     common.sort(key=lambda x: (-int(x["holders"]), x["ticker"]))
     common = common[:top_n]
 
     return {
         "date": now.date().isoformat(),
-        "windowDays": days,
+        "windowDays": window_days,
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "commonHoldings": common,
@@ -596,23 +577,14 @@ def report_holdings_common(
             "uniqueTickers": len(per_ticker),
             "topN": top_n,
         },
-        "note": (
-            "Holdings are a proxy from disclosures: holders = unique members who disclosed activity in ticker within the window."
-        ),
+        "note": "Proxy metric from disclosures: holders = unique members with any disclosed activity in ticker within window.",
     }
 
 
-# --------------------------
+# =========================================================
 # Market Entry Index (simple, stable)
-# Uses Stooq CSV for SPY + VIX
-# --------------------------
+# =========================================================
 def _stooq_daily_close(symbol: str, lookback_days: int = 260) -> List[Tuple[datetime, float]]:
-    """
-    Fetch daily closes from Stooq. Symbol examples:
-      SPY -> "spy.us"
-      VIX -> "^vix"
-    Returns list of (date, close) sorted ascending.
-    """
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
     r = requests.get(url, timeout=20)
     r.raise_for_status()
@@ -622,11 +594,11 @@ def _stooq_daily_close(symbol: str, lookback_days: int = 260) -> List[Tuple[date
         return []
 
     header = lines[0].lower().split(",")
-    try:
-        date_i = header.index("date")
-        close_i = header.index("close")
-    except ValueError:
+    if "date" not in header or "close" not in header:
         return []
+
+    date_i = header.index("date")
+    close_i = header.index("close")
 
     out: List[Tuple[datetime, float]] = []
     for ln in lines[1:]:
@@ -656,28 +628,38 @@ def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
 
+def _fetch_vix_series() -> List[Tuple[datetime, float]]:
+    """
+    Stooq symbols can vary. Try a small set of common ones.
+    """
+    candidates = ["^vix", "vix", "vix.i"]
+    for sym in candidates:
+        try:
+            data = _stooq_daily_close(sym, lookback_days=260)
+            if len(data) >= 60:
+                return data
+        except Exception:
+            continue
+    return []
+
+
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     """
-    Simple entry score 0-100:
-      - Trend (SPY): 50d SMA vs 200d SMA and price vs 200d
-      - Vol (VIX): lower VIX = higher score (scaled by typical range)
+    Score 0-100:
+      - SPY trend: SMA50 vs SMA200 and price vs SMA200
+      - VIX level: lower VIX = higher score
 
-    Returns:
-      {
-        "date": "YYYY-MM-DD",
-        "score": 0..100,
-        "regime": "RISK-ON|NEUTRAL|RISK-OFF",
-        "signal": "...",
-        "components": { spxTrend, vix, breadth, credit, rates, buffettProxy }
-      }
+    The frontend already knows how to render this payload.
     """
+    now = datetime.now(timezone.utc)
+
     try:
         spy = _stooq_daily_close("spy.us", lookback_days=260)
-        vix = _stooq_daily_close("^vix", lookback_days=260)
+        vix = _fetch_vix_series()
     except Exception as e:
         return {
-            "date": datetime.now(timezone.utc).date().isoformat(),
+            "date": now.date().isoformat(),
             "score": 0,
             "regime": "NEUTRAL",
             "signal": "DATA UNAVAILABLE",
@@ -694,11 +676,11 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
 
     if len(spy) < 210 or len(vix) < 30:
         return {
-            "date": datetime.now(timezone.utc).date().isoformat(),
+            "date": now.date().isoformat(),
             "score": 0,
             "regime": "NEUTRAL",
             "signal": "INSUFFICIENT DATA",
-            "notes": "Not enough history returned for SPY/VIX.",
+            "notes": "Not enough history returned for SPY or VIX.",
             "components": {
                 "spxTrend": 0.5,
                 "vix": 0.5,
@@ -709,31 +691,26 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             },
         }
 
-    spy_dates, spy_close = zip(*spy)
-    vix_dates, vix_close = zip(*vix)
+    _, spy_close = zip(*spy)
+    _, vix_close = zip(*vix)
 
     price = float(spy_close[-1])
     sma50 = _sma(list(spy_close), 50) or price
     sma200 = _sma(list(spy_close), 200) or price
 
-    # Trend score 0..1
-    # - +0.5 if 50 > 200
-    # - +0.5 scaled by price vs 200
     trend_cross = 1.0 if sma50 >= sma200 else 0.0
-    price_vs_200 = _clamp01((price / sma200 - 0.90) / (1.10 - 0.90))  # maps 0.90x..1.10x to 0..1
+    price_vs_200 = _clamp01((price / sma200 - 0.90) / (1.10 - 0.90))  # 0.90x..1.10x -> 0..1
     spx_trend_01 = _clamp01(0.55 * trend_cross + 0.45 * price_vs_200)
 
-    # Vol score 0..1 (lower VIX is better). Typical VIX 12..35.
     v = float(vix_close[-1])
-    vix_01 = _clamp01(1.0 - ((v - 12.0) / (35.0 - 12.0)))
+    vix_01 = _clamp01(1.0 - ((v - 12.0) / (35.0 - 12.0)))  # VIX 12..35 typical band
 
-    # Simple proxies for unused fields (keep stable for UI)
+    # Keep these stable for your UI. You can replace later.
     breadth_01 = spx_trend_01
     credit_01 = 0.55
     rates_01 = 0.50
     buffett_01 = 0.55
 
-    # Total score
     score_01 = 0.65 * spx_trend_01 + 0.35 * vix_01
     score = int(round(100.0 * score_01))
 
@@ -748,7 +725,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         signal = "WAIT / SMALL DCA"
 
     return {
-        "date": datetime.now(timezone.utc).date().isoformat(),
+        "date": now.date().isoformat(),
         "score": score,
         "regime": regime,
         "signal": signal,
@@ -762,3 +739,11 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             "buffettProxy": float(buffett_01),
         },
     }
+
+
+# =========================================================
+# Local run
+# =========================================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
