@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.2.0")
+app = FastAPI(title="Finance Signals Backend", version="4.2.1")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -48,7 +48,7 @@ UA_HEADERS = {
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.2.0"}
+    return {"status": "ok", "version": "4.2.1"}
 
 
 # =========================================================
@@ -350,14 +350,29 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 
 # =========================================================
-# Market data (FIXED): Yahoo first, Stooq fallback
+# Market data (Yahoo + Stooq fallback)
 # =========================================================
 def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
-    params = {"range": range_str, "interval": interval}
-    r = requests.get(url, params=params, timeout=14, headers=UA_HEADERS)
-    r.raise_for_status()
-    return r.json()
+    """
+    Yahoo is convenient but often blocks or rate-limits server environments.
+    We try both query1 and query2.
+    """
+    base_urls = [
+        "https://query1.finance.yahoo.com/v8/finance/chart/",
+        "https://query2.finance.yahoo.com/v8/finance/chart/",
+    ]
+    last_err = None
+    for base in base_urls:
+        try:
+            url = base + quote_plus(symbol)
+            params = {"range": range_str, "interval": interval, "includePrePost": "false", "events": "div|split"}
+            r = requests.get(url, params=params, timeout=14, headers=UA_HEADERS)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err if last_err else RuntimeError("Yahoo chart failed")
 
 
 def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> List[Tuple[datetime, float]]:
@@ -381,85 +396,84 @@ def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> 
     return out
 
 
-def _symbol_to_stooq(symbol: str) -> str:
+def _stooq_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper()
     if s == "SPY":
         return "spy.us"
-    if s in ("^VIX", "VIX"):
-        return "vix"
-    if s in ("^GSPC", "SPX", "S&P500", "SP500"):
-        return "spx"
-    # crude fallback for US tickers
-    if re.fullmatch(r"[A-Z]{1,5}", s):
-        return s.lower() + ".us"
-    # strip leading ^ for some indices (best effort)
-    if s.startswith("^"):
-        return s[1:].lower()
-    return s.lower()
+    if s == "^VIX":
+        return "^vix"
+    s2 = s.replace("-", ".")
+    if s2.startswith("^"):
+        return s2.lower()
+    return (s2 + ".us").lower()
 
 
-def _stooq_closes(symbol: str, lookback_days: int = 3650) -> List[Tuple[datetime, float]]:
-    """
-    Stooq daily historical CSV:
-    https://stooq.com/q/d/l/?s=spy.us&i=d
-    """
-    sym = _symbol_to_stooq(symbol)
+def _stooq_closes(symbol: str) -> List[Tuple[datetime, float]]:
+    sym = _stooq_symbol(symbol)
     url = f"https://stooq.com/q/d/l/?s={quote_plus(sym)}&i=d"
     r = requests.get(url, timeout=14, headers=UA_HEADERS)
     r.raise_for_status()
 
     text = (r.text or "").strip()
-    if not text or "404" in text.lower():
+    if not text or "No data" in text:
         return []
 
     f = StringIO(text)
     reader = csv.DictReader(f)
-    rows = list(reader)
-    if not rows:
-        return []
-
     out: List[Tuple[datetime, float]] = []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=int(lookback_days))
-    for row in rows:
+    for row in reader:
         ds = (row.get("Date") or "").strip()
         cs = (row.get("Close") or "").strip()
         if not ds or not cs:
             continue
         try:
-            dt = datetime.strptime(ds, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            if dt < cutoff:
-                continue
-            c = float(cs)
+            dt = datetime.fromisoformat(ds).replace(tzinfo=timezone.utc)
+            out.append((dt, float(cs)))
         except Exception:
             continue
-        out.append((dt, c))
 
     out.sort(key=lambda x: x[0])
     return out
 
 
-def _closes(symbol: str, prefer_yahoo_range: str, interval: str, stooq_lookback_days: int) -> Tuple[List[Tuple[datetime, float]], List[str]]:
+def _filter_last_days(series: List[Tuple[datetime, float]], days: int) -> List[Tuple[datetime, float]]:
+    if not series:
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+    # keep a buffer because markets skip weekends
+    cutoff2 = cutoff - timedelta(days=10)
+    out = [(dt, v) for dt, v in series if dt >= cutoff2]
+    return out
+
+
+def _market_closes(symbol: str, range_days: int) -> Tuple[List[Tuple[datetime, float]], List[str], str]:
     """
-    Returns (series, errors)
+    Returns (closes, errors, source).
     """
     errors: List[str] = []
+    # Try Yahoo first
     try:
-        y = _yahoo_closes(symbol, range_str=prefer_yahoo_range, interval=interval)
-        if len(y) >= 10:
-            return y, errors
-        errors.append(f"Yahoo returned too few points for {symbol}")
+        # choose a generous range_str to increase chance of enough points
+        range_str = "1y" if range_days >= 330 else "6mo" if range_days >= 150 else "3mo"
+        closes = _yahoo_closes(symbol, range_str=range_str, interval="1d")
+        closes = _filter_last_days(closes, range_days)
+        if len(closes) >= 2:
+            return closes, errors, "yahoo"
+        errors.append(f"Yahoo returned insufficient data for {symbol}")
     except Exception as e:
         errors.append(f"Yahoo failed for {symbol}: {type(e).__name__}: {str(e)}")
 
+    # Fallback to Stooq
     try:
-        s = _stooq_closes(symbol, lookback_days=stooq_lookback_days)
-        if len(s) >= 10:
-            return s, errors
-        errors.append(f"Stooq returned too few points for {symbol}")
+        closes2 = _stooq_closes(symbol)
+        closes2 = _filter_last_days(closes2, range_days)
+        if len(closes2) >= 2:
+            return closes2, errors, "stooq"
+        errors.append(f"Stooq returned insufficient data for {symbol}")
     except Exception as e:
         errors.append(f"Stooq failed for {symbol}: {type(e).__name__}: {str(e)}")
 
-    return [], errors
+    return [], errors, "none"
 
 
 def _pct(a: float, b: float) -> float:
@@ -491,33 +505,47 @@ def _cnn_fear_greed_graphdata(date_str: Optional[str] = None) -> dict:
 
 @app.get("/market/fear-greed")
 def market_fear_greed(date: Optional[str] = Query(default=None)):
-    key = f"feargreed:{date or 'today'}"
+    key = f"feargreed:{date or 'auto'}"
     cached = cache_get(key)
     if cached is not None:
         return cached
 
-    try:
-        data = _cnn_fear_greed_graphdata(date)
-        fg = (data or {}).get("fear_and_greed") or {}
-        now_val = fg.get("now") or {}
-        out = {
-            "date": (data or {}).get("date") or (date or datetime.now(timezone.utc).date().isoformat()),
-            "score": now_val.get("value"),
-            "rating": now_val.get("valueText") or now_val.get("rating"),
-            "raw": data,
-        }
-        return cache_set(key, out, ttl_seconds=300)
-    except Exception as e:
-        return cache_set(
-            key,
-            {
-                "date": date or datetime.now(timezone.utc).date().isoformat(),
-                "score": None,
-                "rating": None,
-                "error": f"{type(e).__name__}: {str(e)}",
-            },
-            ttl_seconds=60,
-        )
+    # Try requested date, else try today then yesterday
+    dates_to_try: List[str] = []
+    if date:
+        dates_to_try = [date]
+    else:
+        today = datetime.now(timezone.utc).date()
+        dates_to_try = [today.isoformat(), (today - timedelta(days=1)).isoformat()]
+
+    last_err = None
+    for d in dates_to_try:
+        try:
+            data = _cnn_fear_greed_graphdata(d)
+            fg = (data or {}).get("fear_and_greed") or {}
+            now_val = fg.get("now") or {}
+            out = {
+                "date": (data or {}).get("date") or d,
+                "score": now_val.get("value"),
+                "rating": now_val.get("valueText") or now_val.get("rating"),
+                "raw": data,
+                "sourceDate": d,
+            }
+            return cache_set(key, out, ttl_seconds=300)
+        except Exception as e:
+            last_err = e
+            continue
+
+    return cache_set(
+        key,
+        {
+            "date": date or datetime.now(timezone.utc).date().isoformat(),
+            "score": None,
+            "rating": None,
+            "error": f"{type(last_err).__name__}: {str(last_err)}" if last_err else "Unknown error",
+        },
+        ttl_seconds=60,
+    )
 
 
 @app.get("/market/snapshot")
@@ -527,6 +555,7 @@ def market_snapshot():
     - SPY (proxy for S&P 500) level + 1D/5D/1M returns
     - VIX level
     - Fear & Greed score + label (best effort)
+    Uses Yahoo first, Stooq fallback.
     """
     key = "market:snapshot"
     cached = cache_get(key)
@@ -534,12 +563,12 @@ def market_snapshot():
         return cached
 
     now = datetime.now(timezone.utc)
-    out = {"date": now.date().isoformat(), "sp500": {}, "vix": {}, "fearGreed": {}}
-    errors: List[str] = []
+    out = {"date": now.date().isoformat(), "sp500": {}, "vix": {}, "fearGreed": {}, "errors": [], "sources": {}}
 
-    spy, spy_errs = _closes("SPY", prefer_yahoo_range="3mo", interval="1d", stooq_lookback_days=365)
-    errors.extend([f"SPY: {e}" for e in spy_errs])
-
+    # SPY
+    spy, errs, src = _market_closes("SPY", range_days=120)
+    out["sources"]["sp500"] = src
+    out["errors"].extend(errs)
     if len(spy) >= 25:
         closes = [c for _, c in spy]
         last = closes[-1]
@@ -550,12 +579,11 @@ def market_snapshot():
             "ret5dPct": round(_pct(closes[-1], closes[-6]), 4) if len(closes) >= 6 else None,
             "ret1mPct": round(_pct(closes[-1], closes[-22]), 4) if len(closes) >= 22 else None,
         }
-    else:
-        errors.append("SPY: insufficient data points for returns")
 
-    vix, vix_errs = _closes("^VIX", prefer_yahoo_range="3mo", interval="1d", stooq_lookback_days=365)
-    errors.extend([f"VIX: {e}" for e in vix_errs])
-
+    # VIX
+    vix, errs2, src2 = _market_closes("^VIX", range_days=120)
+    out["sources"]["vix"] = src2
+    out["errors"].extend(errs2)
     if len(vix) >= 2:
         closes = [c for _, c in vix]
         out["vix"] = {
@@ -563,34 +591,37 @@ def market_snapshot():
             "last": round(closes[-1], 4),
             "chg1d": round(closes[-1] - closes[-2], 4),
         }
-    else:
-        errors.append("VIX: insufficient data points")
 
+    # Fear & Greed
     try:
         fg = market_fear_greed(None)
-        out["fearGreed"] = {"score": fg.get("score"), "rating": fg.get("rating")}
+        out["fearGreed"] = {
+            "score": fg.get("score"),
+            "rating": fg.get("rating"),
+            "date": fg.get("date"),
+            "sourceDate": fg.get("sourceDate"),
+        }
     except Exception as e:
-        errors.append(f"FearGreed: {type(e).__name__}: {str(e)}")
+        out["errors"].append(f"FearGreed: {type(e).__name__}: {str(e)}")
 
-    out["errors"] = [e for e in errors if e]
     return cache_set(key, out, ttl_seconds=180)
 
 
 # =========================================================
-# Market Entry Index (FIXED): uses provider fallback
+# Market Entry Index (fixed: Yahoo first, Stooq fallback)
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     now = datetime.now(timezone.utc)
 
-    spy, spy_errs = _closes("SPY", prefer_yahoo_range="2y", interval="1d", stooq_lookback_days=900)
-    vix, vix_errs = _closes("^VIX", prefer_yahoo_range="1y", interval="1d", stooq_lookback_days=900)
+    # Need ~200 trading days for SMA200, so pull about 420 calendar days
+    spy, spy_errs, spy_src = _market_closes("SPY", range_days=420)
+    vix, vix_errs, vix_src = _market_closes("^VIX", range_days=420)
 
     err_notes = []
     err_notes.extend(spy_errs)
     err_notes.extend(vix_errs)
 
-    # Need enough history for SMA200 and a stable VIX gauge
     if len(spy) < 210 or len(vix) < 30:
         return {
             "date": now.date().isoformat(),
@@ -598,6 +629,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             "regime": "NEUTRAL",
             "signal": "DATA UNAVAILABLE",
             "notes": " | ".join(err_notes) if err_notes else "Insufficient market data.",
+            "sources": {"SPY": spy_src, "VIX": vix_src},
             "components": {
                 "spxTrend": 0.5,
                 "vix": 0.5,
@@ -608,8 +640,8 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             },
         }
 
-    _, spy_close = zip(*spy)
-    _, vix_close = zip(*vix)
+    spy_close = [c for _, c in spy]
+    vix_close = [c for _, c in vix]
 
     price = float(spy_close[-1])
     sma50 = _sma(list(spy_close), 50) or price
@@ -650,6 +682,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         "regime": regime,
         "signal": signal,
         "notes": notes,
+        "sources": {"SPY": spy_src, "VIX": vix_src},
         "components": {
             "spxTrend": float(spx_trend_01),
             "vix": float(vix_01),
@@ -662,7 +695,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
 
 
 # =========================================================
-# RSS + sentiment (your existing approach)
+# RSS + sentiment
 # =========================================================
 def _fetch_rss_items(url: str, timeout: int = 12, max_items: int = 30) -> List[dict]:
     r = requests.get(url, timeout=timeout, headers=UA_HEADERS)
@@ -824,7 +857,7 @@ def news_watchlist(
 
 
 # =========================================================
-# News briefing (NEW): sector-friendly daily summary
+# News briefing: sector-friendly daily summary
 # =========================================================
 DEFAULT_SECTORS = [
     "AI",
@@ -941,6 +974,11 @@ def news_briefing(
     watchlist: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
     max_items_per_sector: int = Query(default=12, ge=5, le=40),
 ):
+    """
+    One call your News tab can render visually:
+    - Market snapshot (SPY, VIX, Fear&Greed)
+    - Sector tiles with: sentiment, short summary, top headlines, watchlist ticker mentions
+    """
     key = f"briefing:{sectors}:{watchlist}:{max_items_per_sector}"
     cached = cache_get(key)
     if cached is not None:
@@ -1015,7 +1053,7 @@ def news_briefing(
 
 
 # =========================================================
-# Congress: /report/today (your existing endpoint)
+# Congress: /report/today
 # =========================================================
 @app.get("/report/today")
 def report_today(
@@ -1188,7 +1226,7 @@ def report_today(
 
 
 # =========================================================
-# Congress: holdings proxy endpoint your UI expects
+# Congress: holdings proxy endpoint
 # =========================================================
 @app.get("/report/holdings/common")
 def report_holdings_common(
@@ -1256,7 +1294,7 @@ def report_holdings_common(
 
 
 # =========================================================
-# Congress: day-by-day activity feed for UI
+# Congress: day-by-day activity feed
 # =========================================================
 @app.get("/report/congress/daily")
 def report_congress_daily(
@@ -1365,8 +1403,7 @@ def report_congress_daily(
 
 
 # =========================================================
-# Signals (NEW): bring back scored list for Main tab
-# Combines congress participation + watchlist news mentions + sector briefing mentions
+# Signals: scored ideas list for Main tab
 # =========================================================
 def _congress_ticker_agg(congress_payload: dict) -> Dict[str, dict]:
     agg: Dict[str, dict] = {}
@@ -1450,6 +1487,9 @@ def signals_ideas(
     sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense"),
     limit: int = Query(default=25, ge=5, le=100),
 ):
+    """
+    Returns a scored list you can render under Market Entry on Main tab.
+    """
     key = f"ideas:{window_days}:{watchlist}:{sectors}:{limit}"
     cached = cache_get(key)
     if cached is not None:
@@ -1459,11 +1499,12 @@ def signals_ideas(
     sec_str = sectors
 
     congress = report_today(window_days=window_days, horizon_days=None)
+
     cong_agg = _congress_ticker_agg(congress)
 
     wnews = news_watchlist(tickers=",".join(wl), max_items_per_ticker=8)
     watch_titles: List[str] = []
-    for t, arr in (wnews.get("itemsByTicker") or {}).items():
+    for _, arr in (wnews.get("itemsByTicker") or {}).items():
         for x in (arr or [])[:8]:
             watch_titles.append(x.get("title", "") or "")
 
