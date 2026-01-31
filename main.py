@@ -1,36 +1,22 @@
-"""
-Finance Signals Backend (single-file)
-
-What this backend provides:
-  - GET /                       health check
-  - GET /report/today           congress buys/sells + bipartisan overlap + crypto detection
-  - GET /report/crypto          crypto-only view (from /report/today)
-  - GET /report/holdings/common common holdings proxy (frontend-friendly shape)
-  - GET /report/congress-holdings richer holdings proxy (topHoldings + breadth + scoring)
-  - GET /market/entry           market entry score (SPY + VIX) with Stooq primary + Yahoo fallback
-
-Deploy notes (Render):
-  - Set env var: QUIVER_TOKEN
-  - Start command: uvicorn main:app --host 0.0.0.0 --port $PORT
-  - Runtime: python-3.11.x recommended
-"""
-
 import os
 import re
+import json
+import math
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
+import xml.etree.ElementTree as ET
 
 import requests
 import quiverquant
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 
-# --------------------------
-# App + CORS
-# --------------------------
+# =========================================================
+# App
+# =========================================================
 app = FastAPI(title="Finance Signals Backend", version="3.0.0")
 
 ALLOWED_ORIGINS = [
@@ -53,38 +39,12 @@ _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": app.version}
+    return {"status": "ok", "version": "3.0.0"}
 
 
-# --------------------------
-# HTTP session with retries
-# --------------------------
-def _http_session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=0.6,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET",),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    s.headers.update(
-        {"User-Agent": "Mozilla/5.0 (compatible; FinanceSignals/1.0; +https://hijazss.github.io)"}
-    )
-    return s
-
-
-_SESSION = _http_session()
-
-
-# --------------------------
+# =========================================================
 # Helpers
-# --------------------------
+# =========================================================
 def pick_first(row: dict, keys: List[str], default=""):
     for k in keys:
         if k in row and row[k] is not None:
@@ -233,9 +193,9 @@ def to_card(x: dict, kind: str) -> dict:
     }
 
 
-# --------------------------
+# =========================================================
 # Crypto detection
-# --------------------------
+# =========================================================
 TOP_COINS = ["BTC", "ETH", "SOL", "LINK", "XRP", "ADA", "DOGE", "AVAX", "MATIC", "BNB"]
 
 CRYPTO_ALIASES: Dict[str, List[str]] = {
@@ -251,38 +211,16 @@ CRYPTO_ALIASES: Dict[str, List[str]] = {
     "BNB": ["bnb", "binance coin"],
 }
 
-CRYPTO_RELATED_TICKERS = set(
-    [
-        "IBIT",
-        "FBTC",
-        "ARKB",
-        "BITB",
-        "BTCO",
-        "HODL",
-        "GBTC",
-        "BITO",
-        "ETHE",
-        "ETHA",
-        "COIN",
-        "MSTR",
-        "RIOT",
-        "MARA",
-        "HUT",
-        "CLSK",
-    ]
-)
+CRYPTO_RELATED_TICKERS = set([
+    "IBIT", "FBTC", "ARKB", "BITB", "BTCO", "HODL", "GBTC", "BITO",
+    "ETHE", "ETHA",
+    "COIN", "MSTR", "RIOT", "MARA", "HUT", "CLSK",
+])
 
 TICKER_TO_COINS: Dict[str, List[str]] = {
-    "IBIT": ["BTC"],
-    "FBTC": ["BTC"],
-    "ARKB": ["BTC"],
-    "BITB": ["BTC"],
-    "BTCO": ["BTC"],
-    "HODL": ["BTC"],
-    "GBTC": ["BTC"],
-    "BITO": ["BTC"],
-    "ETHE": ["ETH"],
-    "ETHA": ["ETH"],
+    "IBIT": ["BTC"], "FBTC": ["BTC"], "ARKB": ["BTC"], "BITB": ["BTC"], "BTCO": ["BTC"], "HODL": ["BTC"],
+    "GBTC": ["BTC"], "BITO": ["BTC"],
+    "ETHE": ["ETH"], "ETHA": ["ETH"],
     "COIN": ["CRYPTO-LINKED"],
     "MSTR": ["BTC", "CRYPTO-LINKED"],
     "RIOT": ["BTC", "CRYPTO-LINKED"],
@@ -310,26 +248,10 @@ _GENERIC_CRYPTO_HINTS = [
 
 def collect_crypto_text(row: dict) -> str:
     fields = [
-        "AssetDescription",
-        "asset_description",
-        "Description",
-        "description",
-        "Asset",
-        "asset",
-        "Name",
-        "name",
-        "Issuer",
-        "issuer",
-        "Ticker",
-        "ticker",
-        "Stock",
-        "stock",
-        "Symbol",
-        "symbol",
-        "Owner",
-        "owner",
-        "Type",
-        "type",
+        "AssetDescription", "asset_description", "Description", "description",
+        "Asset", "asset", "Name", "name", "Issuer", "issuer",
+        "Ticker", "ticker", "Stock", "stock", "Symbol", "symbol",
+        "Owner", "owner", "Type", "type",
     ]
     parts = []
     for f in fields:
@@ -395,40 +317,26 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
     return out
 
 
-# --------------------------
-# Quiver fetch (single place)
-# --------------------------
-def _get_congress_rows() -> List[dict]:
-    if not QUIVER_TOKEN:
-        raise HTTPException(500, "QUIVER_TOKEN missing")
-
-    q = quiverquant.quiver(QUIVER_TOKEN)
-    df = q.congress_trading()
-
-    if df is None or len(df) == 0:
-        return []
-
-    try:
-        return df.to_dict(orient="records")
-    except Exception:
-        return list(df)
-
-
-# --------------------------
-# Congress: today
-# --------------------------
+# =========================================================
+# Congress: /report/today
+# =========================================================
 @app.get("/report/today")
 def report_today(
     window_days: Optional[int] = Query(default=None, ge=1, le=365),
     horizon_days: Optional[int] = Query(default=None, ge=1, le=365),
 ):
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
+
     days = window_days if window_days is not None else horizon_days if horizon_days is not None else 30
 
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
 
-    rows = _get_congress_rows()
-    if not rows:
+    q = quiverquant.quiver(QUIVER_TOKEN)
+    df = q.congress_trading()
+
+    if df is None or len(df) == 0:
         return {
             "date": now.date().isoformat(),
             "windowDays": days,
@@ -437,8 +345,13 @@ def report_today(
             "convergence": [],
             "politicianBuys": [],
             "politicianSells": [],
-            "crypto": {"buys": [], "sells": [], "rawBuys": [], "rawSells": [], "raw": [], "topCoins": TOP_COINS},
+            "crypto": {"buys": [], "sells": [], "rawBuys": [], "rawSells": [], "raw": []},
         }
+
+    try:
+        rows = df.to_dict(orient="records")
+    except Exception:
+        rows = list(df)
 
     buys: List[dict] = []
     sells: List[dict] = []
@@ -468,16 +381,12 @@ def report_today(
         ticker = norm_ticker(r)
         pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
         chamber = str(pick_first(r, ["Chamber", "chamber", "Office", "office"], "")).strip()
-        amount = str(
-            pick_first(r, ["Amount", "amount", "Range", "range", "AmountRange", "amount_range"], "")
-        ).strip()
+        amount = str(pick_first(r, ["Amount", "amount", "Range", "range", "AmountRange", "amount_range"], "")).strip()
 
         filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
         traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
 
-        desc = str(
-            pick_first(r, ["AssetDescription", "asset_description", "Description", "description", "Asset", "asset"], "")
-        ).strip()
+        desc = str(pick_first(r, ["AssetDescription", "asset_description", "Description", "description", "Asset", "asset"], "")).strip()
 
         item = {
             "ticker": ticker,
@@ -543,18 +452,16 @@ def report_today(
             if x["ticker"] == t:
                 if latest_dt is None or x["best_dt"] > latest_dt:
                     latest_dt = x["best_dt"]
-        overlap_cards.append(
-            {
-                "ticker": t,
-                "companyName": "",
-                "demBuyers": dem_ct,
-                "repBuyers": rep_ct,
-                "demSellers": 0,
-                "repSellers": 0,
-                "lastFiledAt": iso_date_only(latest_dt),
-                "strength": "OVERLAP",
-            }
-        )
+        overlap_cards.append({
+            "ticker": t,
+            "companyName": "",
+            "demBuyers": dem_ct,
+            "repBuyers": rep_ct,
+            "demSellers": 0,
+            "repSellers": 0,
+            "lastFiledAt": iso_date_only(latest_dt),
+            "strength": "OVERLAP",
+        })
 
     overlap_cards.sort(key=lambda x: (-(x["demBuyers"] + x["repBuyers"]), x["ticker"]))
 
@@ -583,48 +490,25 @@ def report_today(
     }
 
 
-@app.get("/report/crypto")
-def report_crypto(
-    window_days: Optional[int] = Query(default=None, ge=1, le=365),
-    horizon_days: Optional[int] = Query(default=None, ge=1, le=365),
-):
-    payload = report_today(window_days=window_days, horizon_days=horizon_days)
-    return {
-        "date": payload["date"],
-        "windowDays": payload["windowDays"],
-        "windowStart": payload["windowStart"],
-        "windowEnd": payload["windowEnd"],
-        "crypto": payload["crypto"],
-    }
-
-
-# --------------------------
-# Holdings proxy (two endpoints)
-# --------------------------
+# =========================================================
+# Congress: holdings proxy endpoint your UI expects
+# GET /report/holdings/common?window_days=365
+# =========================================================
 @app.get("/report/holdings/common")
 def report_holdings_common(
     window_days: int = Query(default=365, ge=30, le=365),
     top_n: int = Query(default=30, ge=5, le=100),
 ):
-    """
-    Frontend-friendly holdings shape:
-      {
-        "date": "...",
-        "windowDays": 365,
-        "commonHoldings": [
-          {"ticker":"NVDA","companyName":"","holders":42},
-          ...
-        ],
-        "meta": {...}
-      }
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    holders = unique politicians who disclosed activity in ticker within the window
-    """
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=window_days)
 
-    rows = _get_congress_rows()
-    if not rows:
+    q = quiverquant.quiver(QUIVER_TOKEN)
+    df = q.congress_trading()
+
+    if df is None or len(df) == 0:
         return {
             "date": now.date().isoformat(),
             "windowDays": window_days,
@@ -634,6 +518,11 @@ def report_holdings_common(
             "meta": {"uniquePoliticians": 0, "uniqueTickers": 0, "topN": top_n},
             "note": "No congress trading rows returned for this window.",
         }
+
+    try:
+        rows = df.to_dict(orient="records")
+    except Exception:
+        rows = list(df)
 
     per_ticker: Dict[str, set] = {}
     all_pol: set = set()
@@ -653,14 +542,9 @@ def report_holdings_common(
 
         t = ticker.upper()
         all_pol.add(pol)
-        if t not in per_ticker:
-            per_ticker[t] = set()
-        per_ticker[t].add(pol)
+        per_ticker.setdefault(t, set()).add(pol)
 
-    common = [
-        {"ticker": t, "companyName": "", "holders": len(pols)}
-        for t, pols in per_ticker.items()
-    ]
+    common = [{"ticker": t, "companyName": "", "holders": len(pols)} for t, pols in per_ticker.items()]
     common.sort(key=lambda x: (-int(x["holders"]), x["ticker"]))
     common = common[:top_n]
 
@@ -671,208 +555,179 @@ def report_holdings_common(
         "windowEnd": now.date().isoformat(),
         "commonHoldings": common,
         "meta": {"uniquePoliticians": len(all_pol), "uniqueTickers": len(per_ticker), "topN": top_n},
-        "note": "Holdings are a proxy from disclosures: holders = unique members with activity in ticker within window.",
+        "note": "Holdings are a proxy from disclosures: holders = unique members who disclosed activity in ticker within the window.",
     }
 
 
-@app.get("/report/congress-holdings")
-def report_congress_holdings(
-    window_days: int = Query(default=365, ge=30, le=365),
-    top_n: int = Query(default=30, ge=5, le=100),
+# =========================================================
+# Congress: day-by-day activity feed for UI
+# GET /report/congress/daily?window_days=14
+# =========================================================
+@app.get("/report/congress/daily")
+def report_congress_daily(
+    window_days: int = Query(default=14, ge=1, le=365),
+    limit: int = Query(default=200, ge=50, le=1000),
 ):
-    """
-    Rich holdings proxy:
-      - per ticker: holderCount, demHolders, repHolders, breadthPct, holdingsScore, tradeCount, lastActivity
-      - topHoldings = first top_n sorted by holderCount
-    """
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
+
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=window_days)
 
-    rows = _get_congress_rows()
-    if not rows:
+    q = quiverquant.quiver(QUIVER_TOKEN)
+    df = q.congress_trading()
+
+    if df is None or len(df) == 0:
         return {
             "date": now.date().isoformat(),
             "windowDays": window_days,
             "windowStart": since.date().isoformat(),
             "windowEnd": now.date().isoformat(),
-            "breadth": {"uniquePoliticians": 0, "uniqueTickers": 0},
-            "topHoldings": [],
-            "holdings": [],
-            "note": "No congress trading rows returned for this window.",
+            "days": [],
+            "note": "No rows returned.",
         }
 
-    pol_set_all = set()
-    per: Dict[str, dict] = {}
+    try:
+        rows = df.to_dict(orient="records")
+    except Exception:
+        rows = list(df)
 
+    items: List[dict] = []
     for r in rows:
         best_dt = row_best_dt(r)
         if best_dt is None or best_dt < since or best_dt > now:
             continue
 
-        ticker = norm_ticker(r)
-        if not ticker:
-            continue
-
-        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
-        if not pol:
-            continue
-
         party = norm_party_from_any(r)
+        if not party:
+            continue
 
-        pol_set_all.add(pol)
-        t = ticker.upper()
+        tx = tx_text(r)
+        kind = "BUY" if is_buy(tx) else "SELL" if is_sell(tx) else ""
+        if not kind:
+            continue
 
-        cur = per.get(t)
-        if not cur:
-            cur = {
-                "ticker": t,
-                "politicians": set(),
-                "dems": set(),
-                "reps": set(),
-                "lastSeen": None,
-                "tradeCount": 0,
+        ticker = norm_ticker(r)
+        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
+        chamber = str(pick_first(r, ["Chamber", "chamber", "Office", "office"], "")).strip()
+        amount = str(pick_first(r, ["Amount", "amount", "Range", "range", "AmountRange", "amount_range"], "")).strip()
+
+        filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
+        traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
+
+        desc = str(pick_first(r, ["AssetDescription", "asset_description", "Description", "description", "Asset", "asset"], "")).strip()
+
+        # Source links (best effort)
+        cap_url = ""
+        if pol:
+            cap_url = "https://www.capitoltrades.com/politicians/" + quote_plus(pol)
+
+        ticker_url = ""
+        if ticker:
+            ticker_url = "https://www.capitoltrades.com/trades?search=" + quote_plus(ticker)
+
+        items.append({
+            "kind": kind,
+            "ticker": (ticker or "").upper(),
+            "politician": pol,
+            "party": party,
+            "chamber": chamber,
+            "amountRange": amount,
+            "traded": iso_date_only(traded_dt),
+            "filed": iso_date_only(filed_dt),
+            "description": desc,
+            "bestDate": iso_date_only(best_dt),
+            "links": {
+                "capitoltrades_politician": cap_url,
+                "capitoltrades_ticker": ticker_url,
+                "quiver_congresstrading": "https://www.quiverquant.com/congresstrading/",
+                "senate_efd_search": "https://efdsearch.senate.gov/search/home/",
+                "house_disclosures": "https://disclosures-clerk.house.gov/",
             }
-            per[t] = cur
+        })
 
-        cur["politicians"].add(pol)
-        if party == "D":
-            cur["dems"].add(pol)
-        elif party == "R":
-            cur["reps"].add(pol)
+    # Sort newest first by filed/traded fallback
+    def sort_key(x):
+        s = x.get("filed") or x.get("traded") or x.get("bestDate") or ""
+        return s
 
-        cur["tradeCount"] += 1
-        if cur["lastSeen"] is None or best_dt > cur["lastSeen"]:
-            cur["lastSeen"] = best_dt
+    items.sort(key=sort_key, reverse=True)
+    items = items[:limit]
 
-    total_unique_pol = len(pol_set_all)
+    # Group by filed date (or traded if filed missing)
+    days: Dict[str, List[dict]] = {}
+    for it in items:
+        d = it.get("filed") or it.get("traded") or it.get("bestDate") or now.date().isoformat()
+        days.setdefault(d, []).append(it)
 
-    def holdings_score(holder_count: int, dem_count: int, rep_count: int) -> int:
-        if total_unique_pol <= 0:
-            return 0
-        breadth_pct = holder_count / total_unique_pol
-        base = breadth_pct * 85.0
-        bipartisan = 0.0
-        if dem_count > 0 and rep_count > 0:
-            balance = min(dem_count, rep_count) / max(dem_count, rep_count)
-            bipartisan = 15.0 * balance
-        return int(round(min(100.0, base + bipartisan)))
-
-    holdings: List[dict] = []
-    for t, cur in per.items():
-        holder_count = len(cur["politicians"])
-        dem_count = len(cur["dems"])
-        rep_count = len(cur["reps"])
-        last_seen = cur["lastSeen"]
-        breadth_pct = (holder_count / total_unique_pol) if total_unique_pol else 0.0
-
-        holdings.append(
-            {
-                "ticker": t,
-                "holderCount": holder_count,
-                "demHolders": dem_count,
-                "repHolders": rep_count,
-                "breadthPct": round(breadth_pct * 100.0, 2),
-                "holdingsScore": holdings_score(holder_count, dem_count, rep_count),
-                "tradeCount": int(cur["tradeCount"]),
-                "lastActivity": iso_date_only(last_seen),
-            }
-        )
-
-    holdings.sort(key=lambda x: (-int(x["holderCount"]), -int(x["holdingsScore"]), x["ticker"]))
-    top_holdings = holdings[: int(top_n or 30)]
+    # Convert to ordered list
+    day_list = [{"date": d, "items": days[d]} for d in sorted(days.keys(), reverse=True)]
 
     return {
         "date": now.date().isoformat(),
         "windowDays": window_days,
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
-        "breadth": {"uniquePoliticians": total_unique_pol, "uniqueTickers": len(holdings)},
-        "topHoldings": top_holdings,
-        "holdings": holdings,
-        "note": (
-            "Holdings are a proxy computed from disclosed congress trading activity: "
-            "holderCount = unique members with activity in ticker within the window."
-        ),
-        "scoring": {
-            "holdingsScoreMeaning": "0-100. Mostly breadth (holderCount/uniquePoliticians), with a bipartisan boost when both parties participate.",
-            "maxScore": 100,
-        },
+        "days": day_list,
+        "note": "Grouped by filed date when available. Links are best-effort jump links.",
     }
 
 
-# --------------------------
-# Market Entry Index (Stooq primary, Yahoo fallback)
-# --------------------------
-def _parse_date_yyyy_mm_dd(s: str) -> Optional[datetime]:
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
+# =========================================================
+# Market Entry Index
+# Uses Yahoo Finance chart API first (more reliable on Render),
+# then falls back to Stooq.
+# =========================================================
+def _yahoo_chart_daily_close(symbol: str, range_str: str = "1y", interval: str = "1d") -> List[Tuple[datetime, float]]:
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
+    params = {"range": range_str, "interval": interval}
+    r = requests.get(url, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    res = (j.get("chart") or {}).get("result") or []
+    if not res:
+        return []
+    result = res[0]
+    ts = result.get("timestamp") or []
+    q = (result.get("indicators") or {}).get("quote") or []
+    if not ts or not q:
+        return []
+    closes = (q[0] or {}).get("close") or []
+    out: List[Tuple[datetime, float]] = []
+    for t, c in zip(ts, closes):
+        if c is None:
+            continue
+        dt = datetime.fromtimestamp(int(t), tz=timezone.utc)
+        out.append((dt, float(c)))
+    out.sort(key=lambda x: x[0])
+    return out
 
 
 def _stooq_daily_close(symbol: str, lookback_days: int = 260) -> List[Tuple[datetime, float]]:
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    r = _SESSION.get(url, timeout=(8, 20))
-    if r.status_code != 200:
-        raise RuntimeError(f"Stooq HTTP {r.status_code}")
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
 
     lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
     if len(lines) < 5:
         return []
 
     header = lines[0].lower().split(",")
-    if "date" not in header or "close" not in header:
+    try:
+        date_i = header.index("date")
+        close_i = header.index("close")
+    except ValueError:
         return []
-
-    date_i = header.index("date")
-    close_i = header.index("close")
 
     out: List[Tuple[datetime, float]] = []
     for ln in lines[1:]:
         parts = ln.split(",")
         if len(parts) <= max(date_i, close_i):
             continue
-        dt = _parse_date_yyyy_mm_dd(parts[date_i])
-        if not dt:
-            continue
         try:
+            dt = datetime.strptime(parts[date_i], "%Y-%m-%d").replace(tzinfo=timezone.utc)
             cl = float(parts[close_i])
-        except Exception:
-            continue
-        out.append((dt, cl))
-
-    out.sort(key=lambda x: x[0])
-    if lookback_days and len(out) > lookback_days:
-        out = out[-lookback_days:]
-    return out
-
-
-def _yahoo_daily_close(ticker: str, lookback_days: int = 260) -> List[Tuple[datetime, float]]:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    params = {"range": "2y", "interval": "1d"}
-    r = _SESSION.get(url, params=params, timeout=(8, 20))
-    if r.status_code != 200:
-        raise RuntimeError(f"Yahoo HTTP {r.status_code}")
-
-    j = r.json()
-    result = (((j or {}).get("chart") or {}).get("result") or [])
-    if not result:
-        return []
-
-    r0 = result[0]
-    ts = r0.get("timestamp") or []
-    ind = ((r0.get("indicators") or {}).get("quote") or [])
-    if not ind:
-        return []
-
-    closes = ind[0].get("close") or []
-    out: List[Tuple[datetime, float]] = []
-    for t, cl in zip(ts, closes):
-        if cl is None:
-            continue
-        try:
-            dt = datetime.fromtimestamp(int(t), tz=timezone.utc)
-            out.append((dt, float(cl)))
+            out.append((dt, cl))
         except Exception:
             continue
 
@@ -880,16 +735,6 @@ def _yahoo_daily_close(ticker: str, lookback_days: int = 260) -> List[Tuple[date
     if lookback_days and len(out) > lookback_days:
         out = out[-lookback_days:]
     return out
-
-
-def _daily_close_with_fallback(stooq_symbol: str, yahoo_symbol: str, lookback_days: int = 260) -> List[Tuple[datetime, float]]:
-    try:
-        data = _stooq_daily_close(stooq_symbol, lookback_days=lookback_days)
-        if data:
-            return data
-    except Exception:
-        pass
-    return _yahoo_daily_close(yahoo_symbol, lookback_days=lookback_days)
 
 
 def _sma(vals: List[float], n: int) -> Optional[float]:
@@ -904,51 +749,33 @@ def _clamp01(x: float) -> float:
 
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
-    """
-    Entry score 0-100 using:
-      - SPY trend: SMA50 vs SMA200 and price vs SMA200
-      - VIX: lower VIX gives higher score
-    Stooq is primary, Yahoo is fallback.
-
-    Returns:
-      {
-        "date":"YYYY-MM-DD",
-        "score": int,
-        "regime":"RISK-ON|NEUTRAL|RISK-OFF",
-        "signal":"ACCUMULATE|ACCUMULATE SLOWLY|WAIT / SMALL DCA",
-        "notes":"...",
-        "components": { spxTrend, vix, breadth, credit, rates, buffettProxy }
-      }
-    """
     now = datetime.now(timezone.utc)
 
+    # Prefer Yahoo (Render-friendly), fallback to Stooq
+    spy = []
+    vix = []
+    err_notes = []
+
     try:
-        spy = _daily_close_with_fallback("spy.us", "SPY", lookback_days=260)
-        vix = _daily_close_with_fallback("^vix", "^VIX", lookback_days=260)
+        spy = _yahoo_chart_daily_close("SPY", range_str="1y", interval="1d")
+        vix = _yahoo_chart_daily_close("^VIX", range_str="1y", interval="1d")
     except Exception as e:
-        return {
-            "date": now.date().isoformat(),
-            "score": 0,
-            "regime": "NEUTRAL",
-            "signal": "DATA UNAVAILABLE",
-            "notes": f"Market data fetch failed: {str(e)}",
-            "components": {
-                "spxTrend": 0.5,
-                "vix": 0.5,
-                "breadth": 0.5,
-                "credit": 0.5,
-                "rates": 0.5,
-                "buffettProxy": 0.5,
-            },
-        }
+        err_notes.append(f"Yahoo chart failed: {type(e).__name__}: {str(e)}")
+
+    if len(spy) < 210 or len(vix) < 30:
+        try:
+            spy = _stooq_daily_close("spy.us", lookback_days=260)
+            vix = _stooq_daily_close("^vix", lookback_days=260)
+        except Exception as e:
+            err_notes.append(f"Stooq failed: {type(e).__name__}: {str(e)}")
 
     if len(spy) < 210 or len(vix) < 30:
         return {
             "date": now.date().isoformat(),
             "score": 0,
             "regime": "NEUTRAL",
-            "signal": "INSUFFICIENT DATA",
-            "notes": "Not enough history returned for SPY/VIX.",
+            "signal": "DATA UNAVAILABLE",
+            "notes": " | ".join(err_notes) if err_notes else "Insufficient market data.",
             "components": {
                 "spxTrend": 0.5,
                 "vix": 0.5,
@@ -991,12 +818,16 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         regime = "RISK-OFF"
         signal = "WAIT / SMALL DCA"
 
+    notes = f"SPY={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={v:.2f}"
+    if err_notes:
+        notes = notes + " | " + " | ".join(err_notes)
+
     return {
         "date": now.date().isoformat(),
         "score": score,
         "regime": regime,
         "signal": signal,
-        "notes": f"SPY={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={v:.2f}",
+        "notes": notes,
         "components": {
             "spxTrend": float(spx_trend_01),
             "vix": float(vix_01),
@@ -1005,4 +836,186 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             "rates": float(rates_01),
             "buffettProxy": float(buffett_01),
         },
+    }
+
+
+# =========================================================
+# News + Sentiment
+# =========================================================
+def _fetch_rss_items(url: str, timeout: int = 12, max_items: int = 30) -> List[dict]:
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+
+    # Some RSS feeds have leading whitespace or BOM, strip for safety
+    text = r.text.strip()
+    root = ET.fromstring(text)
+
+    # RSS: <rss><channel><item>...
+    channel = root.find("channel")
+    if channel is None:
+        # Atom fallback: <feed><entry>...
+        entries = root.findall("{http://www.w3.org/2005/Atom}entry")
+        out = []
+        for e in entries[:max_items]:
+            title = (e.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
+            link_el = e.find("{http://www.w3.org/2005/Atom}link")
+            link = (link_el.get("href") if link_el is not None else "") or ""
+            pub = (e.findtext("{http://www.w3.org/2005/Atom}updated") or "").strip()
+            out.append({"title": title, "link": link, "published": pub})
+        return out
+
+    out = []
+    for item in channel.findall("item")[:max_items]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        out.append({"title": title, "link": link, "published": pub})
+    return out
+
+
+_POS_WORDS = set([
+    "beat", "beats", "surge", "surges", "rally", "rallies", "gain", "gains", "up",
+    "upgrade", "upgrades", "record", "strong", "bull", "bullish", "growth",
+    "profit", "profits", "outperform", "buy", "wins", "win", "breakout"
+])
+_NEG_WORDS = set([
+    "miss", "misses", "drop", "drops", "plunge", "plunges", "down",
+    "downgrade", "downgrades", "warning", "weak", "bear", "bearish",
+    "lawsuit", "probe", "investigation", "fraud", "loss", "losses",
+    "cut", "cuts", "layoff", "layoffs", "recession", "crash"
+])
+
+
+def _headline_sentiment(headlines: List[str]) -> Dict[str, Any]:
+    score = 0
+    pos = 0
+    neg = 0
+    total = 0
+
+    for h in headlines:
+        if not h:
+            continue
+        total += 1
+        tokens = re.findall(r"[a-zA-Z]+", h.lower())
+        tset = set(tokens)
+        p = len(tset & _POS_WORDS)
+        n = len(tset & _NEG_WORDS)
+        if p > n:
+            pos += 1
+            score += 1
+        elif n > p:
+            neg += 1
+            score -= 1
+
+    if total == 0:
+        return {"label": "NEUTRAL", "score": 0, "pos": 0, "neg": 0, "total": 0}
+
+    # normalize into 0..100-ish gauge
+    raw = score / max(1, total)
+    gauge = int(round(50 + 50 * raw))
+    gauge = max(0, min(100, gauge))
+
+    if gauge >= 60:
+        label = "POSITIVE"
+    elif gauge <= 40:
+        label = "NEGATIVE"
+    else:
+        label = "NEUTRAL"
+
+    return {"label": label, "score": gauge, "pos": pos, "neg": neg, "total": total}
+
+
+@app.get("/news/top")
+def news_top(
+    max_items: int = Query(default=30, ge=10, le=100),
+):
+    """
+    General market news headlines and a simple sentiment gauge.
+    """
+    feeds = [
+        # Yahoo general finance RSS
+        "https://www.yahoo.com/news/rss/finance",
+        # CNBC Top News RSS (often works)
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        # MarketWatch Top Stories RSS (often works)
+        "https://www.marketwatch.com/rss/topstories",
+    ]
+
+    items: List[dict] = []
+    errors: List[str] = []
+
+    for f in feeds:
+        try:
+            it = _fetch_rss_items(f, max_items=max_items)
+            for x in it:
+                x["sourceFeed"] = f
+            items.extend(it)
+        except Exception as e:
+            errors.append(f"{f} -> {type(e).__name__}: {str(e)}")
+
+    # dedupe by link
+    seen = set()
+    deduped = []
+    for x in items:
+        lk = (x.get("link") or "").strip()
+        if not lk or lk in seen:
+            continue
+        seen.add(lk)
+        deduped.append(x)
+
+    # newest-ish first: RSS pubDate formats vary, so keep stable order (already feed order)
+    deduped = deduped[:max_items]
+
+    sentiment = _headline_sentiment([x.get("title", "") for x in deduped])
+
+    return {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "items": deduped,
+        "sentiment": sentiment,
+        "errors": errors,
+        "note": "Sentiment is a lightweight headline-based gauge, not a price predictor.",
+    }
+
+
+@app.get("/news/watchlist")
+def news_watchlist(
+    tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
+    max_items_per_ticker: int = Query(default=8, ge=3, le=25),
+):
+    """
+    Yahoo Finance per-ticker RSS feed.
+    Uses: https://feeds.finance.yahoo.com/rss/2.0/headline?s=SPY&region=US&lang=en-US
+    """
+    syms = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    syms = syms[:40]
+
+    all_items: Dict[str, List[dict]] = {}
+    errors: List[str] = []
+
+    for t in syms:
+        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(t)}&region=US&lang=en-US"
+        try:
+            it = _fetch_rss_items(url, max_items=max_items_per_ticker)
+            for x in it:
+                x["ticker"] = t
+                x["sourceFeed"] = "yahoo_ticker_rss"
+            all_items[t] = it
+        except Exception as e:
+            errors.append(f"{t}: {type(e).__name__}: {str(e)}")
+            all_items[t] = []
+
+    # sentiment across all watchlist headlines
+    headlines = []
+    for t in syms:
+        headlines.extend([x.get("title", "") for x in all_items.get(t, [])])
+
+    sentiment = _headline_sentiment(headlines)
+
+    return {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "tickers": syms,
+        "itemsByTicker": all_items,
+        "sentiment": sentiment,
+        "errors": errors,
+        "note": "Ticker news via Yahoo RSS. If a ticker has no feed items, it may be temporarily empty.",
     }
