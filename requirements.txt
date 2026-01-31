@@ -1,5 +1,11 @@
-fastapi
-uvicorn
-requests
-quiverquant
-pandas
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+python-dotenv==1.0.1
+
+requests==2.32.3
+
+pandas==2.2.2
+numpy==1.26.4
+
+quiverquant==0.2.2
