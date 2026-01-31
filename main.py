@@ -1,14 +1,12 @@
 import os
 import re
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
-import xml.etree.ElementTree as ET
 
-import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import quiverquant
+
 
 app = FastAPI(title="Finance Signals Backend")
 
@@ -21,14 +19,8 @@ app.add_middleware(
 
 QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
 
-SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "FinanceApp/1.0 (contact: hijazss@gmail.com)")
-SEC_TIMEOUT = 25
-
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
-# --------------------------
-# Root
-# --------------------------
 
 @app.get("/")
 def root():
@@ -36,7 +28,7 @@ def root():
 
 
 # --------------------------
-# Generic helpers
+# Helpers
 # --------------------------
 
 def pick_first(row: dict, keys: List[str], default=""):
@@ -315,7 +307,7 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 
 # --------------------------
-# Endpoint: Congress rolling window (30/180/365)
+# Congress rolling window (Main / Crypto)
 # --------------------------
 
 @app.get("/report/today")
@@ -504,476 +496,157 @@ def report_crypto(
 
 
 # --------------------------
-# SEC EDGAR helpers
+# NEW: Congress "Holdings Overlap" (proxy via disclosed activity)
 # --------------------------
 
-def sec_get_json(url: str) -> dict:
-    headers = {
-        "User-Agent": SEC_USER_AGENT,
-        "Accept-Encoding": "gzip, deflate",
-        "Host": "data.sec.gov",
-    }
-    r = requests.get(url, headers=headers, timeout=SEC_TIMEOUT)
-    if r.status_code != 200:
-        raise HTTPException(502, f"SEC fetch failed HTTP {r.status_code} for {url}")
-    return r.json()
-
-
-def sec_get_text(url: str) -> str:
-    headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
-    r = requests.get(url, headers=headers, timeout=SEC_TIMEOUT)
-    if r.status_code != 200:
-        raise HTTPException(502, f"SEC fetch failed HTTP {r.status_code} for {url}")
-    return r.text
-
-
-def cik10(cik: str) -> str:
-    s = re.sub(r"\D", "", str(cik).strip())
-    return s.zfill(10)
-
-
-def accession_no_dashes(acc: str) -> str:
-    return (acc or "").replace("-", "").strip()
-
-
-def build_filing_index_url(cik: str, accession: str) -> str:
-    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dashes(accession)}/{accession}-index.html"
-
-
-def build_primary_doc_url(cik: str, accession: str, primary_doc: str) -> str:
-    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dashes(accession)}/{primary_doc}"
-
-
-def pull_recent_filings_for_cik(cik: str) -> dict:
-    url = f"https://data.sec.gov/submissions/CIK{cik10(cik)}.json"
-    return sec_get_json(url)
-
-
-def extract_latest_filings(submissions: dict, forms_allow: List[str], max_items: int = 20) -> List[dict]:
-    filings = (submissions.get("filings") or {}).get("recent") or {}
-    forms = filings.get("form") or []
-    accs = filings.get("accessionNumber") or []
-    primary_docs = filings.get("primaryDocument") or []
-    filed_dates = filings.get("filingDate") or []
-
-    out = []
-    n = min(len(forms), len(accs), len(primary_docs), len(filed_dates))
-    for i in range(n):
-        form = str(forms[i])
-        if form not in forms_allow:
-            continue
-        out.append({
-            "form": form,
-            "accession": str(accs[i]),
-            "primaryDocument": str(primary_docs[i]),
-            "filingDate": str(filed_dates[i]),
-        })
-
-    out.sort(key=lambda x: x.get("filingDate", ""), reverse=True)
-    return out[:max_items]
-
-
-# --------------------------
-# 13F parsing and delta logic
-# --------------------------
-
-def _strip_ns(tag: str) -> str:
-    return tag.split("}", 1)[-1] if "}" in tag else tag
-
-
-def _find_first_text(node: ET.Element, want: List[str]) -> str:
-    want_set = set(want)
-    for ch in node.iter():
-        if _strip_ns(ch.tag) in want_set and ch.text:
-            return ch.text.strip()
-    return ""
-
-
-def parse_13f_info_table(xml_text: str) -> List[dict]:
+@app.get("/report/congress-holdings")
+def report_congress_holdings(
+    window_days: Optional[int] = Query(default=365, ge=30, le=365),
+    top_n: Optional[int] = Query(default=30, ge=5, le=100),
+):
     """
-    Parses SEC 13F information table XML.
-    Returns holdings as list of dicts with:
-      issuer, cusip, value (int, in thousands), shares (int), type (SH/PRN), putCall
+    "Holdings" proxy:
+      counts how many unique members disclosed activity in a ticker within window_days.
+    This supports a "common holdings overlap" UI even if we do not have a true holdings endpoint.
     """
-    out: List[dict] = []
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception:
-        return out
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    # Find all <infoTable> nodes (namespaced or not)
-    for node in root.iter():
-        if _strip_ns(node.tag).lower() != "infotable":
-            continue
-
-        issuer = _find_first_text(node, ["nameOfIssuer", "nameofissuer"])
-        cusip = _find_first_text(node, ["cusip"])
-        title = _find_first_text(node, ["titleOfClass", "titleofclass"])
-        value = _find_first_text(node, ["value"])
-        sh_amt = ""
-        sh_type = ""
-        put_call = _find_first_text(node, ["putCall", "putcall"])
-
-        # shares are nested under shrsOrPrnAmt
-        for ch in node.iter():
-            if _strip_ns(ch.tag).lower() == "shrsorprnamt":
-                sh_amt = _find_first_text(ch, ["sshPrnamt", "sshprnamt"])
-                sh_type = _find_first_text(ch, ["sshPrnamtType", "sshprnamttype"])
-                break
-
-        try:
-            v_int = int(float(value)) if value else 0
-        except Exception:
-            v_int = 0
-        try:
-            s_int = int(float(sh_amt)) if sh_amt else 0
-        except Exception:
-            s_int = 0
-
-        key = (cusip or issuer or title).strip()
-        if not key:
-            continue
-
-        out.append({
-            "issuer": issuer,
-            "titleClass": title,
-            "cusip": cusip,
-            "valueK": v_int,      # SEC 13F "value" is typically in thousands of dollars
-            "shares": s_int,
-            "shareType": sh_type,
-            "putCall": put_call,
-        })
-
-    return out
-
-
-def extract_links_from_index_html(index_html: str) -> List[str]:
-    # Simple href extraction, good enough for SEC filing index pages
-    hrefs = re.findall(r'href="([^"]+)"', index_html, flags=re.IGNORECASE)
-    return hrefs
-
-
-def resolve_sec_archive_url(index_url: str, href: str) -> str:
-    # SEC index uses relative links like "xslForm13F_X01/infotable.xml" or full paths
-    if href.startswith("http"):
-        return href
-    if href.startswith("/Archives/"):
-        return "https://www.sec.gov" + href
-    base = index_url.rsplit("/", 1)[0]
-    return base + "/" + href.lstrip("./")
-
-
-def find_best_13f_info_table_url(index_url: str) -> Tuple[str, str]:
-    """
-    Returns (info_table_url, raw_index_html_url)
-    """
-    html = sec_get_text(index_url)
-
-    # Pull all candidate links
-    links = extract_links_from_index_html(html)
-    # Prefer .xml links that look like information tables
-    xmls = [x for x in links if x.lower().endswith(".xml")]
-    preferred = []
-    for x in xmls:
-        lx = x.lower()
-        if "infotable" in lx or "informationtable" in lx or "form13f" in lx or "xslform13f" in lx:
-            preferred.append(x)
-    candidates = preferred or xmls
-
-    for href in candidates:
-        full = resolve_sec_archive_url(index_url, href)
-        # quick filter: SEC archive xml often accessible
-        return full, html
-
-    # If none found, return empty
-    return "", html
-
-
-def holdings_map(holdings: List[dict]) -> Dict[str, dict]:
-    """
-    key by CUSIP if available, else issuer+title
-    """
-    m: Dict[str, dict] = {}
-    for h in holdings:
-        cusip = (h.get("cusip") or "").strip()
-        issuer = (h.get("issuer") or "").strip()
-        title = (h.get("titleClass") or "").strip()
-        key = cusip if cusip else (issuer + "|" + title).strip("|")
-        if not key:
-            continue
-        m[key] = h
-    return m
-
-
-def compute_holdings_delta(newer: List[dict], older: List[dict], top_n: int = 20) -> dict:
-    """
-    Compute adds/trims/new/exits based on share delta and value delta.
-    """
-    m_new = holdings_map(newer)
-    m_old = holdings_map(older)
-
-    keys = set(m_new.keys()) | set(m_old.keys())
-    rows = []
-    for k in keys:
-        a = m_new.get(k)
-        b = m_old.get(k)
-
-        new_sh = int((a or {}).get("shares") or 0)
-        old_sh = int((b or {}).get("shares") or 0)
-        d_sh = new_sh - old_sh
-
-        new_v = int((a or {}).get("valueK") or 0)
-        old_v = int((b or {}).get("valueK") or 0)
-        d_v = new_v - old_v
-
-        issuer = (a or b or {}).get("issuer") or ""
-        cusip = (a or b or {}).get("cusip") or ""
-        title = (a or b or {}).get("titleClass") or ""
-
-        row = {
-            "issuer": issuer,
-            "cusip": cusip,
-            "titleClass": title,
-            "oldShares": old_sh,
-            "newShares": new_sh,
-            "deltaShares": d_sh,
-            "oldValueK": old_v,
-            "newValueK": new_v,
-            "deltaValueK": d_v,
-        }
-        rows.append(row)
-
-    new_positions = [r for r in rows if r["oldShares"] == 0 and r["newShares"] > 0]
-    exits = [r for r in rows if r["oldShares"] > 0 and r["newShares"] == 0]
-    adds = [r for r in rows if r["deltaShares"] > 0 and r["oldShares"] > 0 and r["newShares"] > 0]
-    trims = [r for r in rows if r["deltaShares"] < 0 and r["newShares"] > 0]
-
-    # Sort primarily by absolute value change, then abs shares change
-    def key_abs(r):
-        return (abs(int(r.get("deltaValueK") or 0)), abs(int(r.get("deltaShares") or 0)))
-
-    new_positions.sort(key=key_abs, reverse=True)
-    exits.sort(key=key_abs, reverse=True)
-    adds.sort(key=key_abs, reverse=True)
-    trims.sort(key=key_abs, reverse=True)
-
-    return {
-        "summary": {
-            "positionsNew": len(new_positions),
-            "positionsExited": len(exits),
-            "positionsAdded": len(adds),
-            "positionsTrimmed": len(trims),
-        },
-        "topNew": new_positions[:top_n],
-        "topExited": exits[:top_n],
-        "topAdds": adds[:top_n],
-        "topTrims": trims[:top_n],
-    }
-
-
-# --------------------------
-# Form 4 parsing (kept)
-# --------------------------
-
-def parse_form4_transactions(xml_text: str) -> List[dict]:
-    out: List[dict] = []
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception:
-        return out
-
-    issuer = ""
-    symbol = ""
-
-    for node in root.iter():
-        tag = node.tag.lower()
-        if tag.endswith("issuername"):
-            issuer = (node.text or "").strip()
-        elif tag.endswith("issuertradingsymbol"):
-            symbol = (node.text or "").strip().upper()
-
-    for tx in root.iter():
-        if not tx.tag.lower().endswith("nonderivativetransaction"):
-            continue
-
-        code = ""
-        date = ""
-        shares = ""
-        price = ""
-
-        for node in tx.iter():
-            t = node.tag.lower()
-            if t.endswith("transactioncode"):
-                code = (node.text or "").strip().upper()
-
-        for node in tx.iter():
-            t = node.tag.lower()
-            if t.endswith("transactiondate"):
-                for c in node.iter():
-                    if c.tag.lower().endswith("value"):
-                        date = (c.text or "").strip()
-            elif t.endswith("transactionshares"):
-                for c in node.iter():
-                    if c.tag.lower().endswith("value"):
-                        shares = (c.text or "").strip()
-            elif t.endswith("transactionpricepershare"):
-                for c in node.iter():
-                    if c.tag.lower().endswith("value"):
-                        price = (c.text or "").strip()
-
-        if code in ["P", "S"]:
-            out.append({
-                "issuerName": issuer,
-                "ticker": symbol,
-                "code": code,
-                "transactionDate": date,
-                "shares": shares,
-                "price": price,
-            })
-
-    return out
-
-
-# --------------------------
-# Leaders endpoint: now includes 13F holdings deltas
-# --------------------------
-
-@app.get("/report/public-leaders")
-def report_public_leaders():
+    days = window_days or 365
     now = datetime.now(timezone.utc)
-    since365 = now - timedelta(days=365)
+    since = now - timedelta(days=days)
 
-    leaders = [
-        {"key": "musk", "name": "Elon Musk", "cik": "1494730", "forms": ["4", "4/A"]},
-        {"key": "berkshire", "name": "Berkshire Hathaway", "cik": "1067983", "forms": ["13F-HR", "13F-HR/A"]},
-        {"key": "bridgewater", "name": "Bridgewater Associates", "cik": "1350694", "forms": ["13F-HR", "13F-HR/A"]},
-        {"key": "blackrock", "name": "BlackRock, Inc.", "cik": "1364742", "forms": ["13F-HR", "13F-HR/A"]},
-    ]
+    q = quiverquant.quiver(QUIVER_TOKEN)
+    df = q.congress_trading()
 
-    results = []
-    for leader in leaders:
-        cik = leader["cik"]
-        subs = pull_recent_filings_for_cik(cik10(cik))
+    if df is None or len(df) == 0:
+        return {
+            "date": now.date().isoformat(),
+            "windowDays": days,
+            "windowStart": since.date().isoformat(),
+            "windowEnd": now.date().isoformat(),
+            "breadth": {
+                "uniquePoliticians": 0,
+                "uniqueTickers": 0,
+            },
+            "topHoldings": [],
+            "holdings": [],
+            "note": "No congress trading rows returned for this window.",
+        }
 
-        filings = extract_latest_filings(subs, leader["forms"], max_items=20)
+    try:
+        rows = df.to_dict(orient="records")
+    except Exception:
+        rows = list(df)
 
-        # Filter to within 365d when possible, but keep enough 13Fs to compute delta
-        filtered = []
-        for f in filings:
-            filed_dt = parse_dt_any(f.get("filingDate"))
-            if filed_dt is not None and filed_dt < since365 and not f["form"].startswith("13F"):
-                continue
-            filtered.append(f)
+    # Track unique politicians overall in-window
+    pol_set_all = set()
 
-        events = []
+    # Per ticker: sets of politicians, per party holders, and last seen date
+    per: Dict[str, dict] = {}
 
-        # If 13F leader: compute delta between latest two 13F filings
-        if any(f["form"].startswith("13F") for f in filtered):
-            f13 = [f for f in filtered if f["form"].startswith("13F")]
-            f13.sort(key=lambda x: x.get("filingDate", ""), reverse=True)
+    for r in rows:
+        best_dt = row_best_dt(r)
+        if best_dt is None:
+            continue
+        if best_dt < since or best_dt > now:
+            continue
 
-            # Try to compute delta using the latest two 13F filings
-            delta = None
-            info_urls = {"newerInfoTable": "", "olderInfoTable": ""}
+        ticker = norm_ticker(r)
+        if not ticker:
+            continue
 
-            if len(f13) >= 2:
-                newer = f13[0]
-                older = f13[1]
+        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
+        if not pol:
+            continue
 
-                newer_index = build_filing_index_url(cik10(cik), newer["accession"])
-                older_index = build_filing_index_url(cik10(cik), older["accession"])
+        party = norm_party_from_any(r)
 
-                try:
-                    newer_info_url, _ = find_best_13f_info_table_url(newer_index)
-                    older_info_url, _ = find_best_13f_info_table_url(older_index)
+        pol_set_all.add(pol)
 
-                    info_urls["newerInfoTable"] = newer_info_url
-                    info_urls["olderInfoTable"] = older_info_url
+        t = ticker.upper()
+        cur = per.get(t)
+        if not cur:
+            cur = {
+                "ticker": t,
+                "politicians": set(),
+                "dems": set(),
+                "reps": set(),
+                "lastSeen": None,     # datetime
+                "tradeCount": 0,
+            }
+            per[t] = cur
 
-                    if newer_info_url and older_info_url:
-                        newer_xml = sec_get_text(newer_info_url)
-                        older_xml = sec_get_text(older_info_url)
-                        newer_holdings = parse_13f_info_table(newer_xml)
-                        older_holdings = parse_13f_info_table(older_xml)
-                        delta = compute_holdings_delta(newer_holdings, older_holdings, top_n=20)
-                except Exception:
-                    delta = None
+        cur["politicians"].add(pol)
+        if party == "D":
+            cur["dems"].add(pol)
+        elif party == "R":
+            cur["reps"].add(pol)
 
-            # Add a compact 13F event card with delta
-            if f13:
-                latest = f13[0]
-                latest_index_url = build_filing_index_url(cik10(cik), latest["accession"])
-                latest_primary_url = build_primary_doc_url(cik10(cik), latest["accession"], latest["primaryDocument"])
+        cur["tradeCount"] += 1
+        if cur["lastSeen"] is None or best_dt > cur["lastSeen"]:
+            cur["lastSeen"] = best_dt
 
-                events.append({
-                    "form": latest["form"],
-                    "label": "13F HOLDINGS DELTA" if delta else "13F FILED",
-                    "filingDate": latest.get("filingDate", ""),
-                    "indexUrl": latest_index_url,
-                    "primaryUrl": latest_primary_url,
-                    "details": {
-                        "note": "13F shows holdings, not real-time trades. Values are SEC 'value' in thousands of dollars (valueK).",
-                        "infoTableUrls": info_urls,
-                        "delta": delta,
-                    },
-                })
+    total_unique_pol = len(pol_set_all)
+    holdings: List[dict] = []
 
-        # Add latest Form 4 events as before
-        for f in filtered:
-            form = str(f.get("form") or "")
-            if not form.startswith("4"):
-                continue
+    # Score scaling:
+    # - holderCount drives most of the score
+    # - small boost for bipartisan breadth
+    # This yields stable 0-100.
+    def holdings_score(holder_count: int, dem_count: int, rep_count: int) -> int:
+        if total_unique_pol <= 0:
+            return 0
+        breadth_pct = holder_count / total_unique_pol  # 0..1
+        base = breadth_pct * 85.0
+        bipartisan = 0.0
+        if dem_count > 0 and rep_count > 0:
+            # up to +15 depending on balance
+            balance = min(dem_count, rep_count) / max(dem_count, rep_count)
+            bipartisan = 15.0 * balance
+        score = int(round(min(100.0, base + bipartisan)))
+        return score
 
-            filing_date = f.get("filingDate", "")
-            filed_dt = parse_dt_any(filing_date)
-            if filed_dt is not None and filed_dt < since365:
-                continue
+    for t, cur in per.items():
+        holder_count = len(cur["politicians"])
+        dem_count = len(cur["dems"])
+        rep_count = len(cur["reps"])
+        last_seen = cur["lastSeen"]
 
-            accession = f["accession"]
-            primary_doc = f["primaryDocument"]
+        breadth_pct = (holder_count / total_unique_pol) if total_unique_pol else 0.0
 
-            index_url = build_filing_index_url(cik10(cik), accession)
-            primary_url = build_primary_doc_url(cik10(cik), accession, primary_doc)
+        holdings.append({
+            "ticker": t,
+            "holderCount": holder_count,
+            "demHolders": dem_count,
+            "repHolders": rep_count,
+            "breadthPct": round(breadth_pct * 100.0, 2),     # percent of active politicians in window
+            "holdingsScore": holdings_score(holder_count, dem_count, rep_count),
+            "tradeCount": int(cur["tradeCount"]),
+            "lastActivity": iso_date_only(last_seen),
+        })
 
-            label = "FORM4"
-            details = {}
+    holdings.sort(key=lambda x: (-int(x["holderCount"]), -int(x["holdingsScore"]), x["ticker"]))
 
-            try:
-                xml_text = sec_get_text(primary_url)
-                txs = parse_form4_transactions(xml_text)
-                buys = [t for t in txs if (t.get("code") or "").upper() == "P"]
-                sells = [t for t in txs if (t.get("code") or "").upper() == "S"]
-                if buys and not sells:
-                    label = "BUY"
-                elif sells and not buys:
-                    label = "SELL"
-                elif buys and sells:
-                    label = "MIXED"
-                details = {"transactions": txs[:40], "buyCount": len(buys), "sellCount": len(sells)}
-            except Exception:
-                label = "FORM4"
-
-            events.append({
-                "form": form,
-                "label": label,
-                "filingDate": filing_date,
-                "indexUrl": index_url,
-                "primaryUrl": primary_url,
-                "details": details,
-            })
-
-            if len(events) >= 6:
-                break
-
-            time.sleep(0.15)
-
-        results.append({"name": leader["name"], "cik": cik10(cik), "events": events})
+    top_holdings = holdings[: int(top_n or 30)]
 
     return {
         "date": now.date().isoformat(),
-        "windowDays": 365,
-        "windowStart": since365.date().isoformat(),
+        "windowDays": days,
+        "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
-        "leaders": results,
-        "note": "Leaders now includes 13F holdings delta (adds/trims/new/exits). 13F holdings do not include ticker symbols, only issuer name + CUSIP + shares + value.",
+        "breadth": {
+            "uniquePoliticians": total_unique_pol,
+            "uniqueTickers": len(holdings),
+        },
+        "topHoldings": top_holdings,
+        "holdings": holdings,
+        "note": (
+            "Holdings are a proxy computed from disclosed congress trading activity: "
+            "holderCount = unique members who disclosed activity in that ticker within the window."
+        ),
+        "scoring": {
+            "holdingsScoreMeaning": "0-100. Mostly breadth (holderCount/uniquePoliticians), with a bipartisan boost when both parties participate.",
+            "maxScore": 100,
+        }
     }
