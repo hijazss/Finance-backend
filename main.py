@@ -22,7 +22,7 @@ app.add_middleware(
 QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
 
 SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "FinanceApp/1.0 (contact: hijazss@gmail.com)")
-SEC_TIMEOUT = 20
+SEC_TIMEOUT = 25
 
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
@@ -187,57 +187,8 @@ def to_card(x: dict, kind: str) -> dict:
     }
 
 
-def aggregate_by_ticker(items: List[dict], kind: str) -> List[dict]:
-    """
-    Build full-window aggregates by ticker so the KPI dashboard changes
-    meaningfully between 30D / 180D / 365D.
-    """
-    agg: Dict[str, dict] = {}
-
-    for x in items:
-        t = (x.get("ticker") or "").upper().strip()
-        if not t:
-            continue
-
-        cur = agg.get(t)
-        if not cur:
-            cur = {
-                "ticker": t,
-                "companyName": "",
-                "demBuyers": 0, "repBuyers": 0,
-                "demSellers": 0, "repSellers": 0,
-                "lastFiledAt": "",
-            }
-            agg[t] = cur
-
-        party = (x.get("party") or "").upper().strip()
-        if kind == "BUY":
-            if party == "D":
-                cur["demBuyers"] += 1
-            elif party == "R":
-                cur["repBuyers"] += 1
-        else:
-            if party == "D":
-                cur["demSellers"] += 1
-            elif party == "R":
-                cur["repSellers"] += 1
-
-        last = x.get("filed") or x.get("traded") or ""
-        if last and last > (cur["lastFiledAt"] or ""):
-            cur["lastFiledAt"] = last
-
-    out = list(agg.values())
-    out.sort(
-        key=lambda r: -(
-            (r["demBuyers"] + r["repBuyers"]) +
-            (r["demSellers"] + r["repSellers"])
-        )
-    )
-    return out
-
-
 # --------------------------
-# Crypto detection
+# Crypto detection (unchanged)
 # --------------------------
 
 TOP_COINS = [
@@ -267,8 +218,12 @@ TICKER_TO_COINS: Dict[str, List[str]] = {
     "IBIT": ["BTC"], "FBTC": ["BTC"], "ARKB": ["BTC"], "BITB": ["BTC"], "BTCO": ["BTC"], "HODL": ["BTC"],
     "GBTC": ["BTC"], "BITO": ["BTC"],
     "ETHE": ["ETH"], "ETHA": ["ETH"],
-    "COIN": ["CRYPTO-LINKED"], "MSTR": ["BTC", "CRYPTO-LINKED"], "RIOT": ["BTC", "CRYPTO-LINKED"],
-    "MARA": ["BTC", "CRYPTO-LINKED"], "HUT": ["BTC", "CRYPTO-LINKED"], "CLSK": ["BTC", "CRYPTO-LINKED"],
+    "COIN": ["CRYPTO-LINKED"],
+    "MSTR": ["BTC", "CRYPTO-LINKED"],
+    "RIOT": ["BTC", "CRYPTO-LINKED"],
+    "MARA": ["BTC", "CRYPTO-LINKED"],
+    "HUT": ["BTC", "CRYPTO-LINKED"],
+    "CLSK": ["BTC", "CRYPTO-LINKED"],
 }
 
 _CRYPTO_PATTERNS: Dict[str, List[re.Pattern]] = {}
@@ -335,9 +290,8 @@ def classify_crypto_trade(ticker: str, text: str) -> Tuple[bool, List[str], str]
     is_related_ticker = bool(t and t in CRYPTO_RELATED_TICKERS)
     coins_from_ticker = TICKER_TO_COINS.get(t, []) if is_related_ticker else []
 
+    coins = []
     merged = set(coins_from_text + coins_from_ticker)
-    coins: List[str] = []
-
     for sym in TOP_COINS:
         if sym in merged:
             coins.append(sym)
@@ -362,7 +316,6 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 # --------------------------
 # Endpoint: Congress rolling window (30/180/365)
-# Accept both window_days and horizon_days.
 # --------------------------
 
 @app.get("/report/today")
@@ -390,10 +343,7 @@ def report_today(
             "convergence": [],
             "politicianBuys": [],
             "politicianSells": [],
-            "tickerBuysAgg": [],
-            "tickerSellsAgg": [],
             "crypto": {"buys": [], "sells": [], "rawBuys": [], "rawSells": [], "raw": []},
-            "debug": {"totalBuysInWindow": 0, "totalSellsInWindow": 0, "returnedBuyCards": 0, "returnedSellCards": 0},
         }
 
     try:
@@ -487,9 +437,6 @@ def report_today(
     buy_cards = [to_card(x, "BUY") for x in interleave(buys, 140)]
     sell_cards = [to_card(x, "SELL") for x in interleave(sells, 140)]
 
-    ticker_buys_agg = aggregate_by_ticker(buys, "BUY")
-    ticker_sells_agg = aggregate_by_ticker(sells, "SELL")
-
     dem_buy = [x for x in buys if x["party"] == "D"]
     rep_buy = [x for x in buys if x["party"] == "R"]
     overlap = set(x["ticker"] for x in dem_buy if x["ticker"]) & set(x["ticker"] for x in rep_buy if x["ticker"])
@@ -535,23 +482,9 @@ def report_today(
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "convergence": overlap_cards[:25],
-
-        # recent-card lists (interleaved by party)
         "politicianBuys": buy_cards,
         "politicianSells": sell_cards,
-
-        # full-window ticker aggregates (used for KPI/dashboard ranking)
-        "tickerBuysAgg": ticker_buys_agg[:500],
-        "tickerSellsAgg": ticker_sells_agg[:500],
-
         "crypto": crypto_payload,
-
-        "debug": {
-            "totalBuysInWindow": len(buys),
-            "totalSellsInWindow": len(sells),
-            "returnedBuyCards": len(buy_cards),
-            "returnedSellCards": len(sell_cards),
-        },
     }
 
 
@@ -571,198 +504,15 @@ def report_crypto(
 
 
 # --------------------------
-# 2-year performance
-# --------------------------
-
-def stooq_symbol(ticker: str) -> str:
-    t = (ticker or "").strip().lower()
-    return f"{t}.us" if t else ""
-
-
-def fetch_close_stooq(ticker: str, start: datetime, end: datetime) -> List[Tuple[datetime, float]]:
-    sym = stooq_symbol(ticker)
-    if not sym:
-        return []
-    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-    r = requests.get(url, timeout=15)
-    if r.status_code != 200 or "Date,Open" not in r.text:
-        return []
-    lines = r.text.strip().splitlines()
-    out = []
-    for line in lines[1:]:
-        parts = line.split(",")
-        if len(parts) < 5:
-            continue
-        d = parse_dt_any(parts[0])
-        if not d:
-            continue
-        d = d.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-        if d < start or d > end:
-            continue
-        try:
-            close = float(parts[4])
-        except Exception:
-            continue
-        out.append((d, close))
-    out.sort(key=lambda x: x[0])
-    return out
-
-
-def nearest_close(series: List[Tuple[datetime, float]], target: datetime) -> Optional[float]:
-    if not series:
-        return None
-    for d, c in series:
-        if d >= target:
-            return c
-    return series[-1][1]
-
-
-@app.get("/report/performance-2y")
-def performance_2y(
-    horizon_days: Optional[int] = Query(default=None, ge=7, le=365),
-    window_days: Optional[int] = Query(default=None, ge=7, le=365),
-):
-    if not QUIVER_TOKEN:
-        raise HTTPException(500, "QUIVER_TOKEN missing")
-
-    days = horizon_days if horizon_days is not None else window_days if window_days is not None else 30
-
-    now = datetime.now(timezone.utc)
-    since2y = now - timedelta(days=730)
-
-    q = quiverquant.quiver(QUIVER_TOKEN)
-    df = q.congress_trading()
-
-    if df is None or len(df) == 0:
-        return {"date": now.date().isoformat(), "horizonDays": days, "leaders": []}
-
-    try:
-        rows = df.to_dict(orient="records")
-    except Exception:
-        rows = list(df)
-
-    trades: List[dict] = []
-    tickers_needed = set()
-
-    for r in rows:
-        best_dt = row_best_dt(r)
-        if not best_dt or best_dt < since2y or best_dt > now:
-            continue
-
-        party = norm_party_from_any(r)
-        if not party:
-            continue
-
-        tx = tx_text(r)
-        kind = "BUY" if is_buy(tx) else "SELL" if is_sell(tx) else ""
-        if not kind:
-            continue
-
-        ticker = norm_ticker(r)
-        if not ticker:
-            continue
-
-        pol = str(pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip() or "Unknown"
-        chamber = str(pick_first(r, ["Chamber", "chamber", "Office", "office"], "")).strip()
-
-        traded_dt = parse_dt_any(pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
-        filed_dt = parse_dt_any(pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
-
-        base_dt = traded_dt or filed_dt
-        if not base_dt:
-            continue
-
-        base_dt = base_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-        end_dt = base_dt + timedelta(days=days)
-        if end_dt > now:
-            continue
-
-        tickers_needed.add(ticker.upper())
-        trades.append({
-            "politician": pol,
-            "party": party,
-            "chamber": chamber,
-            "ticker": ticker.upper(),
-            "kind": kind,
-            "base_dt": base_dt,
-            "end_dt": end_dt,
-            "traded": iso_date_only(traded_dt),
-            "filed": iso_date_only(filed_dt),
-        })
-
-    if not trades:
-        return {"date": now.date().isoformat(), "horizonDays": days, "leaders": []}
-
-    price_cache: Dict[str, List[Tuple[datetime, float]]] = {}
-    min_start = since2y.replace(hour=0, minute=0, second=0, microsecond=0)
-    max_end = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    for t in sorted(tickers_needed):
-        try:
-            price_cache[t] = fetch_close_stooq(t, min_start, max_end)
-        except Exception:
-            price_cache[t] = []
-
-    stats: Dict[str, dict] = {}
-    for tr in trades:
-        t = tr["ticker"]
-        series = price_cache.get(t) or []
-        p0 = nearest_close(series, tr["base_dt"])
-        p1 = nearest_close(series, tr["end_dt"])
-        if p0 is None or p1 is None or p0 <= 0:
-            continue
-
-        ret = (p1 - p0) / p0
-        if tr["kind"] == "SELL":
-            ret = -ret
-
-        key = tr["politician"]
-        cur = stats.get(key) or {
-            "name": key,
-            "party": tr["party"],
-            "chamber": tr["chamber"],
-            "tradeCount": 0,
-            "sumReturn": 0.0,
-            "avgReturn": 0.0,
-            "sample": [],
-        }
-        cur["tradeCount"] += 1
-        cur["sumReturn"] += ret
-        cur["avgReturn"] = cur["sumReturn"] / max(cur["tradeCount"], 1)
-
-        if len(cur["sample"]) < 5:
-            cur["sample"].append({
-                "ticker": t,
-                "kind": tr["kind"],
-                "traded": tr["traded"],
-                "filed": tr["filed"],
-                "scorePct": round(ret * 100, 2),
-            })
-
-        stats[key] = cur
-
-    leaders = list(stats.values())
-    leaders.sort(key=lambda x: (-(x["avgReturn"]), -x["tradeCount"], x["name"]))
-
-    for x in leaders:
-        x["avgReturnPct"] = round(x["avgReturn"] * 100, 2)
-
-    return {
-        "date": now.date().isoformat(),
-        "windowStart": since2y.date().isoformat(),
-        "windowEnd": now.date().isoformat(),
-        "horizonDays": days,
-        "leaders": leaders[:60],
-        "note": "2Y performance score. BUY uses forward return. SELL uses negative forward return over the selected horizon.",
-    }
-
-
-# --------------------------
-# SEC EDGAR endpoints (unchanged placeholders)
+# SEC EDGAR helpers
 # --------------------------
 
 def sec_get_json(url: str) -> dict:
-    headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate", "Host": "data.sec.gov"}
+    headers = {
+        "User-Agent": SEC_USER_AGENT,
+        "Accept-Encoding": "gzip, deflate",
+        "Host": "data.sec.gov",
+    }
     r = requests.get(url, headers=headers, timeout=SEC_TIMEOUT)
     if r.status_code != 200:
         raise HTTPException(502, f"SEC fetch failed HTTP {r.status_code} for {url}")
@@ -823,6 +573,208 @@ def extract_latest_filings(submissions: dict, forms_allow: List[str], max_items:
     return out[:max_items]
 
 
+# --------------------------
+# 13F parsing and delta logic
+# --------------------------
+
+def _strip_ns(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+
+def _find_first_text(node: ET.Element, want: List[str]) -> str:
+    want_set = set(want)
+    for ch in node.iter():
+        if _strip_ns(ch.tag) in want_set and ch.text:
+            return ch.text.strip()
+    return ""
+
+
+def parse_13f_info_table(xml_text: str) -> List[dict]:
+    """
+    Parses SEC 13F information table XML.
+    Returns holdings as list of dicts with:
+      issuer, cusip, value (int, in thousands), shares (int), type (SH/PRN), putCall
+    """
+    out: List[dict] = []
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return out
+
+    # Find all <infoTable> nodes (namespaced or not)
+    for node in root.iter():
+        if _strip_ns(node.tag).lower() != "infotable":
+            continue
+
+        issuer = _find_first_text(node, ["nameOfIssuer", "nameofissuer"])
+        cusip = _find_first_text(node, ["cusip"])
+        title = _find_first_text(node, ["titleOfClass", "titleofclass"])
+        value = _find_first_text(node, ["value"])
+        sh_amt = ""
+        sh_type = ""
+        put_call = _find_first_text(node, ["putCall", "putcall"])
+
+        # shares are nested under shrsOrPrnAmt
+        for ch in node.iter():
+            if _strip_ns(ch.tag).lower() == "shrsorprnamt":
+                sh_amt = _find_first_text(ch, ["sshPrnamt", "sshprnamt"])
+                sh_type = _find_first_text(ch, ["sshPrnamtType", "sshprnamttype"])
+                break
+
+        try:
+            v_int = int(float(value)) if value else 0
+        except Exception:
+            v_int = 0
+        try:
+            s_int = int(float(sh_amt)) if sh_amt else 0
+        except Exception:
+            s_int = 0
+
+        key = (cusip or issuer or title).strip()
+        if not key:
+            continue
+
+        out.append({
+            "issuer": issuer,
+            "titleClass": title,
+            "cusip": cusip,
+            "valueK": v_int,      # SEC 13F "value" is typically in thousands of dollars
+            "shares": s_int,
+            "shareType": sh_type,
+            "putCall": put_call,
+        })
+
+    return out
+
+
+def extract_links_from_index_html(index_html: str) -> List[str]:
+    # Simple href extraction, good enough for SEC filing index pages
+    hrefs = re.findall(r'href="([^"]+)"', index_html, flags=re.IGNORECASE)
+    return hrefs
+
+
+def resolve_sec_archive_url(index_url: str, href: str) -> str:
+    # SEC index uses relative links like "xslForm13F_X01/infotable.xml" or full paths
+    if href.startswith("http"):
+        return href
+    if href.startswith("/Archives/"):
+        return "https://www.sec.gov" + href
+    base = index_url.rsplit("/", 1)[0]
+    return base + "/" + href.lstrip("./")
+
+
+def find_best_13f_info_table_url(index_url: str) -> Tuple[str, str]:
+    """
+    Returns (info_table_url, raw_index_html_url)
+    """
+    html = sec_get_text(index_url)
+
+    # Pull all candidate links
+    links = extract_links_from_index_html(html)
+    # Prefer .xml links that look like information tables
+    xmls = [x for x in links if x.lower().endswith(".xml")]
+    preferred = []
+    for x in xmls:
+        lx = x.lower()
+        if "infotable" in lx or "informationtable" in lx or "form13f" in lx or "xslform13f" in lx:
+            preferred.append(x)
+    candidates = preferred or xmls
+
+    for href in candidates:
+        full = resolve_sec_archive_url(index_url, href)
+        # quick filter: SEC archive xml often accessible
+        return full, html
+
+    # If none found, return empty
+    return "", html
+
+
+def holdings_map(holdings: List[dict]) -> Dict[str, dict]:
+    """
+    key by CUSIP if available, else issuer+title
+    """
+    m: Dict[str, dict] = {}
+    for h in holdings:
+        cusip = (h.get("cusip") or "").strip()
+        issuer = (h.get("issuer") or "").strip()
+        title = (h.get("titleClass") or "").strip()
+        key = cusip if cusip else (issuer + "|" + title).strip("|")
+        if not key:
+            continue
+        m[key] = h
+    return m
+
+
+def compute_holdings_delta(newer: List[dict], older: List[dict], top_n: int = 20) -> dict:
+    """
+    Compute adds/trims/new/exits based on share delta and value delta.
+    """
+    m_new = holdings_map(newer)
+    m_old = holdings_map(older)
+
+    keys = set(m_new.keys()) | set(m_old.keys())
+    rows = []
+    for k in keys:
+        a = m_new.get(k)
+        b = m_old.get(k)
+
+        new_sh = int((a or {}).get("shares") or 0)
+        old_sh = int((b or {}).get("shares") or 0)
+        d_sh = new_sh - old_sh
+
+        new_v = int((a or {}).get("valueK") or 0)
+        old_v = int((b or {}).get("valueK") or 0)
+        d_v = new_v - old_v
+
+        issuer = (a or b or {}).get("issuer") or ""
+        cusip = (a or b or {}).get("cusip") or ""
+        title = (a or b or {}).get("titleClass") or ""
+
+        row = {
+            "issuer": issuer,
+            "cusip": cusip,
+            "titleClass": title,
+            "oldShares": old_sh,
+            "newShares": new_sh,
+            "deltaShares": d_sh,
+            "oldValueK": old_v,
+            "newValueK": new_v,
+            "deltaValueK": d_v,
+        }
+        rows.append(row)
+
+    new_positions = [r for r in rows if r["oldShares"] == 0 and r["newShares"] > 0]
+    exits = [r for r in rows if r["oldShares"] > 0 and r["newShares"] == 0]
+    adds = [r for r in rows if r["deltaShares"] > 0 and r["oldShares"] > 0 and r["newShares"] > 0]
+    trims = [r for r in rows if r["deltaShares"] < 0 and r["newShares"] > 0]
+
+    # Sort primarily by absolute value change, then abs shares change
+    def key_abs(r):
+        return (abs(int(r.get("deltaValueK") or 0)), abs(int(r.get("deltaShares") or 0)))
+
+    new_positions.sort(key=key_abs, reverse=True)
+    exits.sort(key=key_abs, reverse=True)
+    adds.sort(key=key_abs, reverse=True)
+    trims.sort(key=key_abs, reverse=True)
+
+    return {
+        "summary": {
+            "positionsNew": len(new_positions),
+            "positionsExited": len(exits),
+            "positionsAdded": len(adds),
+            "positionsTrimmed": len(trims),
+        },
+        "topNew": new_positions[:top_n],
+        "topExited": exits[:top_n],
+        "topAdds": adds[:top_n],
+        "topTrims": trims[:top_n],
+    }
+
+
+# --------------------------
+# Form 4 parsing (kept)
+# --------------------------
+
 def parse_form4_transactions(xml_text: str) -> List[dict]:
     out: List[dict] = []
     try:
@@ -882,6 +834,10 @@ def parse_form4_transactions(xml_text: str) -> List[dict]:
     return out
 
 
+# --------------------------
+# Leaders endpoint: now includes 13F holdings deltas
+# --------------------------
+
 @app.get("/report/public-leaders")
 def report_public_leaders():
     now = datetime.now(timezone.utc)
@@ -891,52 +847,111 @@ def report_public_leaders():
         {"key": "musk", "name": "Elon Musk", "cik": "1494730", "forms": ["4", "4/A"]},
         {"key": "berkshire", "name": "Berkshire Hathaway", "cik": "1067983", "forms": ["13F-HR", "13F-HR/A"]},
         {"key": "bridgewater", "name": "Bridgewater Associates", "cik": "1350694", "forms": ["13F-HR", "13F-HR/A"]},
+        {"key": "blackrock", "name": "BlackRock, Inc.", "cik": "1364742", "forms": ["13F-HR", "13F-HR/A"]},
     ]
 
     results = []
     for leader in leaders:
         cik = leader["cik"]
-        subs = pull_recent_filings_for_cik(cik)
-        filings = extract_latest_filings(subs, leader["forms"], max_items=12)
+        subs = pull_recent_filings_for_cik(cik10(cik))
 
-        events = []
+        filings = extract_latest_filings(subs, leader["forms"], max_items=20)
+
+        # Filter to within 365d when possible, but keep enough 13Fs to compute delta
+        filtered = []
         for f in filings:
             filed_dt = parse_dt_any(f.get("filingDate"))
+            if filed_dt is not None and filed_dt < since365 and not f["form"].startswith("13F"):
+                continue
+            filtered.append(f)
+
+        events = []
+
+        # If 13F leader: compute delta between latest two 13F filings
+        if any(f["form"].startswith("13F") for f in filtered):
+            f13 = [f for f in filtered if f["form"].startswith("13F")]
+            f13.sort(key=lambda x: x.get("filingDate", ""), reverse=True)
+
+            # Try to compute delta using the latest two 13F filings
+            delta = None
+            info_urls = {"newerInfoTable": "", "olderInfoTable": ""}
+
+            if len(f13) >= 2:
+                newer = f13[0]
+                older = f13[1]
+
+                newer_index = build_filing_index_url(cik10(cik), newer["accession"])
+                older_index = build_filing_index_url(cik10(cik), older["accession"])
+
+                try:
+                    newer_info_url, _ = find_best_13f_info_table_url(newer_index)
+                    older_info_url, _ = find_best_13f_info_table_url(older_index)
+
+                    info_urls["newerInfoTable"] = newer_info_url
+                    info_urls["olderInfoTable"] = older_info_url
+
+                    if newer_info_url and older_info_url:
+                        newer_xml = sec_get_text(newer_info_url)
+                        older_xml = sec_get_text(older_info_url)
+                        newer_holdings = parse_13f_info_table(newer_xml)
+                        older_holdings = parse_13f_info_table(older_xml)
+                        delta = compute_holdings_delta(newer_holdings, older_holdings, top_n=20)
+                except Exception:
+                    delta = None
+
+            # Add a compact 13F event card with delta
+            if f13:
+                latest = f13[0]
+                latest_index_url = build_filing_index_url(cik10(cik), latest["accession"])
+                latest_primary_url = build_primary_doc_url(cik10(cik), latest["accession"], latest["primaryDocument"])
+
+                events.append({
+                    "form": latest["form"],
+                    "label": "13F HOLDINGS DELTA" if delta else "13F FILED",
+                    "filingDate": latest.get("filingDate", ""),
+                    "indexUrl": latest_index_url,
+                    "primaryUrl": latest_primary_url,
+                    "details": {
+                        "note": "13F shows holdings, not real-time trades. Values are SEC 'value' in thousands of dollars (valueK).",
+                        "infoTableUrls": info_urls,
+                        "delta": delta,
+                    },
+                })
+
+        # Add latest Form 4 events as before
+        for f in filtered:
+            form = str(f.get("form") or "")
+            if not form.startswith("4"):
+                continue
+
+            filing_date = f.get("filingDate", "")
+            filed_dt = parse_dt_any(filing_date)
             if filed_dt is not None and filed_dt < since365:
                 continue
 
             accession = f["accession"]
             primary_doc = f["primaryDocument"]
-            form = f["form"]
-            filing_date = f["filingDate"]
 
-            index_url = build_filing_index_url(cik, accession)
-            primary_url = build_primary_doc_url(cik, accession, primary_doc)
+            index_url = build_filing_index_url(cik10(cik), accession)
+            primary_url = build_primary_doc_url(cik10(cik), accession, primary_doc)
 
-            label = "FILED"
+            label = "FORM4"
             details = {}
 
-            if form.startswith("4"):
-                try:
-                    xml_text = sec_get_text(primary_url)
-                    txs = parse_form4_transactions(xml_text)
-                    buys = [t for t in txs if (t.get("code") or "").upper() == "P"]
-                    sells = [t for t in txs if (t.get("code") or "").upper() == "S"]
-                    if buys and not sells:
-                        label = "BUY"
-                    elif sells and not buys:
-                        label = "SELL"
-                    elif buys and sells:
-                        label = "MIXED"
-                    else:
-                        label = "FORM4"
-                    details = {"transactions": txs[:20], "buyCount": len(buys), "sellCount": len(sells)}
-                except Exception:
-                    label = "FORM4"
-
-            if form.startswith("13F"):
-                label = "13F FILED"
-                details = {"note": "13F is quarterly and not a direct trade feed."}
+            try:
+                xml_text = sec_get_text(primary_url)
+                txs = parse_form4_transactions(xml_text)
+                buys = [t for t in txs if (t.get("code") or "").upper() == "P"]
+                sells = [t for t in txs if (t.get("code") or "").upper() == "S"]
+                if buys and not sells:
+                    label = "BUY"
+                elif sells and not buys:
+                    label = "SELL"
+                elif buys and sells:
+                    label = "MIXED"
+                details = {"transactions": txs[:40], "buyCount": len(buys), "sellCount": len(sells)}
+            except Exception:
+                label = "FORM4"
 
             events.append({
                 "form": form,
@@ -947,10 +962,10 @@ def report_public_leaders():
                 "details": details,
             })
 
-            if len(events) >= 4:
+            if len(events) >= 6:
                 break
 
-            time.sleep(0.2)
+            time.sleep(0.15)
 
         results.append({"name": leader["name"], "cik": cik10(cik), "events": events})
 
@@ -960,5 +975,5 @@ def report_public_leaders():
         "windowStart": since365.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "leaders": results,
-        "note": "This endpoint is separate from congress crypto extraction (Option A uses Quiver only).",
+        "note": "Leaders now includes 13F holdings delta (adds/trims/new/exits). 13F holdings do not include ticker symbols, only issuer name + CUSIP + shares + value.",
     }
