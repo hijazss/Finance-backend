@@ -3,6 +3,8 @@ import re
 import time
 import math
 import json
+import csv
+from io import StringIO
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -348,7 +350,7 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 
 # =========================================================
-# Market data (Yahoo chart)
+# Market data (FIXED): Yahoo first, Stooq fallback
 # =========================================================
 def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
@@ -379,6 +381,87 @@ def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> 
     return out
 
 
+def _symbol_to_stooq(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if s == "SPY":
+        return "spy.us"
+    if s in ("^VIX", "VIX"):
+        return "vix"
+    if s in ("^GSPC", "SPX", "S&P500", "SP500"):
+        return "spx"
+    # crude fallback for US tickers
+    if re.fullmatch(r"[A-Z]{1,5}", s):
+        return s.lower() + ".us"
+    # strip leading ^ for some indices (best effort)
+    if s.startswith("^"):
+        return s[1:].lower()
+    return s.lower()
+
+
+def _stooq_closes(symbol: str, lookback_days: int = 3650) -> List[Tuple[datetime, float]]:
+    """
+    Stooq daily historical CSV:
+    https://stooq.com/q/d/l/?s=spy.us&i=d
+    """
+    sym = _symbol_to_stooq(symbol)
+    url = f"https://stooq.com/q/d/l/?s={quote_plus(sym)}&i=d"
+    r = requests.get(url, timeout=14, headers=UA_HEADERS)
+    r.raise_for_status()
+
+    text = (r.text or "").strip()
+    if not text or "404" in text.lower():
+        return []
+
+    f = StringIO(text)
+    reader = csv.DictReader(f)
+    rows = list(reader)
+    if not rows:
+        return []
+
+    out: List[Tuple[datetime, float]] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(lookback_days))
+    for row in rows:
+        ds = (row.get("Date") or "").strip()
+        cs = (row.get("Close") or "").strip()
+        if not ds or not cs:
+            continue
+        try:
+            dt = datetime.strptime(ds, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if dt < cutoff:
+                continue
+            c = float(cs)
+        except Exception:
+            continue
+        out.append((dt, c))
+
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _closes(symbol: str, prefer_yahoo_range: str, interval: str, stooq_lookback_days: int) -> Tuple[List[Tuple[datetime, float]], List[str]]:
+    """
+    Returns (series, errors)
+    """
+    errors: List[str] = []
+    try:
+        y = _yahoo_closes(symbol, range_str=prefer_yahoo_range, interval=interval)
+        if len(y) >= 10:
+            return y, errors
+        errors.append(f"Yahoo returned too few points for {symbol}")
+    except Exception as e:
+        errors.append(f"Yahoo failed for {symbol}: {type(e).__name__}: {str(e)}")
+
+    try:
+        s = _stooq_closes(symbol, lookback_days=stooq_lookback_days)
+        if len(s) >= 10:
+            return s, errors
+        errors.append(f"Stooq returned too few points for {symbol}")
+    except Exception as e:
+        errors.append(f"Stooq failed for {symbol}: {type(e).__name__}: {str(e)}")
+
+    return [], errors
+
+
 def _pct(a: float, b: float) -> float:
     if b == 0:
         return 0.0
@@ -399,8 +482,6 @@ def _clamp01(x: float) -> float:
 # CNN Fear & Greed
 # =========================================================
 def _cnn_fear_greed_graphdata(date_str: Optional[str] = None) -> dict:
-    # CNN endpoint commonly used by dashboards
-    # Example: https://production.dataviz.cnn.io/index/fearandgreed/graphdata/2026-01-31
     d = date_str or datetime.now(timezone.utc).date().isoformat()
     url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{d}"
     r = requests.get(url, timeout=14, headers=UA_HEADERS)
@@ -429,7 +510,12 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
     except Exception as e:
         return cache_set(
             key,
-            {"date": date or datetime.now(timezone.utc).date().isoformat(), "score": None, "rating": None, "error": f"{type(e).__name__}: {str(e)}"},
+            {
+                "date": date or datetime.now(timezone.utc).date().isoformat(),
+                "score": None,
+                "rating": None,
+                "error": f"{type(e).__name__}: {str(e)}",
+            },
             ttl_seconds=60,
         )
 
@@ -451,61 +537,60 @@ def market_snapshot():
     out = {"date": now.date().isoformat(), "sp500": {}, "vix": {}, "fearGreed": {}}
     errors: List[str] = []
 
-    try:
-        spy = _yahoo_closes("SPY", range_str="3mo", interval="1d")
-        if len(spy) >= 25:
-            closes = [c for _, c in spy]
-            last = closes[-1]
-            out["sp500"] = {
-                "symbol": "SPY",
-                "last": round(last, 4),
-                "ret1dPct": round(_pct(closes[-1], closes[-2]), 4) if len(closes) >= 2 else None,
-                "ret5dPct": round(_pct(closes[-1], closes[-6]), 4) if len(closes) >= 6 else None,
-                "ret1mPct": round(_pct(closes[-1], closes[-22]), 4) if len(closes) >= 22 else None,
-            }
-    except Exception as e:
-        errors.append(f"SPY: {type(e).__name__}: {str(e)}")
+    spy, spy_errs = _closes("SPY", prefer_yahoo_range="3mo", interval="1d", stooq_lookback_days=365)
+    errors.extend([f"SPY: {e}" for e in spy_errs])
 
-    try:
-        vix = _yahoo_closes("^VIX", range_str="3mo", interval="1d")
-        if len(vix) >= 2:
-            closes = [c for _, c in vix]
-            out["vix"] = {
-                "symbol": "^VIX",
-                "last": round(closes[-1], 4),
-                "chg1d": round(closes[-1] - closes[-2], 4),
-            }
-    except Exception as e:
-        errors.append(f"VIX: {type(e).__name__}: {str(e)}")
+    if len(spy) >= 25:
+        closes = [c for _, c in spy]
+        last = closes[-1]
+        out["sp500"] = {
+            "symbol": "SPY",
+            "last": round(last, 4),
+            "ret1dPct": round(_pct(closes[-1], closes[-2]), 4) if len(closes) >= 2 else None,
+            "ret5dPct": round(_pct(closes[-1], closes[-6]), 4) if len(closes) >= 6 else None,
+            "ret1mPct": round(_pct(closes[-1], closes[-22]), 4) if len(closes) >= 22 else None,
+        }
+    else:
+        errors.append("SPY: insufficient data points for returns")
+
+    vix, vix_errs = _closes("^VIX", prefer_yahoo_range="3mo", interval="1d", stooq_lookback_days=365)
+    errors.extend([f"VIX: {e}" for e in vix_errs])
+
+    if len(vix) >= 2:
+        closes = [c for _, c in vix]
+        out["vix"] = {
+            "symbol": "^VIX",
+            "last": round(closes[-1], 4),
+            "chg1d": round(closes[-1] - closes[-2], 4),
+        }
+    else:
+        errors.append("VIX: insufficient data points")
 
     try:
         fg = market_fear_greed(None)
-        out["fearGreed"] = {
-            "score": fg.get("score"),
-            "rating": fg.get("rating"),
-        }
+        out["fearGreed"] = {"score": fg.get("score"), "rating": fg.get("rating")}
     except Exception as e:
         errors.append(f"FearGreed: {type(e).__name__}: {str(e)}")
 
-    out["errors"] = errors
+    out["errors"] = [e for e in errors if e]
     return cache_set(key, out, ttl_seconds=180)
 
 
 # =========================================================
-# Market Entry Index (your existing endpoint, upgraded slightly)
+# Market Entry Index (FIXED): uses provider fallback
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     now = datetime.now(timezone.utc)
 
-    err_notes = []
-    try:
-        spy = _yahoo_closes("SPY", range_str="1y", interval="1d")
-        vix = _yahoo_closes("^VIX", range_str="1y", interval="1d")
-    except Exception as e:
-        err_notes.append(f"Yahoo chart failed: {type(e).__name__}: {str(e)}")
-        spy, vix = [], []
+    spy, spy_errs = _closes("SPY", prefer_yahoo_range="2y", interval="1d", stooq_lookback_days=900)
+    vix, vix_errs = _closes("^VIX", prefer_yahoo_range="1y", interval="1d", stooq_lookback_days=900)
 
+    err_notes = []
+    err_notes.extend(spy_errs)
+    err_notes.extend(vix_errs)
+
+    # Need enough history for SMA200 and a stable VIX gauge
     if len(spy) < 210 or len(vix) < 30:
         return {
             "date": now.date().isoformat(),
@@ -557,7 +642,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
 
     notes = f"SPY={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={v:.2f}"
     if err_notes:
-        notes = notes + " | " + " | ".join(err_notes)
+        notes = notes + " | " + " | ".join(err_notes[:4])
 
     return {
         "date": now.date().isoformat(),
@@ -798,8 +883,6 @@ SECTOR_QUERIES = {
 }
 
 def _google_news_rss(query: str) -> str:
-    # Google News RSS search endpoint
-    # https://news.google.com/rss/search?q=...&hl=en-US&gl=US&ceid=US:en
     q = quote_plus(query)
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
@@ -819,7 +902,6 @@ def _extract_tickers_from_titles(titles: List[str], watchlist: List[str]) -> Dic
     return counts
 
 def _brief_paragraph_from_headlines(headlines: List[str], sector: str) -> str:
-    # Simple deterministic summarizer: groups by recurring terms
     if not headlines:
         return f"No major {sector} headlines in the current pull."
     h = " ".join(headlines[:10]).lower()
@@ -859,11 +941,6 @@ def news_briefing(
     watchlist: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
     max_items_per_sector: int = Query(default=12, ge=5, le=40),
 ):
-    """
-    One call your News tab can render visually:
-    - Market snapshot (SPY, VIX, Fear&Greed)
-    - Sector tiles with: sentiment, short summary, top headlines, watchlist ticker mentions
-    """
     key = f"briefing:{sectors}:{watchlist}:{max_items_per_sector}"
     cached = cache_get(key)
     if cached is not None:
@@ -894,7 +971,6 @@ def news_briefing(
             except Exception as e:
                 errors.append(f"{sec}: {type(e).__name__}: {str(e)}")
 
-        # dedupe by link
         seen = set()
         ded = []
         for x in items:
@@ -921,7 +997,6 @@ def news_briefing(
         }
         sector_tiles.append(tile)
 
-    # overall rollup
     all_titles = []
     for t in sector_tiles:
         for h in t.get("topHeadlines", [])[:6]:
@@ -1329,7 +1404,6 @@ def _score_row(cong: dict, news_mentions: int, sector_mentions: int) -> dict:
     net = buy - sell
     bipartisan = min(dem, rep)
 
-    # Scoring: congress dominates, news boosts relevance
     score = 0.0
     score += 6.0 * participation
     score += 5.0 * max(0, net)
@@ -1337,7 +1411,6 @@ def _score_row(cong: dict, news_mentions: int, sector_mentions: int) -> dict:
     score += 2.0 * news_mentions
     score += 1.5 * sector_mentions
 
-    # Soft clamp to 0..100 for UI friendliness
     score_100 = int(max(0, min(100, round(100.0 * (1.0 - math.exp(-score / 25.0))))))
 
     drivers = []
@@ -1377,9 +1450,6 @@ def signals_ideas(
     sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense"),
     limit: int = Query(default=25, ge=5, le=100),
 ):
-    """
-    Returns a scored list you can render under Market Entry on Main tab.
-    """
     key = f"ideas:{window_days}:{watchlist}:{sectors}:{limit}"
     cached = cache_get(key)
     if cached is not None:
@@ -1388,20 +1458,15 @@ def signals_ideas(
     wl = [t.strip().upper() for t in watchlist.split(",") if t.strip()]
     sec_str = sectors
 
-    # Pull congress
     congress = report_today(window_days=window_days, horizon_days=None)
-
-    # Aggregate congress tickers
     cong_agg = _congress_ticker_agg(congress)
 
-    # Pull watchlist headlines
     wnews = news_watchlist(tickers=",".join(wl), max_items_per_ticker=8)
     watch_titles: List[str] = []
     for t, arr in (wnews.get("itemsByTicker") or {}).items():
         for x in (arr or [])[:8]:
             watch_titles.append(x.get("title", "") or "")
 
-    # Pull sector briefing and count mentions of watchlist tickers in sector headlines
     briefing = news_briefing(sectors=sec_str, watchlist=",".join(wl), max_items_per_sector=12)
     sector_titles: List[str] = []
     for sec in briefing.get("sectors") or []:
@@ -1411,7 +1476,6 @@ def signals_ideas(
     watch_counts = _extract_tickers_from_titles(watch_titles, wl)
     sector_counts = _extract_tickers_from_titles(sector_titles, wl)
 
-    # Score all congress tickers, plus any watchlist tickers mentioned in news
     tickers = set(cong_agg.keys()) | set(watch_counts.keys()) | set(sector_counts.keys())
 
     rows = []
