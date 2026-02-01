@@ -2,12 +2,11 @@ import os
 import re
 import time
 import math
-import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import quiverquant
@@ -18,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.2.3")
+app = FastAPI(title="Finance Signals Backend", version="4.3.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -38,7 +37,6 @@ FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
-# Global UA headers (fine for JSON APIs)
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
     "Accept": "application/json,text/plain,*/*",
@@ -46,7 +44,6 @@ UA_HEADERS = {
     "Connection": "keep-alive",
 }
 
-# RSS-specific headers (important: do NOT advertise only JSON)
 RSS_HEADERS = {
     "User-Agent": UA_HEADERS["User-Agent"],
     "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8",
@@ -54,40 +51,43 @@ RSS_HEADERS = {
     "Connection": "keep-alive",
 }
 
-# Use a session to reuse connections (stability and speed)
 SESSION = requests.Session()
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.2.3"}
+    return {"status": "ok", "version": "4.3.0"}
 
 
 # =========================================================
-# Small TTL cache (Render-friendly)
+# Stale-while-revalidate cache (Render-friendly)
 # =========================================================
-_CACHE: Dict[str, Tuple[float, Any]] = {}
+# key -> (fresh_until_epoch, stale_until_epoch, value)
+_CACHE: Dict[str, Tuple[float, float, Any]] = {}
 
 
-def cache_get(key: str) -> Optional[Any]:
+def cache_get(key: str, allow_stale: bool = False) -> Optional[Any]:
     now = time.time()
     rec = _CACHE.get(key)
     if not rec:
         return None
-    exp, val = rec
-    if now > exp:
-        _CACHE.pop(key, None)
-        return None
-    return val
+    fresh_until, stale_until, val = rec
+    if now <= fresh_until:
+        return val
+    if allow_stale and now <= stale_until:
+        return val
+    _CACHE.pop(key, None)
+    return None
 
 
-def cache_set(key: str, val: Any, ttl_seconds: int = 120) -> Any:
-    _CACHE[key] = (time.time() + ttl_seconds, val)
+def cache_set(key: str, val: Any, ttl_seconds: int = 120, stale_ttl_seconds: int = 900) -> Any:
+    now = time.time()
+    _CACHE[key] = (now + float(ttl_seconds), now + float(stale_ttl_seconds), val)
     return val
 
 
 # =========================================================
-# Provider cooldowns to avoid repeated 429 / timeouts
+# Provider cooldowns (split RSS vs chart to stop collateral damage)
 # =========================================================
 _PROVIDER_COOLDOWN_UNTIL: Dict[str, float] = {}
 
@@ -377,24 +377,27 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 
 # =========================================================
-# Market data providers (rate-limit safe)
+# HTTP helpers
 # =========================================================
 def _requests_get(url: str, params: Optional[dict] = None, timeout: int = 14, headers: Optional[dict] = None) -> requests.Response:
     h = headers or UA_HEADERS
     return SESSION.get(url, params=params, timeout=timeout, headers=h)
 
 
+# =========================================================
+# Yahoo chart (separate cooldown bucket)
+# =========================================================
 def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
-    if _is_cooled_down("yahoo"):
-        raise RuntimeError("Yahoo in cooldown (rate-limit backoff)")
+    if _is_cooled_down("yahoo_chart"):
+        raise RuntimeError("Yahoo chart in cooldown (rate-limit backoff)")
 
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
     params = {"range": range_str, "interval": interval}
 
     r = _requests_get(url, params=params, timeout=14, headers=UA_HEADERS)
     if r.status_code == 429:
-        _cooldown("yahoo", 10 * 60)
-        raise RuntimeError("Yahoo rate limited (HTTP 429)")
+        _cooldown("yahoo_chart", 10 * 60)
+        raise RuntimeError("Yahoo chart rate limited (HTTP 429)")
     r.raise_for_status()
     return r.json()
 
@@ -420,6 +423,9 @@ def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> 
     return out
 
 
+# =========================================================
+# Stooq closes (good fallback, no Yahoo dependencies)
+# =========================================================
 def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
     if _is_cooled_down("stooq"):
         raise RuntimeError("Stooq in cooldown")
@@ -474,6 +480,9 @@ def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
     raise RuntimeError(f"Stooq failed: {last_err or 'unknown'}")
 
 
+# =========================================================
+# Finnhub (optional)
+# =========================================================
 def _finnhub_quote(symbol: str) -> dict:
     if not FINNHUB_API_KEY:
         raise RuntimeError("FINNHUB_API_KEY missing")
@@ -520,7 +529,7 @@ def _cnn_fear_greed_graphdata(date_str: Optional[str] = None) -> dict:
 @app.get("/market/fear-greed")
 def market_fear_greed(date: Optional[str] = Query(default=None)):
     key = f"feargreed:{date or 'today'}"
-    cached = cache_get(key)
+    cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
 
@@ -532,10 +541,13 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
             "date": (data or {}).get("date") or (date or datetime.now(timezone.utc).date().isoformat()),
             "score": now_val.get("value"),
             "rating": now_val.get("valueText") or now_val.get("rating"),
-            "raw": data,
         }
-        return cache_set(key, out, ttl_seconds=600)
+        return cache_set(key, out, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
     except Exception as e:
+        # keep a stale value if we have it
+        stale = cache_get(key, allow_stale=True)
+        if stale is not None:
+            return stale
         return cache_set(
             key,
             {
@@ -545,11 +557,12 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
                 "error": f"{type(e).__name__}: {str(e)}",
             },
             ttl_seconds=120,
+            stale_ttl_seconds=900,
         )
 
 
 # =========================================================
-# Market Snapshot (cache + cooldown + fallbacks)
+# Market Snapshot (cache + fallbacks)
 # =========================================================
 def _compute_returns_from_closes(closes: List[Tuple[datetime, float]]) -> dict:
     if not closes or len(closes) < 2:
@@ -572,6 +585,13 @@ def _compute_returns_from_closes(closes: List[Tuple[datetime, float]]) -> dict:
 
 
 def _try_get_spy_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
+    # Prefer Stooq to avoid Yahoo coupling
+    try:
+        return _stooq_daily_closes("spy.us")
+    except Exception as e:
+        errors.append(f"Stooq SPY: {type(e).__name__}: {str(e)}")
+
+    # Finnhub quick fallback (2 points only)
     if FINNHUB_API_KEY:
         try:
             q = _finnhub_quote("SPY")
@@ -583,20 +603,22 @@ def _try_get_spy_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
         except Exception as e:
             errors.append(f"Finnhub SPY: {type(e).__name__}: {str(e)}")
 
+    # Yahoo last resort
     try:
         return _yahoo_closes("SPY", range_str="3mo", interval="1d")
     except Exception as e:
         errors.append(f"Yahoo SPY: {type(e).__name__}: {str(e)}")
 
-    try:
-        return _stooq_daily_closes("spy.us")
-    except Exception as e:
-        errors.append(f"Stooq SPY: {type(e).__name__}: {str(e)}")
-
     return []
 
 
 def _try_get_vix_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
+    # Prefer Stooq to avoid Yahoo coupling
+    try:
+        return _stooq_daily_closes("vix")
+    except Exception as e:
+        errors.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
+
     if FINNHUB_API_KEY:
         try:
             q = _finnhub_quote("VIX")
@@ -613,18 +635,13 @@ def _try_get_vix_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
     except Exception as e:
         errors.append(f"Yahoo VIX: {type(e).__name__}: {str(e)}")
 
-    try:
-        return _stooq_daily_closes("vix")
-    except Exception as e:
-        errors.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
-
     return []
 
 
 @app.get("/market/snapshot")
 def market_snapshot():
-    key = "market:snapshot:v2"
-    cached = cache_get(key)
+    key = "market:snapshot:v3"
+    cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
 
@@ -662,68 +679,67 @@ def market_snapshot():
 
     out["errors"] = errors
 
-    last_good = cache_get("market:snapshot:last_good")
+    # last-good fallback
+    last_good = cache_get("market:snapshot:last_good", allow_stale=True)
     if (out["sp500"].get("last") is None) and last_good:
-        last_good = dict(last_good)
-        last_good_errors = list(last_good.get("errors") or [])
-        last_good_errors.extend(errors[:3])
-        last_good["errors"] = last_good_errors
-        return cache_set(key, last_good, ttl_seconds=90)
+        merged = dict(last_good)
+        merged_errors = list(merged.get("errors") or [])
+        merged_errors.extend(errors[:3])
+        merged["errors"] = merged_errors
+        return cache_set(key, merged, ttl_seconds=90, stale_ttl_seconds=1800)
 
     if out["sp500"].get("last") is not None:
-        cache_set("market:snapshot:last_good", out, ttl_seconds=3600)
+        cache_set("market:snapshot:last_good", out, ttl_seconds=3600, stale_ttl_seconds=24 * 3600)
 
-    return cache_set(key, out, ttl_seconds=120)
+    return cache_set(key, out, ttl_seconds=180, stale_ttl_seconds=1800)
 
 
 # =========================================================
-# Market Entry Index (caching + last-good fallback)
+# Market Entry Index (no longer dependent on Yahoo RSS cooldown)
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
-    key = f"market:entry:v2:{window_days}"
-    cached = cache_get(key)
+    key = f"market:entry:v3:{window_days}"
+    cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
 
     now = datetime.now(timezone.utc)
     err_notes: List[str] = []
 
-    snap = market_snapshot()
-    spy_last = (snap.get("sp500") or {}).get("last")
-    vix_last = (snap.get("vix") or {}).get("last")
-
+    # Use 1y closes for SMA. Prefer Stooq always.
     spy: List[Tuple[datetime, float]] = []
     vix: List[Tuple[datetime, float]] = []
 
     try:
-        spy = _yahoo_closes("SPY", range_str="1y", interval="1d")
+        spy = _stooq_daily_closes("spy.us")
     except Exception as e:
-        err_notes.append(f"Yahoo SPY: {type(e).__name__}: {str(e)}")
+        err_notes.append(f"Stooq SPY: {type(e).__name__}: {str(e)}")
+        # Yahoo chart is OK if RSS is throttled, because cooldown buckets are split.
         try:
-            spy = _stooq_daily_closes("spy.us")
+            spy = _yahoo_closes("SPY", range_str="1y", interval="1d")
         except Exception as e2:
-            err_notes.append(f"Stooq SPY: {type(e2).__name__}: {str(e2)}")
+            err_notes.append(f"Yahoo SPY: {type(e2).__name__}: {str(e2)}")
             spy = []
 
     try:
-        vix = _yahoo_closes("^VIX", range_str="1y", interval="1d")
+        vix = _stooq_daily_closes("vix")
     except Exception as e:
-        err_notes.append(f"Yahoo VIX: {type(e).__name__}: {str(e)}")
+        err_notes.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
         try:
-            vix = _stooq_daily_closes("vix")
+            vix = _yahoo_closes("^VIX", range_str="1y", interval="1d")
         except Exception as e2:
-            err_notes.append(f"Stooq VIX: {type(e2).__name__}: {str(e2)}")
+            err_notes.append(f"Yahoo VIX: {type(e2).__name__}: {str(e2)}")
             vix = []
 
+    # last-good fallback
     if len(spy) < 210 or len(vix) < 30:
-        last_good = cache_get("market:entry:last_good")
+        last_good = cache_get("market:entry:last_good", allow_stale=True)
         if last_good:
-            last_good = dict(last_good)
-            last_good["notes"] = (last_good.get("notes") or "") + " | " + (" | ".join(err_notes) if err_notes else "Insufficient market data.")
-            last_good.setdefault("errors", [])
-            last_good["errors"] = (last_good.get("errors") or []) + err_notes[:3]
-            return cache_set(key, last_good, ttl_seconds=90)
+            merged = dict(last_good)
+            merged["notes"] = (merged.get("notes") or "") + " | " + (" | ".join(err_notes) if err_notes else "Insufficient market data.")
+            merged["errors"] = (list(merged.get("errors") or []) + err_notes)[:8]
+            return cache_set(key, merged, ttl_seconds=90, stale_ttl_seconds=1800)
 
         out = {
             "date": now.date().isoformat(),
@@ -741,32 +757,25 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             },
             "errors": err_notes,
         }
-        return cache_set(key, out, ttl_seconds=90)
+        return cache_set(key, out, ttl_seconds=90, stale_ttl_seconds=900)
 
-    _, spy_close = zip(*spy)
-    _, vix_close = zip(*vix)
+    spy_sorted = sorted(spy, key=lambda x: x[0])
+    vix_sorted = sorted(vix, key=lambda x: x[0])
 
-    price = float(spy_close[-1])
-    if spy_last is not None:
-        try:
-            price = float(spy_last)
-        except Exception:
-            pass
+    spy_vals = [c for _, c in spy_sorted]
+    vix_vals = [c for _, c in vix_sorted]
 
-    sma50 = _sma(list(spy_close), 50) or price
-    sma200 = _sma(list(spy_close), 200) or price
+    price = float(spy_vals[-1])
+    v = float(vix_vals[-1])
+
+    sma50 = _sma(spy_vals, 50) or price
+    sma200 = _sma(spy_vals, 200) or price
 
     trend_cross = 1.0 if sma50 >= sma200 else 0.0
     price_vs_200 = _clamp01((price / sma200 - 0.90) / (1.10 - 0.90))
     spx_trend_01 = _clamp01(0.55 * trend_cross + 0.45 * price_vs_200)
 
-    v = float(vix_close[-1])
-    if vix_last is not None:
-        try:
-            v = float(vix_last)
-        except Exception:
-            pass
-
+    # vix lower is better
     vix_01 = _clamp01(1.0 - ((v - 12.0) / (35.0 - 12.0)))
 
     breadth_01 = spx_trend_01
@@ -808,22 +817,23 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         "errors": err_notes,
     }
 
-    cache_set("market:entry:last_good", out, ttl_seconds=3600)
-    return cache_set(key, out, ttl_seconds=180)
+    cache_set("market:entry:last_good", out, ttl_seconds=3600, stale_ttl_seconds=24 * 3600)
+    return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=1800)
 
 
 # =========================================================
-# RSS + sentiment
+# RSS fetch (stale on 429, provider split: yahoo_rss)
 # =========================================================
 def _fetch_rss_items_uncached(url: str, timeout: int = 8, max_items: int = 25) -> List[dict]:
     r = _requests_get(url, timeout=timeout, headers=RSS_HEADERS)
+    if r.status_code == 429:
+        raise requests.HTTPError("429 Too Many Requests", response=r)
     r.raise_for_status()
 
     text = (r.text or "").strip()
     if not text:
         return []
 
-    # Some feeds include leading junk or BOM
     if text.startswith("\ufeff"):
         text = text.lstrip("\ufeff").strip()
 
@@ -832,10 +842,8 @@ def _fetch_rss_items_uncached(url: str, timeout: int = 8, max_items: int = 25) -
     except Exception:
         return []
 
-    # RSS channel
     channel = root.find("channel")
     if channel is None:
-        # Atom
         entries = root.findall("{http://www.w3.org/2005/Atom}entry")
         out = []
         for e in entries[:max_items]:
@@ -857,16 +865,50 @@ def _fetch_rss_items_uncached(url: str, timeout: int = 8, max_items: int = 25) -
     return out
 
 
-def _fetch_rss_items(url: str, timeout: int = 8, max_items: int = 25, ttl_seconds: int = 180) -> List[dict]:
+def _provider_for_url(url: str) -> str:
+    u = (url or "").lower()
+    if "feeds.finance.yahoo.com" in u:
+        return "yahoo_rss"
+    if "news.google.com" in u:
+        return "google_rss"
+    return "rss"
+
+
+def _fetch_rss_items(url: str, timeout: int = 8, max_items: int = 25, ttl_seconds: int = 240, stale_ttl_seconds: int = 6 * 3600) -> List[dict]:
     """
-    URL-level cache so repeated refreshes do not refetch all feeds.
+    URL-level cache with stale fallback.
+    If upstream 429s, we cool down yahoo_rss and return stale cached data.
     """
-    key = f"rss:url:{url}"
-    cached = cache_get(key)
-    if cached is not None:
-        return cached
-    items = _fetch_rss_items_uncached(url, timeout=timeout, max_items=max_items)
-    return cache_set(key, items, ttl_seconds=ttl_seconds)
+    key = f"rss:url:v2:{url}"
+    cached_fresh = cache_get(key, allow_stale=False)
+    if cached_fresh is not None:
+        return cached_fresh
+
+    provider = _provider_for_url(url)
+    cached_stale = cache_get(key, allow_stale=True)
+
+    if _is_cooled_down(provider):
+        if cached_stale is not None:
+            return cached_stale
+        raise RuntimeError(f"{provider} in cooldown")
+
+    try:
+        items = _fetch_rss_items_uncached(url, timeout=timeout, max_items=max_items)
+        return cache_set(key, items, ttl_seconds=ttl_seconds, stale_ttl_seconds=stale_ttl_seconds)
+    except requests.HTTPError as e:
+        resp = getattr(e, "response", None)
+        code = getattr(resp, "status_code", None)
+        if code == 429:
+            # Cooldown only for Yahoo RSS, not charts
+            if provider == "yahoo_rss":
+                _cooldown("yahoo_rss", 15 * 60)
+            if cached_stale is not None:
+                return cached_stale
+        raise
+    except Exception:
+        if cached_stale is not None:
+            return cached_stale
+        raise
 
 
 _POS_WORDS = set([
@@ -904,7 +946,7 @@ def _headline_sentiment(headlines: List[str]) -> Dict[str, Any]:
             score -= 1
 
     if total == 0:
-        return {"label": "NEUTRAL", "score": 0, "pos": 0, "neg": 0, "total": 0}
+        return {"label": "NEUTRAL", "score": 50, "pos": 0, "neg": 0, "total": 0}
 
     raw = score / max(1, total)
     gauge = int(round(50 + 50 * raw))
@@ -921,7 +963,7 @@ def _headline_sentiment(headlines: List[str]) -> Dict[str, Any]:
 
 
 # =========================================================
-# News briefing endpoints
+# News briefing endpoint (matches your frontend signature)
 # =========================================================
 def _google_news_rss(query: str) -> str:
     q = quote_plus(query)
@@ -944,140 +986,204 @@ def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
     return out
 
 
+def _simple_implications_from_titles(titles: List[str]) -> List[str]:
+    blob = " ".join((titles or [])[:20]).lower()
+    bullets: List[str] = []
+    if any(w in blob for w in ["fed", "fomc", "cpi", "inflation", "rates"]):
+        bullets.append("Macro or rates headlines could drive index-level volatility.")
+    if any(w in blob for w in ["earnings", "guidance", "revenue", "margin"]):
+        bullets.append("Earnings and guidance narratives may dominate near-term moves.")
+    if any(w in blob for w in ["sec", "doj", "probe", "lawsuit", "regulat"]):
+        bullets.append("Regulatory risk is present and can reprice multiples quickly.")
+    if any(w in blob for w in ["war", "sanction", "geopolit", "china", "russia"]):
+        bullets.append("Geopolitical headlines can cause abrupt risk-on or risk-off shifts.")
+    if not bullets:
+        bullets.append("Headlines look mixed and event-driven, treat as context not timing.")
+    return bullets[:3]
+
+
+def _bucketize_by_sector(title: str, sector_hint: str) -> str:
+    # If a sector is explicitly requested, prefer it
+    if sector_hint:
+        return sector_hint
+
+    s = (title or "").lower()
+    if any(w in s for w in ["nvidia", "amd", "chip", "semiconductor", "ai", "datacenter", "gpu"]):
+        return "Semiconductors"
+    if any(w in s for w in ["cloud", "aws", "azure", "google cloud", "saas"]):
+        return "Cloud"
+    if any(w in s for w in ["cyber", "ransomware", "breach", "hack", "security"]):
+        return "Cybersecurity"
+    if any(w in s for w in ["defense", "pentagon", "lockheed", "raytheon", "northrop"]):
+        return "Defense"
+    if any(w in s for w in ["biotech", "fda", "clinical", "medical", "health"]):
+        return "Medical"
+    if any(w in s for w in ["oil", "opec", "gas", "energy", "lng"]):
+        return "Energy"
+    if any(w in s for w in ["robot", "automation", "humanoid"]):
+        return "Robotics"
+    if any(w in s for w in ["bank", "fintech", "payments", "visa", "mastercard"]):
+        return "Financials"
+    if any(w in s for w in ["consumer", "retail", "walmart", "target", "nike"]):
+        return "Consumer"
+    if any(w in s for w in ["infrastructure", "construction", "grid", "utilities"]):
+        return "Infrastructure"
+    return "General"
+
+
 @app.get("/news/briefing")
 def news_briefing(
-    tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
-    max_general: int = Query(default=55, ge=10, le=200),
-    max_per_ticker: int = Query(default=6, ge=2, le=25),
+    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
+    watchlist: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
+    max_items_per_sector: int = Query(default=12, ge=5, le=30),
 ):
     """
-    Fix: concurrent RSS fetch + URL caching + ticker cap to avoid timeouts.
+    Returns a stable, cached, rate-limit safe briefing that matches the frontend schema.
+    Strategy:
+      - For watchlist: prefer Yahoo RSS for only a few tickers, and use Google News RSS for the rest.
+      - On Yahoo 429: serve stale cached headlines and shift load toward Google.
     """
-    key = f"news:brief:v2:{tickers}:{max_general}:{max_per_ticker}"
-    cached = cache_get(key)
+    key = f"news:brief:v3:{sectors}:{watchlist}:{max_items_per_sector}"
+    cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
 
-    syms = [t.strip().upper() for t in (tickers or "").split(",") if t.strip()]
+    sector_list = [s.strip() for s in (sectors or "").split(",") if s.strip()]
+    if not sector_list:
+        sector_list = ["General"]
+
+    syms = [t.strip().upper() for t in (watchlist or "").split(",") if t.strip()]
     syms = syms[:50]
 
-    # IMPORTANT: cap the number of tickers we fetch via Yahoo RSS
-    # This avoids Render timeouts and keeps the feed responsive.
-    MAX_WATCHLIST_TICKERS = 12
-    watch_syms = syms[:MAX_WATCHLIST_TICKERS]
+    # Keep Yahoo RSS load very small. This is the main reason you were getting 429.
+    YAHOO_TICKERS_MAX = 3
+    yahoo_syms = syms[:YAHOO_TICKERS_MAX]
+    google_syms = syms[YAHOO_TICKERS_MAX: min(len(syms), 15)]  # cap extra work
 
-    errors: Dict[str, List[str]] = {"general": [], "watchlist": []}
+    errors: List[str] = []
+    all_items: List[dict] = []
 
-    # Reduce general queries (5 queries can be ok with concurrency, but keep it conservative)
-    general_queries = [
-        "markets stocks macro inflation fed earnings",
-        "AI semiconductors datacenter nvidia amd",
-        "energy oil opec natural gas",
-        "healthcare biotech fda clinical trial",
-        "crypto bitcoin ethereum etf",
-    ]
+    jobs: List[Tuple[str, str, str, int, str]] = []
 
-    def bucketize(title: str) -> str:
-        s = (title or "").lower()
-        if any(w in s for w in ["nvidia", "amd", "chip", "semiconductor", "ai", "datacenter"]):
-            return "AI"
-        if any(w in s for w in ["biotech", "fda", "clinical", "medical", "health"]):
-            return "Medical"
-        if any(w in s for w in ["oil", "opec", "gas", "energy", "lng"]):
-            return "Energy"
-        if any(w in s for w in ["robot", "automation", "humanoid"]):
-            return "Robotics"
-        if any(w in s for w in ["crypto", "bitcoin", "ethereum", "etf", "blockchain"]):
-            return "Crypto"
-        return "General"
-
-    # Build all fetch jobs
-    jobs = []
-
-    # General jobs (Google News RSS)
-    per_q = max(10, max_general // max(1, len(general_queries)))
-    for q in general_queries:
+    # Sector queries (Google News RSS)
+    for sec in sector_list[:18]:
+        q = f"{sec} stocks markets"
         url = _google_news_rss(q)
-        jobs.append(("general", q, url, min(per_q, 30)))
+        jobs.append(("sector", sec, url, max_items_per_sector * 2, "google_rss"))
 
-    # Watchlist jobs (Yahoo Finance RSS)
-    for t in watch_syms:
+    # Watchlist: Yahoo for a few
+    for t in yahoo_syms:
         url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(t)}&region=US&lang=en-US"
-        jobs.append(("watchlist", t, url, max_per_ticker))
+        jobs.append(("watch_yahoo", t, url, max_items_per_sector, "yahoo_rss"))
 
-    general_items: List[dict] = []
-    watch_items: List[dict] = []
+    # Watchlist: Google for the rest
+    for t in google_syms:
+        url = _google_news_rss(f"{t} stock")
+        jobs.append(("watch_google", t, url, max_items_per_sector, "google_rss"))
 
-    # Concurrent fetch
-    # Keep workers modest to avoid tripping upstream or Render CPU throttling
-    MAX_WORKERS = 10
+    # Concurrency: modest
+    MAX_WORKERS = 8
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futs = []
-        for kind, tag, url, n in jobs:
-            futs.append((kind, tag, url, ex.submit(_fetch_rss_items, url, 8, n, 180)))
+        for kind, tag, url, n, provider in jobs:
+            futs.append((kind, tag, url, provider, ex.submit(_fetch_rss_items, url, 8, n, 240, 6 * 3600)))
 
-        for kind, tag, url, fut in futs:
+        for kind, tag, url, provider, fut in futs:
             try:
                 items = fut.result()
                 if not items:
                     continue
-                if kind == "general":
+                for x in items:
+                    x["source"] = "Yahoo" if provider == "yahoo_rss" else "Google News"
+                if kind == "sector":
                     for x in items:
-                        x["bucket"] = "General"
-                    general_items.extend(items)
+                        x["sectorHint"] = tag
+                    all_items.extend(items)
                 else:
                     for x in items:
-                        x["bucket"] = "Watchlist"
                         x["ticker"] = tag
-                    watch_items.extend(items)
+                    all_items.extend(items)
             except Exception as e:
-                if kind == "general":
-                    errors["general"].append(f"{tag}: {type(e).__name__}: {str(e)}")
-                else:
-                    errors["watchlist"].append(f"{tag}: {type(e).__name__}: {str(e)}")
+                errors.append(f"{tag}: {type(e).__name__}: {str(e)}")
 
-    # Dedup and cap general
-    gen_ded = _dedup_items(general_items, max_items=max_general)
+    all_items = _dedup_items(all_items, max_items=600)
 
-    # Create sector map
-    sector_map: Dict[str, List[dict]] = {}
-    for x in (gen_ded + watch_items):
-        sec = bucketize(x.get("title", ""))
-        sector_map.setdefault(sec, []).append(x)
+    # Build per-sector objects
+    sectors_out: List[dict] = []
+    for sec in sector_list:
+        sec_items: List[dict] = []
+        watch_mentions: List[dict] = []
 
-    sectors_out = []
-    for sec, items in sector_map.items():
-        titles = [i.get("title", "") for i in items]
+        for x in all_items:
+            title = x.get("title", "") or ""
+            hint = x.get("sectorHint", "")
+            # If item came from this sector query, include.
+            if hint == sec:
+                sec_items.append(x)
+
+        # Add watchlist items that map into this sector bucket
+        for x in all_items:
+            title = x.get("title", "") or ""
+            if not title:
+                continue
+            tkr = (x.get("ticker") or "").upper().strip()
+            if not tkr:
+                continue
+            mapped = _bucketize_by_sector(title, "")
+            if mapped == sec:
+                watch_mentions.append({
+                    "ticker": tkr,
+                    "title": title,
+                    "link": x.get("link", ""),
+                    "published": x.get("published", ""),
+                    "sourceFeed": x.get("source", ""),
+                    "sector": sec,
+                })
+
+        combined = sec_items + watch_mentions
+        combined = _dedup_items(combined, max_items=max_items_per_sector)
+
+        titles = [c.get("title", "") for c in combined if c.get("title")]
         sent = _headline_sentiment(titles)
-        top = items[:12]
+        implications = _simple_implications_from_titles(titles)
+
+        top_headlines = []
+        for c in combined[:max_items_per_sector]:
+            top_headlines.append({
+                "title": c.get("title", ""),
+                "link": c.get("link", ""),
+                "published": c.get("published", ""),
+                "sourceFeed": c.get("source", c.get("sourceFeed", "")),
+                "sector": sec,
+            })
+
+        # WatchlistMentions: keep small
+        wm = _dedup_items(watch_mentions, max_items=min(8, max_items_per_sector))
+
         sectors_out.append({
             "sector": sec,
-            "count": len(items),
-            "sentiment": sent,
+            "sentiment": {"label": sent.get("label", "NEUTRAL"), "score": int(sent.get("score", 50) or 50)},
             "summary": "",
-            "implications_2_12_weeks": [],
-            "headlines": top,
+            "implications": implications,
+            "topHeadlines": top_headlines,
+            "watchlistMentions": wm,
         })
 
-    overall = _headline_sentiment([x.get("title", "") for x in (gen_ded[:20] + watch_items[:20])])
+    overall_titles = []
+    for s in sectors_out:
+        overall_titles.extend([h.get("title", "") for h in (s.get("topHeadlines") or [])[:4]])
+    overall = _headline_sentiment(overall_titles)
 
     out = {
         "date": datetime.now(timezone.utc).date().isoformat(),
-        "overallSentiment": overall,
-        "sectors": sorted(sectors_out, key=lambda x: (-int(x["count"]), x["sector"])),
-        "sources": {
-            "general": "Google News RSS (queries)",
-            "watchlist": f"Yahoo Finance RSS (first {MAX_WATCHLIST_TICKERS} tickers)",
-        },
+        "overallSentiment": {"label": overall.get("label", "NEUTRAL"), "score": int(overall.get("score", 50) or 50)},
+        "sectors": sectors_out,
         "errors": errors,
-        "note": "Headline grouping for context. Not a prediction engine.",
+        "note": "Cache-first briefing. Yahoo is sampled for only a few tickers. If Yahoo throttles, stale cache is served and Google remains active.",
     }
 
-    # If everything fails, still return something visible and explicit
-    if not out["sectors"]:
-        out["note"] = "No headlines returned. Likely upstream blocking or timeout. See errors for details."
-
-    return cache_set(key, out, ttl_seconds=180)
+    return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
 
 
 # =========================================================
@@ -1420,7 +1526,7 @@ def report_congress_daily(
 
 
 # =========================================================
-# Crypto News Briefing (existing endpoint)
+# Crypto News Briefing (kept from your version, already robust)
 # =========================================================
 CRYPTO_OUTLETS = [
     {"name": "CoinDesk", "rss": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
@@ -1512,8 +1618,8 @@ def crypto_news_briefing(
         if "SHIB" not in coin_list:
             coin_list.insert(0, "SHIB")
 
-    key = f"crypto:brief:{','.join(coin_list)}:{include_top_n}"
-    cached = cache_get(key)
+    key = f"crypto:brief:v2:{','.join(coin_list)}:{include_top_n}"
+    cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
 
@@ -1522,7 +1628,7 @@ def crypto_news_briefing(
 
     for outlet in CRYPTO_OUTLETS:
         try:
-            items = _fetch_rss_items(outlet["rss"], max_items=50, timeout=8, ttl_seconds=240)
+            items = _fetch_rss_items(outlet["rss"], max_items=50, timeout=8, ttl_seconds=240, stale_ttl_seconds=6 * 3600)
             for x in items:
                 x["source"] = outlet["name"]
             all_items.extend(items)
@@ -1533,7 +1639,7 @@ def crypto_news_briefing(
         try:
             nm = COIN_CANON.get(sym, {}).get("name", sym)
             q = f"{nm} {sym} crypto"
-            g_items = _fetch_rss_items(_google_news_rss(q), max_items=18, timeout=8, ttl_seconds=240)
+            g_items = _fetch_rss_items(_google_news_rss(q), max_items=18, timeout=8, ttl_seconds=240, stale_ttl_seconds=6 * 3600)
             for x in g_items:
                 x["source"] = "Google News"
             all_items.extend(g_items)
@@ -1600,4 +1706,4 @@ def crypto_news_briefing(
         "coins": coin_blocks,
     }
 
-    return cache_set(key, out, ttl_seconds=240)
+    return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
