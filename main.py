@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import quiverquant
@@ -37,12 +38,24 @@ FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
+# Global UA headers (fine for JSON APIs)
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-    "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, application/json;q=0.7, text/plain;q=0.6, */*;q=0.5",
+    "Accept": "application/json,text/plain,*/*",
     "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
 }
+
+# RSS-specific headers (important: do NOT advertise only JSON)
+RSS_HEADERS = {
+    "User-Agent": UA_HEADERS["User-Agent"],
+    "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8",
+    "Accept-Language": UA_HEADERS["Accept-Language"],
+    "Connection": "keep-alive",
+}
+
+# Use a session to reuse connections (stability and speed)
+SESSION = requests.Session()
 
 
 @app.get("/")
@@ -366,8 +379,9 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 # =========================================================
 # Market data providers (rate-limit safe)
 # =========================================================
-def _requests_get(url: str, params: Optional[dict] = None, timeout: int = 14) -> requests.Response:
-    return requests.get(url, params=params, timeout=timeout, headers=UA_HEADERS)
+def _requests_get(url: str, params: Optional[dict] = None, timeout: int = 14, headers: Optional[dict] = None) -> requests.Response:
+    h = headers or UA_HEADERS
+    return SESSION.get(url, params=params, timeout=timeout, headers=h)
 
 
 def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
@@ -377,7 +391,7 @@ def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> d
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
     params = {"range": range_str, "interval": interval}
 
-    r = _requests_get(url, params=params, timeout=14)
+    r = _requests_get(url, params=params, timeout=14, headers=UA_HEADERS)
     if r.status_code == 429:
         _cooldown("yahoo", 10 * 60)
         raise RuntimeError("Yahoo rate limited (HTTP 429)")
@@ -416,7 +430,7 @@ def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
     last_err = None
     for attempt in range(3):
         try:
-            r = _requests_get(url, params=params, timeout=12)
+            r = _requests_get(url, params=params, timeout=12, headers=UA_HEADERS)
             if r.status_code >= 400:
                 last_err = f"HTTP {r.status_code}"
                 time.sleep(min(1.5, 0.5 * (attempt + 1)))
@@ -468,7 +482,7 @@ def _finnhub_quote(symbol: str) -> dict:
 
     url = "https://finnhub.io/api/v1/quote"
     params = {"symbol": symbol, "token": FINNHUB_API_KEY}
-    r = _requests_get(url, params=params, timeout=10)
+    r = _requests_get(url, params=params, timeout=10, headers=UA_HEADERS)
     if r.status_code == 429:
         _cooldown("finnhub", 5 * 60)
         raise RuntimeError("Finnhub rate limited (HTTP 429)")
@@ -498,7 +512,7 @@ def _clamp01(x: float) -> float:
 def _cnn_fear_greed_graphdata(date_str: Optional[str] = None) -> dict:
     d = date_str or datetime.now(timezone.utc).date().isoformat()
     url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{d}"
-    r = _requests_get(url, timeout=14)
+    r = _requests_get(url, timeout=14, headers=UA_HEADERS)
     r.raise_for_status()
     return r.json()
 
@@ -799,66 +813,62 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
 
 
 # =========================================================
-# RSS utilities (more robust)
+# RSS + sentiment
 # =========================================================
-def _looks_like_html(text: str) -> bool:
-    t = (text or "").lstrip().lower()
-    return t.startswith("<!doctype html") or t.startswith("<html") or "<html" in t[:2000]
-
-
-def _fetch_text(url: str, timeout: int = 12, max_bytes: int = 2_000_000) -> str:
-    r = _requests_get(url, timeout=timeout)
+def _fetch_rss_items_uncached(url: str, timeout: int = 8, max_items: int = 25) -> List[dict]:
+    r = _requests_get(url, timeout=timeout, headers=RSS_HEADERS)
     r.raise_for_status()
-    txt = r.text or ""
-    if len(txt) > max_bytes:
-        txt = txt[:max_bytes]
-    return txt.strip()
 
+    text = (r.text or "").strip()
+    if not text:
+        return []
 
-def _fetch_rss_items(url: str, timeout: int = 12, max_items: int = 30) -> List[dict]:
-    last_err = None
-    for attempt in range(3):
-        try:
-            text = _fetch_text(url, timeout=timeout)
-            if _looks_like_html(text):
-                raise RuntimeError("HTML returned (likely consent/bot-check instead of RSS)")
+    # Some feeds include leading junk or BOM
+    if text.startswith("\ufeff"):
+        text = text.lstrip("\ufeff").strip()
 
-            root = ET.fromstring(text)
+    try:
+        root = ET.fromstring(text)
+    except Exception:
+        return []
 
-            channel = root.find("channel")
-            if channel is None:
-                # Atom fallback
-                entries = root.findall("{http://www.w3.org/2005/Atom}entry")
-                out = []
-                for e in entries[:max_items]:
-                    title = (e.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
-                    link_el = e.find("{http://www.w3.org/2005/Atom}link")
-                    link = (link_el.get("href") if link_el is not None else "") or ""
-                    pub = (e.findtext("{http://www.w3.org/2005/Atom}updated") or "").strip()
-                    out.append({"title": title, "link": link, "published": pub})
-                return out
-
-            out = []
-            for item in channel.findall("item")[:max_items]:
-                title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
-                pub = (item.findtext("pubDate") or "").strip()
+    # RSS channel
+    channel = root.find("channel")
+    if channel is None:
+        # Atom
+        entries = root.findall("{http://www.w3.org/2005/Atom}entry")
+        out = []
+        for e in entries[:max_items]:
+            title = (e.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
+            link_el = e.find("{http://www.w3.org/2005/Atom}link")
+            link = (link_el.get("href") if link_el is not None else "") or ""
+            pub = (e.findtext("{http://www.w3.org/2005/Atom}updated") or "").strip()
+            if title:
                 out.append({"title": title, "link": link, "published": pub})
-            return out
+        return out
 
-        except requests.exceptions.Timeout as e:
-            last_err = f"Timeout: {type(e).__name__}"
-            time.sleep(0.4 + 0.3 * attempt)
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {str(e)[:220]}"
-            time.sleep(0.4 + 0.3 * attempt)
+    out = []
+    for item in channel.findall("item")[:max_items]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        if title:
+            out.append({"title": title, "link": link, "published": pub})
+    return out
 
-    raise RuntimeError(last_err or "RSS fetch failed")
+
+def _fetch_rss_items(url: str, timeout: int = 8, max_items: int = 25, ttl_seconds: int = 180) -> List[dict]:
+    """
+    URL-level cache so repeated refreshes do not refetch all feeds.
+    """
+    key = f"rss:url:{url}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    items = _fetch_rss_items_uncached(url, timeout=timeout, max_items=max_items)
+    return cache_set(key, items, ttl_seconds=ttl_seconds)
 
 
-# =========================================================
-# Simple sentiment
-# =========================================================
 _POS_WORDS = set([
     "beat", "beats", "surge", "surges", "rally", "rallies", "gain", "gains", "up",
     "upgrade", "upgrades", "record", "strong", "bull", "bullish", "growth",
@@ -918,25 +928,16 @@ def _google_news_rss(query: str) -> str:
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 
-GENERAL_RSS_FEEDS = [
-    {"name": "CNBC Top News", "rss": "https://www.cnbc.com/id/100003114/device/rss/rss.html"},
-    {"name": "MarketWatch Top Stories", "rss": "https://feeds.marketwatch.com/marketwatch/topstories/"},
-    {"name": "Nasdaq Market News", "rss": "https://www.nasdaq.com/feed/rssoutbound?category=Markets"},
-    {"name": "Nasdaq Stocks", "rss": "https://www.nasdaq.com/feed/rssoutbound?category=Stocks"},
-    {"name": "Investing.com News", "rss": "https://www.investing.com/rss/news.rss"},
-]
-
-
-def _dedup_by_link(items: List[dict], max_items: int) -> List[dict]:
+def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
     seen = set()
     out = []
     for x in items:
         lk = (x.get("link") or "").strip()
         ttl = (x.get("title") or "").strip()
-        k = lk or ttl
-        if not k or k in seen:
+        key = lk or ttl
+        if not key or key in seen:
             continue
-        seen.add(k)
+        seen.add(key)
         out.append(x)
         if len(out) >= max_items:
             break
@@ -950,8 +951,7 @@ def news_briefing(
     max_per_ticker: int = Query(default=6, ge=2, le=25),
 ):
     """
-    Returns JSON expected by your frontend.
-    More resilient: multiple general RSS feeds + Google News search fallback + per-ticker fallback.
+    Fix: concurrent RSS fetch + URL caching + ticker cap to avoid timeouts.
     """
     key = f"news:brief:v2:{tickers}:{max_general}:{max_per_ticker}"
     cached = cache_get(key)
@@ -961,23 +961,14 @@ def news_briefing(
     syms = [t.strip().upper() for t in (tickers or "").split(",") if t.strip()]
     syms = syms[:50]
 
+    # IMPORTANT: cap the number of tickers we fetch via Yahoo RSS
+    # This avoids Render timeouts and keeps the feed responsive.
+    MAX_WATCHLIST_TICKERS = 12
+    watch_syms = syms[:MAX_WATCHLIST_TICKERS]
+
     errors: Dict[str, List[str]] = {"general": [], "watchlist": []}
 
-    # ---- General: pull from multiple stable RSS feeds first
-    general_items: List[dict] = []
-    per_feed = max(10, max_general // max(1, len(GENERAL_RSS_FEEDS)))
-
-    for src in GENERAL_RSS_FEEDS:
-        try:
-            items = _fetch_rss_items(src["rss"], max_items=per_feed, timeout=12)
-            for x in items:
-                x["bucket"] = src["name"]
-                x["sourceFeed"] = src["name"]
-            general_items.extend(items)
-        except Exception as e:
-            errors["general"].append(f"{src['name']}: {type(e).__name__}: {str(e)}")
-
-    # ---- General: add Google News RSS queries as a supplement (may be blocked sometimes)
+    # Reduce general queries (5 queries can be ok with concurrency, but keep it conservative)
     general_queries = [
         "markets stocks macro inflation fed earnings",
         "AI semiconductors datacenter nvidia amd",
@@ -985,47 +976,7 @@ def news_briefing(
         "healthcare biotech fda clinical trial",
         "crypto bitcoin ethereum etf",
     ]
-    for q in general_queries:
-        try:
-            items = _fetch_rss_items(_google_news_rss(q), max_items=max(8, max_general // len(general_queries)), timeout=12)
-            for x in items:
-                x["bucket"] = "Google News"
-                x["sourceFeed"] = "Google News"
-            general_items.extend(items)
-        except Exception as e:
-            errors["general"].append(f"GoogleNews: {type(e).__name__}: {str(e)}")
 
-    gen_ded = _dedup_by_link(general_items, max_general)
-
-    # ---- Watchlist: try Yahoo Finance RSS, then fallback to Google News per ticker
-    watch_items: List[dict] = []
-    for t in syms:
-        yahoo = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(t)}&region=US&lang=en-US"
-        ok = False
-
-        try:
-            items = _fetch_rss_items(yahoo, max_items=max_per_ticker, timeout=12)
-            for x in items:
-                x["bucket"] = "Watchlist"
-                x["ticker"] = t
-                x["sourceFeed"] = "Yahoo RSS"
-            watch_items.extend(items)
-            ok = True
-        except Exception as e:
-            errors["watchlist"].append(f"{t} YahooRSS: {type(e).__name__}: {str(e)}")
-
-        if not ok:
-            try:
-                items = _fetch_rss_items(_google_news_rss(f"{t} stock"), max_items=max_per_ticker, timeout=12)
-                for x in items:
-                    x["bucket"] = "Watchlist"
-                    x["ticker"] = t
-                    x["sourceFeed"] = "Google News"
-                watch_items.extend(items)
-            except Exception as e2:
-                errors["watchlist"].append(f"{t} GoogleNews: {type(e2).__name__}: {str(e2)}")
-
-    # ---- Simple sector bucketing
     def bucketize(title: str) -> str:
         s = (title or "").lower()
         if any(w in s for w in ["nvidia", "amd", "chip", "semiconductor", "ai", "datacenter"]):
@@ -1040,6 +991,55 @@ def news_briefing(
             return "Crypto"
         return "General"
 
+    # Build all fetch jobs
+    jobs = []
+
+    # General jobs (Google News RSS)
+    per_q = max(10, max_general // max(1, len(general_queries)))
+    for q in general_queries:
+        url = _google_news_rss(q)
+        jobs.append(("general", q, url, min(per_q, 30)))
+
+    # Watchlist jobs (Yahoo Finance RSS)
+    for t in watch_syms:
+        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(t)}&region=US&lang=en-US"
+        jobs.append(("watchlist", t, url, max_per_ticker))
+
+    general_items: List[dict] = []
+    watch_items: List[dict] = []
+
+    # Concurrent fetch
+    # Keep workers modest to avoid tripping upstream or Render CPU throttling
+    MAX_WORKERS = 10
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = []
+        for kind, tag, url, n in jobs:
+            futs.append((kind, tag, url, ex.submit(_fetch_rss_items, url, 8, n, 180)))
+
+        for kind, tag, url, fut in futs:
+            try:
+                items = fut.result()
+                if not items:
+                    continue
+                if kind == "general":
+                    for x in items:
+                        x["bucket"] = "General"
+                    general_items.extend(items)
+                else:
+                    for x in items:
+                        x["bucket"] = "Watchlist"
+                        x["ticker"] = tag
+                    watch_items.extend(items)
+            except Exception as e:
+                if kind == "general":
+                    errors["general"].append(f"{tag}: {type(e).__name__}: {str(e)}")
+                else:
+                    errors["watchlist"].append(f"{tag}: {type(e).__name__}: {str(e)}")
+
+    # Dedup and cap general
+    gen_ded = _dedup_items(general_items, max_items=max_general)
+
+    # Create sector map
     sector_map: Dict[str, List[dict]] = {}
     for x in (gen_ded + watch_items):
         sec = bucketize(x.get("title", ""))
@@ -1061,22 +1061,22 @@ def news_briefing(
 
     overall = _headline_sentiment([x.get("title", "") for x in (gen_ded[:20] + watch_items[:20])])
 
-    # If everything failed, return a useful diagnostic note (so UI is not silently empty)
-    note = "Headline grouping for context. Not a prediction engine."
-    if not sectors_out:
-        note = "No headlines returned. Check errors for provider blocks (HTML consent pages are common)."
-
     out = {
         "date": datetime.now(timezone.utc).date().isoformat(),
         "overallSentiment": overall,
         "sectors": sorted(sectors_out, key=lambda x: (-int(x["count"]), x["sector"])),
         "sources": {
-            "general": "CNBC/MarketWatch/Nasdaq/Investing + Google News RSS supplement",
-            "watchlist": "Yahoo Finance RSS with Google News fallback",
+            "general": "Google News RSS (queries)",
+            "watchlist": f"Yahoo Finance RSS (first {MAX_WATCHLIST_TICKERS} tickers)",
         },
         "errors": errors,
-        "note": note,
+        "note": "Headline grouping for context. Not a prediction engine.",
     }
+
+    # If everything fails, still return something visible and explicit
+    if not out["sectors"]:
+        out["note"] = "No headlines returned. Likely upstream blocking or timeout. See errors for details."
+
     return cache_set(key, out, ttl_seconds=180)
 
 
@@ -1420,7 +1420,7 @@ def report_congress_daily(
 
 
 # =========================================================
-# Crypto News Briefing (endpoint used by your frontend)
+# Crypto News Briefing (existing endpoint)
 # =========================================================
 CRYPTO_OUTLETS = [
     {"name": "CoinDesk", "rss": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
@@ -1481,22 +1481,6 @@ def _matches_coin(title: str, symbol: str) -> bool:
     return False
 
 
-def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
-    seen = set()
-    out = []
-    for x in items:
-        lk = (x.get("link") or "").strip()
-        ttl = (x.get("title") or "").strip()
-        key = lk or ttl
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(x)
-        if len(out) >= max_items:
-            break
-    return out
-
-
 def _summarize_titles(titles: List[str], coin_name: str) -> str:
     if not titles:
         return f"No major {coin_name} headlines in the current pull."
@@ -1538,7 +1522,7 @@ def crypto_news_briefing(
 
     for outlet in CRYPTO_OUTLETS:
         try:
-            items = _fetch_rss_items(outlet["rss"], max_items=50, timeout=12)
+            items = _fetch_rss_items(outlet["rss"], max_items=50, timeout=8, ttl_seconds=240)
             for x in items:
                 x["source"] = outlet["name"]
             all_items.extend(items)
@@ -1549,7 +1533,7 @@ def crypto_news_briefing(
         try:
             nm = COIN_CANON.get(sym, {}).get("name", sym)
             q = f"{nm} {sym} crypto"
-            g_items = _fetch_rss_items(_google_news_rss(q), max_items=18, timeout=12)
+            g_items = _fetch_rss_items(_google_news_rss(q), max_items=18, timeout=8, ttl_seconds=240)
             for x in g_items:
                 x["source"] = "Google News"
             all_items.extend(g_items)
