@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.2.2")
+app = FastAPI(title="Finance Signals Backend", version="4.2.3")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -47,7 +47,7 @@ UA_HEADERS = {
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.2.2"}
+    return {"status": "ok", "version": "4.2.3"}
 
 
 # =========================================================
@@ -706,7 +706,9 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         last_good = cache_get("market:entry:last_good")
         if last_good:
             last_good = dict(last_good)
-            last_good["notes"] = (last_good.get("notes") or "") + " | " + (" | ".join(err_notes) if err_notes else "Insufficient market data.")
+            last_good["notes"] = (last_good.get("notes") or "") + " | " + (
+                " | ".join(err_notes) if err_notes else "Insufficient market data."
+            )
             last_good.setdefault("errors", [])
             last_good["errors"] = (last_good.get("errors") or []) + err_notes[:3]
             return cache_set(key, last_good, ttl_seconds=90)
@@ -802,31 +804,56 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
 # RSS + sentiment
 # =========================================================
 def _fetch_rss_items(url: str, timeout: int = 12, max_items: int = 30) -> List[dict]:
-    r = _requests_get(url, timeout=timeout)
-    r.raise_for_status()
+    """
+    Robust RSS/Atom fetch with:
+      - short retries for transient failures
+      - tolerant XML parse
+    """
+    last_err: Optional[str] = None
+    for attempt in range(2):
+        try:
+            r = _requests_get(url, timeout=timeout)
+            if r.status_code in (429, 503, 502, 504):
+                last_err = f"HTTP {r.status_code}"
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            r.raise_for_status()
 
-    text = r.text.strip()
-    root = ET.fromstring(text)
+            text = (r.text or "").strip()
+            if not text:
+                return []
 
-    channel = root.find("channel")
-    if channel is None:
-        entries = root.findall("{http://www.w3.org/2005/Atom}entry")
-        out = []
-        for e in entries[:max_items]:
-            title = (e.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
-            link_el = e.find("{http://www.w3.org/2005/Atom}link")
-            link = (link_el.get("href") if link_el is not None else "") or ""
-            pub = (e.findtext("{http://www.w3.org/2005/Atom}updated") or "").strip()
-            out.append({"title": title, "link": link, "published": pub})
-        return out
+            try:
+                root = ET.fromstring(text)
+            except Exception:
+                # Some feeds include invalid control chars
+                cleaned = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text)
+                root = ET.fromstring(cleaned)
 
-    out = []
-    for item in channel.findall("item")[:max_items]:
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        pub = (item.findtext("pubDate") or "").strip()
-        out.append({"title": title, "link": link, "published": pub})
-    return out
+            channel = root.find("channel")
+            if channel is None:
+                entries = root.findall("{http://www.w3.org/2005/Atom}entry")
+                out = []
+                for e in entries[:max_items]:
+                    title = (e.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
+                    link_el = e.find("{http://www.w3.org/2005/Atom}link")
+                    link = (link_el.get("href") if link_el is not None else "") or ""
+                    pub = (e.findtext("{http://www.w3.org/2005/Atom}updated") or "").strip()
+                    out.append({"title": title, "link": link, "published": pub})
+                return out
+
+            out = []
+            for item in channel.findall("item")[:max_items]:
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                pub = (item.findtext("pubDate") or "").strip()
+                out.append({"title": title, "link": link, "published": pub})
+            return out
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:200]}"
+            time.sleep(0.6 * (attempt + 1))
+
+    raise RuntimeError(last_err or "RSS fetch failed")
 
 
 _POS_WORDS = set([
@@ -888,6 +915,11 @@ def _google_news_rss(query: str) -> str:
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 
+def _safe_news_last_good_key(tickers: str) -> str:
+    t = ",".join([x.strip().upper() for x in (tickers or "").split(",") if x.strip()][:50])
+    return f"news:brief:last_good:{t or 'default'}"
+
+
 @app.get("/news/briefing")
 def news_briefing(
     tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
@@ -895,8 +927,12 @@ def news_briefing(
     max_per_ticker: int = Query(default=6, ge=2, le=25),
 ):
     """
-    Your frontend expects /news/briefing.
-    This returns sector-like grouping using Google News RSS for general plus Yahoo ticker RSS for watchlist.
+    Frontend expects:
+      /news/briefing?tickers=...&max_general=55&max_per_ticker=6
+
+    This returns a sector-like grouping using:
+      - Google News RSS for general
+      - Yahoo ticker RSS for watchlist tickers
     """
     key = f"news:brief:{tickers}:{max_general}:{max_per_ticker}"
     cached = cache_get(key)
@@ -918,9 +954,10 @@ def news_briefing(
     ]
 
     general_items: List[dict] = []
+    per_query = max(8, max_general // max(1, len(general_queries)))
     for q in general_queries:
         try:
-            items = _fetch_rss_items(_google_news_rss(q), max_items=max(10, max_general // len(general_queries)))
+            items = _fetch_rss_items(_google_news_rss(q), max_items=per_query)
             for x in items:
                 x["bucket"] = "General"
             general_items.extend(items)
@@ -972,10 +1009,12 @@ def news_briefing(
         sector_map.setdefault(sec, []).append(x)
 
     sectors_out = []
+    total_headlines = 0
     for sec, items in sector_map.items():
         titles = [i.get("title", "") for i in items]
         sent = _headline_sentiment(titles)
         top = items[:12]
+        total_headlines += len(items)
         sectors_out.append({
             "sector": sec,
             "count": len(items),
@@ -985,7 +1024,6 @@ def news_briefing(
             "headlines": top,
         })
 
-    # Overall sentiment on top titles
     overall = _headline_sentiment([x.get("title", "") for x in (gen_ded[:20] + watch_items[:20])])
 
     out = {
@@ -999,6 +1037,30 @@ def news_briefing(
         "errors": errors,
         "note": "Headline grouping for context. Not a prediction engine.",
     }
+
+    # NEW: last-good fallback if feeds go empty (common when providers throttle or block)
+    last_good_key = _safe_news_last_good_key(tickers)
+    if total_headlines <= 0:
+        last_good = cache_get(last_good_key)
+        if last_good:
+            lg = dict(last_good)
+            lg_err = lg.get("errors") or {"general": [], "watchlist": []}
+            try:
+                lg_err = dict(lg_err)
+            except Exception:
+                lg_err = {"general": [], "watchlist": []}
+            lg_err.setdefault("general", [])
+            lg_err.setdefault("watchlist", [])
+            lg_err["general"] = list(lg_err["general"]) + (errors.get("general") or [])[:2]
+            lg_err["watchlist"] = list(lg_err["watchlist"]) + (errors.get("watchlist") or [])[:2]
+            lg["errors"] = lg_err
+            lg["note"] = (lg.get("note") or "") + " Using cached news briefing due to empty live pull."
+            return cache_set(key, lg, ttl_seconds=120)
+
+    # Save last good for 30 minutes if we have content
+    if total_headlines > 0:
+        cache_set(last_good_key, out, ttl_seconds=1800)
+
     return cache_set(key, out, ttl_seconds=180)
 
 
@@ -1342,7 +1404,7 @@ def report_congress_daily(
 
 
 # =========================================================
-# Crypto News Briefing (NEW endpoint your frontend needs)
+# Crypto News Briefing (endpoint your frontend calls)
 # =========================================================
 CRYPTO_OUTLETS = [
     {"name": "CoinDesk", "rss": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
@@ -1352,7 +1414,7 @@ CRYPTO_OUTLETS = [
     {"name": "Bitcoin Magazine", "rss": "https://bitcoinmagazine.com/.rss/full/"},
 ]
 
-COIN_CANON = {
+COIN_CANON: Dict[str, Dict[str, Any]] = {
     "BTC": {"name": "Bitcoin", "strict_terms": [r"\bbitcoin\b", r"\bBTC\b"]},
     "ETH": {"name": "Ethereum", "strict_terms": [r"\bethereum\b", r"\bETH\b", r"\bether\b"]},
     "SOL": {"name": "Solana", "strict_terms": [r"\bsolana\b", r"\bSOL\b"]},
@@ -1363,9 +1425,9 @@ COIN_CANON = {
     "AVAX": {"name": "Avalanche", "strict_terms": [r"\bavalanche\b", r"\bAVAX\b"]},
     "MATIC": {"name": "Polygon", "strict_terms": [r"\bpolygon\b", r"\bMATIC\b"]},
     "BNB": {"name": "BNB", "strict_terms": [r"\bBNB\b", r"\bbinance coin\b"]},
+    "SHIB": {"name": "Shiba Inu", "strict_terms": [r"\bshib\b", r"\bshiba\b", r"\bshiba inu\b"]},
 }
 
-# A simple “catalyst” extractor from headlines.
 _CATALYST_KEYWORDS = [
     "ETF", "SEC", "lawsuit", "approval", "hack", "exploit", "upgrade",
     "fork", "mainnet", "airdrop", "staking", "rate", "Fed", "CPI",
@@ -1379,17 +1441,18 @@ def _clean_coin_list(coins: str, include_top_n: int) -> List[str]:
     for c in raw:
         if c in COIN_CANON and c not in out:
             out.append(c)
-    # If user list is empty, fall back to top_n canonical list
+
     if not out:
         base = list(COIN_CANON.keys())
         return base[: max(1, min(30, include_top_n))]
-    # Expand to include top N if requested
+
     if include_top_n and include_top_n > len(out):
         for c in list(COIN_CANON.keys()):
             if len(out) >= include_top_n:
                 break
             if c not in out:
                 out.append(c)
+
     return out[: max(1, min(30, include_top_n or 15))]
 
 
@@ -1425,7 +1488,6 @@ def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
 def _summarize_titles(titles: List[str], coin_name: str) -> str:
     if not titles:
         return f"No major {coin_name} headlines in the current pull."
-    # Heuristic summary: pick top repeated theme words
     blob = " ".join(titles[:12]).lower()
     themes = []
     if any(w in blob for w in ["etf", "sec", "approval", "lawsuit", "regulat"]):
@@ -1439,6 +1501,10 @@ def _summarize_titles(titles: List[str], coin_name: str) -> str:
     if not themes:
         themes = ["headlines are mixed and event-driven"]
     return f"{coin_name}: " + "; ".join(themes[:2]) + "."
+
+
+def _crypto_last_good_key(coins_key: str) -> str:
+    return f"crypto:brief:last_good:{coins_key or 'default'}"
 
 
 @app.get("/crypto/news/briefing")
@@ -1456,16 +1522,9 @@ def crypto_news_briefing(
     }
     """
     coin_list = _clean_coin_list(coins, include_top_n)
+    coins_key = ",".join(coin_list)
 
-    # Add SHIB support even though it is not in COIN_CANON above by default.
-    # We include it because your UI default includes SHIB.
-    if "SHIB" in [c.strip().upper() for c in (coins or "").split(",")]:
-        if "SHIB" not in COIN_CANON:
-            COIN_CANON["SHIB"] = {"name": "Shiba Inu", "strict_terms": [r"\bshib\b", r"\bshiba\b", r"\bshiba inu\b"]}
-        if "SHIB" not in coin_list:
-            coin_list.insert(0, "SHIB")
-
-    key = f"crypto:brief:{','.join(coin_list)}:{include_top_n}"
+    key = f"crypto:brief:{coins_key}:{include_top_n}"
     cached = cache_get(key)
     if cached is not None:
         return cached
@@ -1473,7 +1532,6 @@ def crypto_news_briefing(
     errors: List[str] = []
     all_items: List[dict] = []
 
-    # Pull from major crypto outlets
     for outlet in CRYPTO_OUTLETS:
         try:
             items = _fetch_rss_items(outlet["rss"], max_items=50, timeout=12)
@@ -1483,7 +1541,6 @@ def crypto_news_briefing(
         except Exception as e:
             errors.append(f"{outlet['name']}: {type(e).__name__}: {str(e)}")
 
-    # Safety net: Google News RSS for each coin by name (helps if an outlet feed is blocked)
     for sym in coin_list[: min(12, len(coin_list))]:
         try:
             nm = COIN_CANON.get(sym, {}).get("name", sym)
@@ -1495,15 +1552,14 @@ def crypto_news_briefing(
         except Exception as e:
             errors.append(f"GoogleNews {sym}: {type(e).__name__}: {str(e)}")
 
-    # Dedup globally
     all_items = _dedup_items(all_items, max_items=260)
 
-    # Group per coin with strict matching
     coin_blocks = []
     all_titles_for_overall: List[str] = []
     catalysts: List[str] = []
     seen_cat = set()
 
+    total_heads = 0
     for sym in coin_list:
         canon = COIN_CANON.get(sym, {"name": sym, "strict_terms": [rf"\b{re.escape(sym)}\b"]})
         nm = canon["name"]
@@ -1521,6 +1577,7 @@ def crypto_news_briefing(
                 })
 
         heads = _dedup_items(heads, max_items=18)
+        total_heads += len(heads)
 
         titles = [h["title"] for h in heads]
         all_titles_for_overall.extend(titles[:6])
@@ -1528,7 +1585,6 @@ def crypto_news_briefing(
         sent = _headline_sentiment(titles)
         summary = _summarize_titles(titles, nm)
 
-        # Extract catalyst-like lines
         for t in titles[:10]:
             for kw in _CATALYST_KEYWORDS:
                 if kw.lower() in (t or "").lower():
@@ -1557,5 +1613,18 @@ def crypto_news_briefing(
         "catalysts": catalysts[:12],
         "coins": coin_blocks,
     }
+
+    # NEW: last-good fallback if live pull goes empty
+    lg_key = _crypto_last_good_key(coins_key)
+    if total_heads <= 0:
+        last_good = cache_get(lg_key)
+        if last_good:
+            lg = dict(last_good)
+            lg["errors"] = list(lg.get("errors") or []) + errors[:3]
+            lg["note"] = (lg.get("note") or "") + " Using cached crypto briefing due to empty live pull."
+            return cache_set(key, lg, ttl_seconds=120)
+
+    if total_heads > 0:
+        cache_set(lg_key, out, ttl_seconds=1800)
 
     return cache_set(key, out, ttl_seconds=240)
