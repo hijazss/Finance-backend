@@ -3,6 +3,7 @@ import re
 import time
 import math
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -17,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.2.1")
+app = FastAPI(title="Finance Signals Backend", version="4.2.2")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -46,7 +47,7 @@ UA_HEADERS = {
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.2.1"}
+    return {"status": "ok", "version": "4.2.2"}
 
 
 # =========================================================
@@ -348,14 +349,117 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 
 # =========================================================
-# Market data (Yahoo chart)
+# Market data (Yahoo chart) with rate-limit protection
 # =========================================================
+_YAHOO_LOCK = threading.Lock()
+_YAHOO_INFLIGHT: Dict[str, threading.Lock] = {}
+_YAHOO_CACHE: Dict[str, Dict[str, Any]] = {}
+_YAHOO_COOLDOWN_UNTIL = 0.0
+
+
+def _now_ts() -> float:
+    return time.time()
+
+
+def _yahoo_cache_key(symbol: str, range_str: str, interval: str) -> str:
+    return f"{symbol}|{range_str}|{interval}"
+
+
+def _yahoo_get_cached(key: str) -> Optional[dict]:
+    rec = _YAHOO_CACHE.get(key)
+    if not rec:
+        return None
+    return rec.get("data")
+
+
+def _yahoo_get_cached_fresh(key: str) -> Optional[dict]:
+    rec = _YAHOO_CACHE.get(key)
+    if not rec:
+        return None
+    exp = float(rec.get("fresh_until") or 0)
+    if _now_ts() <= exp:
+        return rec.get("data")
+    return None
+
+
+def _yahoo_get_cached_stale(key: str) -> Optional[dict]:
+    rec = _YAHOO_CACHE.get(key)
+    if not rec:
+        return None
+    exp = float(rec.get("stale_until") or 0)
+    if _now_ts() <= exp:
+        return rec.get("data")
+    return None
+
+
+def _yahoo_set_cache(key: str, data: dict, fresh_ttl: int = 300, stale_ttl: int = 7200) -> dict:
+    _YAHOO_CACHE[key] = {
+        "data": data,
+        "fresh_until": _now_ts() + float(fresh_ttl),
+        "stale_until": _now_ts() + float(stale_ttl),
+    }
+    return data
+
+
 def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
-    params = {"range": range_str, "interval": interval}
-    r = requests.get(url, params=params, timeout=14, headers=UA_HEADERS)
-    r.raise_for_status()
-    return r.json()
+    """
+    Calls Yahoo, but:
+    - serves fresh cached data for 5 min by default
+    - on 429 or during cooldown, serves stale cached data up to 2 hours
+    - prevents thundering herd with per-key inflight locks
+    """
+    global _YAHOO_COOLDOWN_UNTIL
+
+    key = _yahoo_cache_key(symbol, range_str, interval)
+
+    # Serve fresh cache immediately
+    fresh = _yahoo_get_cached_fresh(key)
+    if fresh is not None:
+        return fresh
+
+    # If in cooldown, do not call Yahoo. Serve stale if possible.
+    if _now_ts() < _YAHOO_COOLDOWN_UNTIL:
+        stale = _yahoo_get_cached_stale(key)
+        if stale is not None:
+            return stale
+        raise RuntimeError("Yahoo rate limited (cooldown active, no cached data available)")
+
+    # Create/get per-key inflight lock
+    with _YAHOO_LOCK:
+        if key not in _YAHOO_INFLIGHT:
+            _YAHOO_INFLIGHT[key] = threading.Lock()
+        inflight_lock = _YAHOO_INFLIGHT[key]
+
+    with inflight_lock:
+        # Re-check cache after waiting
+        fresh2 = _yahoo_get_cached_fresh(key)
+        if fresh2 is not None:
+            return fresh2
+
+        # Call Yahoo
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
+        params = {"range": range_str, "interval": interval}
+
+        try:
+            r = requests.get(url, params=params, timeout=14, headers=UA_HEADERS)
+
+            if r.status_code == 429:
+                _YAHOO_COOLDOWN_UNTIL = _now_ts() + 120.0
+                stale = _yahoo_get_cached_stale(key)
+                if stale is not None:
+                    return stale
+                raise RuntimeError("Yahoo rate limited (HTTP 429)")
+
+            r.raise_for_status()
+            data = r.json()
+            return _yahoo_set_cache(key, data, fresh_ttl=300, stale_ttl=7200)
+
+        except Exception as e:
+            # Serve stale cache on any error if possible
+            stale = _yahoo_get_cached_stale(key)
+            if stale is not None:
+                return stale
+            raise e
 
 
 def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> List[Tuple[datetime, float]]:
@@ -396,13 +500,9 @@ def _clamp01(x: float) -> float:
 
 
 # =========================================================
-# CNN Fear & Greed (FIXED)
+# CNN Fear & Greed (best effort)
 # =========================================================
 def _cnn_fear_greed_graphdata(date_str: str) -> dict:
-    """
-    CNN endpoint used by many dashboards:
-    https://production.dataviz.cnn.io/index/fearandgreed/graphdata/YYYY-MM-DD
-    """
     url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{date_str}"
     r = requests.get(url, timeout=14, headers=UA_HEADERS)
     r.raise_for_status()
@@ -410,15 +510,9 @@ def _cnn_fear_greed_graphdata(date_str: str) -> dict:
 
 
 def _parse_fear_greed_payload(data: dict) -> Tuple[Optional[int], Optional[str], str]:
-    """
-    Handles both common CNN schemas:
-    A) fear_and_greed.score + fear_and_greed.rating
-    B) fear_and_greed.now.value + fear_and_greed.now.valueText
-    Returns: (score, rating, schema_used)
-    """
     fg = (data or {}).get("fear_and_greed") or {}
 
-    # Schema A
+    # Schema A: fear_and_greed.score / fear_and_greed.rating
     if isinstance(fg, dict) and ("score" in fg or "rating" in fg):
         score = fg.get("score")
         rating = fg.get("rating")
@@ -429,7 +523,7 @@ def _parse_fear_greed_payload(data: dict) -> Tuple[Optional[int], Optional[str],
         rating_str = str(rating).strip() if rating is not None else None
         return score_int, rating_str, "score/rating"
 
-    # Schema B
+    # Schema B: fear_and_greed.now.value / valueText
     now_val = fg.get("now") if isinstance(fg, dict) else None
     if isinstance(now_val, dict):
         score = now_val.get("value")
@@ -446,16 +540,11 @@ def _parse_fear_greed_payload(data: dict) -> Tuple[Optional[int], Optional[str],
 
 @app.get("/market/fear-greed")
 def market_fear_greed(date: Optional[str] = Query(default=None)):
-    """
-    Best-effort fetch.
-    If date omitted, tries today then walks back up to 5 days until CNN returns a valid payload.
-    """
     key = f"feargreed:{date or 'auto'}"
     cached = cache_get(key)
     if cached is not None:
         return cached
 
-    # Choose date candidates
     if date:
         candidates = [date]
     else:
@@ -467,8 +556,6 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
         try:
             data = _cnn_fear_greed_graphdata(d)
             score, rating, schema = _parse_fear_greed_payload(data)
-
-            # If CNN returned JSON but score is missing, still return raw for debugging
             out = {
                 "date": (data or {}).get("date") or d,
                 "score": score,
@@ -476,14 +563,12 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
                 "schema": schema,
                 "raw": data,
             }
-            # Cache longer if we got a score
             ttl = 600 if score is not None else 120
             return cache_set(key, out, ttl_seconds=ttl)
         except Exception as e:
             last_err = f"{type(e).__name__}: {str(e)}"
             continue
 
-    # Nothing worked
     out = {
         "date": date or datetime.now(timezone.utc).date().isoformat(),
         "score": None,
@@ -497,10 +582,7 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
 @app.get("/market/snapshot")
 def market_snapshot():
     """
-    Quick market context for News tab:
-    - SPY (proxy for S&P 500) level + 1D/5D/1M returns
-    - VIX level
-    - Fear & Greed score + label (best effort)
+    Cached more aggressively so rapid refreshes do not spam Yahoo.
     """
     key = "market:snapshot"
     cached = cache_get(key)
@@ -551,14 +633,19 @@ def market_snapshot():
         errors.append(f"FearGreed: {type(e).__name__}: {str(e)}")
 
     out["errors"] = errors
-    return cache_set(key, out, ttl_seconds=180)
+    return cache_set(key, out, ttl_seconds=300)
 
 
 # =========================================================
-# Market Entry Index (your existing endpoint, upgraded slightly)
+# Market Entry Index (cached more aggressively)
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
+    key = f"market:entry:{window_days}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
     now = datetime.now(timezone.utc)
 
     err_notes = []
@@ -570,7 +657,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         spy, vix = [], []
 
     if len(spy) < 210 or len(vix) < 30:
-        return {
+        out = {
             "date": now.date().isoformat(),
             "score": 0,
             "regime": "NEUTRAL",
@@ -585,6 +672,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
                 "buffettProxy": 0.5,
             },
         }
+        return cache_set(key, out, ttl_seconds=300)
 
     _, spy_close = zip(*spy)
     _, vix_close = zip(*vix)
@@ -622,7 +710,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     if err_notes:
         notes = notes + " | " + " | ".join(err_notes)
 
-    return {
+    out = {
         "date": now.date().isoformat(),
         "score": score,
         "regime": regime,
@@ -637,10 +725,11 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             "buffettProxy": float(buffett_01),
         },
     }
+    return cache_set(key, out, ttl_seconds=300)
 
 
 # =========================================================
-# RSS + sentiment (your existing approach)
+# RSS + sentiment
 # =========================================================
 def _fetch_rss_items(url: str, timeout: int = 12, max_items: int = 30) -> List[dict]:
     r = requests.get(url, timeout=timeout, headers=UA_HEADERS)
@@ -802,7 +891,7 @@ def news_watchlist(
 
 
 # =========================================================
-# News briefing (NEW): sector-friendly daily summary
+# News briefing (sector summary)
 # =========================================================
 DEFAULT_SECTORS = [
     "AI",
@@ -993,7 +1082,7 @@ def news_briefing(
 
 
 # =========================================================
-# Congress: /report/today (your existing endpoint)
+# Congress endpoints + signals (UNCHANGED from your prior full backend)
 # =========================================================
 @app.get("/report/today")
 def report_today(
@@ -1165,9 +1254,6 @@ def report_today(
     }
 
 
-# =========================================================
-# Congress: holdings proxy endpoint your UI expects
-# =========================================================
 @app.get("/report/holdings/common")
 def report_holdings_common(
     window_days: int = Query(default=365, ge=30, le=365),
@@ -1233,9 +1319,6 @@ def report_holdings_common(
     }
 
 
-# =========================================================
-# Congress: day-by-day activity feed for UI
-# =========================================================
 @app.get("/report/congress/daily")
 def report_congress_daily(
     window_days: int = Query(default=14, ge=1, le=365),
@@ -1342,10 +1425,6 @@ def report_congress_daily(
     }
 
 
-# =========================================================
-# Signals (NEW): bring back scored list for Main tab
-# Combines congress participation + watchlist news mentions + sector briefing mentions
-# =========================================================
 def _congress_ticker_agg(congress_payload: dict) -> Dict[str, dict]:
     agg: Dict[str, dict] = {}
     for arr_name, buy_mode in [("politicianBuys", True), ("politicianSells", False)]:
@@ -1437,7 +1516,6 @@ def signals_ideas(
     sec_str = sectors
 
     congress = report_today(window_days=window_days, horizon_days=None)
-
     cong_agg = _congress_ticker_agg(congress)
 
     wnews = news_watchlist(tickers=",".join(wl), max_items_per_ticker=8)
