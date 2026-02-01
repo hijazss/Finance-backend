@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.2.2")
+app = FastAPI(title="Finance Signals Backend", version="4.2.1")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -43,13 +43,10 @@ UA_HEADERS = {
     "Connection": "keep-alive",
 }
 
-SESSION = requests.Session()
-SESSION.headers.update(UA_HEADERS)
-
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.2.2"}
+    return {"status": "ok", "version": "4.2.1"}
 
 
 # =========================================================
@@ -351,8 +348,37 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 
 # =========================================================
-# Market data (FRED primary, Yahoo quote fallback)
+# Market data (Yahoo chart)
 # =========================================================
+def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
+    params = {"range": range_str, "interval": interval}
+    r = requests.get(url, params=params, timeout=14, headers=UA_HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+
+def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> List[Tuple[datetime, float]]:
+    j = _yahoo_chart(symbol, range_str=range_str, interval=interval)
+    res = (j.get("chart") or {}).get("result") or []
+    if not res:
+        return []
+    result = res[0]
+    ts = result.get("timestamp") or []
+    q = (result.get("indicators") or {}).get("quote") or []
+    if not ts or not q:
+        return []
+    closes = (q[0] or {}).get("close") or []
+    out: List[Tuple[datetime, float]] = []
+    for t, c in zip(ts, closes):
+        if c is None:
+            continue
+        dt = datetime.fromtimestamp(int(t), tz=timezone.utc)
+        out.append((dt, float(c)))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
 def _pct(a: float, b: float) -> float:
     if b == 0:
         return 0.0
@@ -369,229 +395,187 @@ def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
 
-def _fred_series_csv(series_id: str) -> List[Tuple[datetime, float]]:
-    """
-    FRED CSV download endpoint (no API key needed):
-    https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500
-    https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS
-    """
-    ckey = f"fred:{series_id}"
-    cached = cache_get(ckey)
-    if cached is not None:
-        return cached
-
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={quote_plus(series_id)}"
-    r = SESSION.get(url, timeout=12)
-    r.raise_for_status()
-    text = (r.text or "").strip()
-    if not text:
-        return cache_set(ckey, [], ttl_seconds=600)
-
-    out: List[Tuple[datetime, float]] = []
-    lines = text.splitlines()
-    # header: DATE,VALUE
-    for ln in lines[1:]:
-        parts = ln.split(",")
-        if len(parts) < 2:
-            continue
-        d, v = parts[0].strip(), parts[1].strip()
-        if not d or not v or v == ".":
-            continue
-        try:
-            dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            out.append((dt, float(v)))
-        except Exception:
-            continue
-
-    out.sort(key=lambda x: x[0])
-    # Keep it modest
-    if len(out) > 520:
-        out = out[-520:]
-
-    return cache_set(ckey, out, ttl_seconds=600)
-
-
-def _yahoo_quote(symbols: str) -> dict:
-    """
-    Yahoo quote endpoint (often lighter than chart, still may rate-limit):
-    https://query1.finance.yahoo.com/v7/finance/quote?symbols=SPY,%5EVIX
-    """
-    url = "https://query1.finance.yahoo.com/v7/finance/quote"
-    params = {"symbols": symbols}
-    r = SESSION.get(url, params=params, timeout=8)
-    if r.status_code == 429:
-        raise RuntimeError("Yahoo rate limited (HTTP 429)")
-    r.raise_for_status()
-    return r.json()
-
-
-def _last_n_business_like(vals: List[Tuple[datetime, float]], n: int) -> List[float]:
-    # FRED already has trading-day-like series (weekends missing). Just take last n values.
-    if len(vals) < n:
-        return [v for _, v in vals]
-    return [v for _, v in vals[-n:]]
-
-
 # =========================================================
-# CNN Fear & Greed (unchanged, but robust)
+# CNN Fear & Greed (FIXED)
 # =========================================================
 def _cnn_fear_greed_graphdata(date_str: str) -> dict:
+    """
+    CNN endpoint used by many dashboards:
+    https://production.dataviz.cnn.io/index/fearandgreed/graphdata/YYYY-MM-DD
+    """
     url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{date_str}"
-    r = SESSION.get(url, timeout=10)
+    r = requests.get(url, timeout=14, headers=UA_HEADERS)
     r.raise_for_status()
     return r.json()
+
+
+def _parse_fear_greed_payload(data: dict) -> Tuple[Optional[int], Optional[str], str]:
+    """
+    Handles both common CNN schemas:
+    A) fear_and_greed.score + fear_and_greed.rating
+    B) fear_and_greed.now.value + fear_and_greed.now.valueText
+    Returns: (score, rating, schema_used)
+    """
+    fg = (data or {}).get("fear_and_greed") or {}
+
+    # Schema A
+    if isinstance(fg, dict) and ("score" in fg or "rating" in fg):
+        score = fg.get("score")
+        rating = fg.get("rating")
+        try:
+            score_int = int(score) if score is not None else None
+        except Exception:
+            score_int = None
+        rating_str = str(rating).strip() if rating is not None else None
+        return score_int, rating_str, "score/rating"
+
+    # Schema B
+    now_val = fg.get("now") if isinstance(fg, dict) else None
+    if isinstance(now_val, dict):
+        score = now_val.get("value")
+        rating = now_val.get("valueText") or now_val.get("rating")
+        try:
+            score_int = int(score) if score is not None else None
+        except Exception:
+            score_int = None
+        rating_str = str(rating).strip() if rating is not None else None
+        return score_int, rating_str, "now.value/valueText"
+
+    return None, None, "unknown"
 
 
 @app.get("/market/fear-greed")
 def market_fear_greed(date: Optional[str] = Query(default=None)):
+    """
+    Best-effort fetch.
+    If date omitted, tries today then walks back up to 5 days until CNN returns a valid payload.
+    """
     key = f"feargreed:{date or 'auto'}"
     cached = cache_get(key)
     if cached is not None:
         return cached
 
+    # Choose date candidates
     if date:
-        try_dates = [date]
+        candidates = [date]
     else:
-        today = datetime.now(timezone.utc).date()
-        try_dates = [(today - timedelta(days=i)).isoformat() for i in range(0, 7)]
+        base = datetime.now(timezone.utc).date()
+        candidates = [(base - timedelta(days=i)).isoformat() for i in range(0, 6)]
 
     last_err = None
-    for d in try_dates:
+    for d in candidates:
         try:
             data = _cnn_fear_greed_graphdata(d)
-            fg = (data or {}).get("fear_and_greed") or {}
-            now_val = fg.get("now") or {}
+            score, rating, schema = _parse_fear_greed_payload(data)
+
+            # If CNN returned JSON but score is missing, still return raw for debugging
             out = {
                 "date": (data or {}).get("date") or d,
-                "score": now_val.get("value"),
-                "rating": now_val.get("valueText") or now_val.get("rating"),
+                "score": score,
+                "rating": rating,
+                "schema": schema,
                 "raw": data,
             }
-            return cache_set(key, out, ttl_seconds=600)
+            # Cache longer if we got a score
+            ttl = 600 if score is not None else 120
+            return cache_set(key, out, ttl_seconds=ttl)
         except Exception as e:
             last_err = f"{type(e).__name__}: {str(e)}"
             continue
 
-    return cache_set(
-        key,
-        {"date": date or datetime.now(timezone.utc).date().isoformat(), "score": None, "rating": None, "error": last_err},
-        ttl_seconds=120,
-    )
+    # Nothing worked
+    out = {
+        "date": date or datetime.now(timezone.utc).date().isoformat(),
+        "score": None,
+        "rating": None,
+        "schema": "error",
+        "error": last_err or "Unknown error",
+    }
+    return cache_set(key, out, ttl_seconds=60)
 
 
-# =========================================================
-# Market Snapshot (FRED-based)
-# =========================================================
 @app.get("/market/snapshot")
 def market_snapshot():
+    """
+    Quick market context for News tab:
+    - SPY (proxy for S&P 500) level + 1D/5D/1M returns
+    - VIX level
+    - Fear & Greed score + label (best effort)
+    """
     key = "market:snapshot"
     cached = cache_get(key)
     if cached is not None:
         return cached
 
     now = datetime.now(timezone.utc)
-    out = {"date": now.date().isoformat(), "sp500": {}, "vix": {}, "fearGreed": {}, "errors": []}
+    out = {"date": now.date().isoformat(), "sp500": {}, "vix": {}, "fearGreed": {}}
+    errors: List[str] = []
 
-    # SP500
     try:
-        spx = _fred_series_csv("SP500")
-        if len(spx) >= 25:
-            closes = [c for _, c in spx]
+        spy = _yahoo_closes("SPY", range_str="3mo", interval="1d")
+        if len(spy) >= 25:
+            closes = [c for _, c in spy]
+            last = closes[-1]
             out["sp500"] = {
-                "symbol": "SP500",
-                "last": round(closes[-1], 4),
+                "symbol": "SPY",
+                "last": round(last, 4),
                 "ret1dPct": round(_pct(closes[-1], closes[-2]), 4) if len(closes) >= 2 else None,
                 "ret5dPct": round(_pct(closes[-1], closes[-6]), 4) if len(closes) >= 6 else None,
                 "ret1mPct": round(_pct(closes[-1], closes[-22]), 4) if len(closes) >= 22 else None,
-                "source": "fred:SP500",
             }
-        else:
-            out["errors"].append("FRED SP500: insufficient data points")
     except Exception as e:
-        out["errors"].append(f"FRED SP500: {type(e).__name__}: {str(e)}")
+        errors.append(f"SPY: {type(e).__name__}: {str(e)}")
 
-    # VIX
     try:
-        vix = _fred_series_csv("VIXCLS")
+        vix = _yahoo_closes("^VIX", range_str="3mo", interval="1d")
         if len(vix) >= 2:
             closes = [c for _, c in vix]
             out["vix"] = {
                 "symbol": "^VIX",
                 "last": round(closes[-1], 4),
                 "chg1d": round(closes[-1] - closes[-2], 4),
-                "source": "fred:VIXCLS",
             }
-        else:
-            out["errors"].append("FRED VIXCLS: insufficient data points")
     except Exception as e:
-        out["errors"].append(f"FRED VIXCLS: {type(e).__name__}: {str(e)}")
+        errors.append(f"VIX: {type(e).__name__}: {str(e)}")
 
-    # Fear & Greed
-    fg = market_fear_greed(None)
-    out["fearGreed"] = {
-        "score": fg.get("score"),
-        "rating": fg.get("rating"),
-        "date": fg.get("date"),
-    }
-    if fg.get("error"):
-        out["errors"].append(f"FearGreed: {fg.get('error')}")
+    try:
+        fg = market_fear_greed(None)
+        out["fearGreed"] = {
+            "score": fg.get("score"),
+            "rating": fg.get("rating"),
+            "schema": fg.get("schema"),
+        }
+        if fg.get("score") is None and fg.get("error"):
+            errors.append(f"FearGreed: {fg.get('error')}")
+    except Exception as e:
+        errors.append(f"FearGreed: {type(e).__name__}: {str(e)}")
 
-    # Optional: if FRED failed, try Yahoo quote as fallback (may still 429)
-    if not out["sp500"] or not out["vix"]:
-        try:
-            q = _yahoo_quote("SPY,^VIX")
-            results = (((q or {}).get("quoteResponse") or {}).get("result") or [])
-            bysym = {str(x.get("symbol")): x for x in results if x.get("symbol")}
-            if not out["sp500"] and "SPY" in bysym and bysym["SPY"].get("regularMarketPrice") is not None:
-                out["sp500"] = {
-                    "symbol": "SPY",
-                    "last": float(bysym["SPY"]["regularMarketPrice"]),
-                    "ret1dPct": None,
-                    "ret5dPct": None,
-                    "ret1mPct": None,
-                    "source": "yahoo_quote_fallback",
-                }
-            if not out["vix"] and "^VIX" in bysym and bysym["^VIX"].get("regularMarketPrice") is not None:
-                out["vix"] = {
-                    "symbol": "^VIX",
-                    "last": float(bysym["^VIX"]["regularMarketPrice"]),
-                    "chg1d": None,
-                    "source": "yahoo_quote_fallback",
-                }
-        except Exception as e:
-            out["errors"].append(f"Yahoo quote fallback: {type(e).__name__}: {str(e)}")
-
-    return cache_set(key, out, ttl_seconds=300)
+    out["errors"] = errors
+    return cache_set(key, out, ttl_seconds=180)
 
 
 # =========================================================
-# Market Entry Index (FRED-based)
+# Market Entry Index (your existing endpoint, upgraded slightly)
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     now = datetime.now(timezone.utc)
-    errors: List[str] = []
 
-    # Pull enough history for SMA200
+    err_notes = []
     try:
-        spx = _fred_series_csv("SP500")
+        spy = _yahoo_closes("SPY", range_str="1y", interval="1d")
+        vix = _yahoo_closes("^VIX", range_str="1y", interval="1d")
     except Exception as e:
-        spx = []
-        errors.append(f"FRED SP500: {type(e).__name__}: {str(e)}")
+        err_notes.append(f"Yahoo chart failed: {type(e).__name__}: {str(e)}")
+        spy, vix = [], []
 
-    try:
-        vix = _fred_series_csv("VIXCLS")
-    except Exception as e:
-        vix = []
-        errors.append(f"FRED VIXCLS: {type(e).__name__}: {str(e)}")
-
-    if len(spx) < 210 or len(vix) < 30:
+    if len(spy) < 210 or len(vix) < 30:
         return {
             "date": now.date().isoformat(),
             "score": 0,
             "regime": "NEUTRAL",
             "signal": "DATA UNAVAILABLE",
-            "notes": " | ".join(errors) if errors else "Insufficient market data.",
+            "notes": " | ".join(err_notes) if err_notes else "Insufficient market data.",
             "components": {
                 "spxTrend": 0.5,
                 "vix": 0.5,
@@ -602,12 +586,12 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             },
         }
 
-    spx_close = [c for _, c in spx]
-    vix_close = [c for _, c in vix]
+    _, spy_close = zip(*spy)
+    _, vix_close = zip(*vix)
 
-    price = float(spx_close[-1])
-    sma50 = _sma(spx_close, 50) or price
-    sma200 = _sma(spx_close, 200) or price
+    price = float(spy_close[-1])
+    sma50 = _sma(list(spy_close), 50) or price
+    sma200 = _sma(list(spy_close), 200) or price
 
     trend_cross = 1.0 if sma50 >= sma200 else 0.0
     price_vs_200 = _clamp01((price / sma200 - 0.90) / (1.10 - 0.90))
@@ -634,9 +618,9 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         regime = "RISK-OFF"
         signal = "WAIT / SMALL DCA"
 
-    notes = f"SP500={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={v:.2f} (FRED)"
-    if errors:
-        notes = notes + " | " + " | ".join(errors[:3])
+    notes = f"SPY={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={v:.2f}"
+    if err_notes:
+        notes = notes + " | " + " | ".join(err_notes)
 
     return {
         "date": now.date().isoformat(),
@@ -659,7 +643,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
 # RSS + sentiment (your existing approach)
 # =========================================================
 def _fetch_rss_items(url: str, timeout: int = 12, max_items: int = 30) -> List[dict]:
-    r = SESSION.get(url, timeout=timeout)
+    r = requests.get(url, timeout=timeout, headers=UA_HEADERS)
     r.raise_for_status()
 
     text = r.text.strip()
@@ -1009,7 +993,7 @@ def news_briefing(
 
 
 # =========================================================
-# Congress: /report/today (unchanged)
+# Congress: /report/today (your existing endpoint)
 # =========================================================
 @app.get("/report/today")
 def report_today(
@@ -1182,7 +1166,7 @@ def report_today(
 
 
 # =========================================================
-# Congress: holdings proxy endpoint your UI expects (unchanged)
+# Congress: holdings proxy endpoint your UI expects
 # =========================================================
 @app.get("/report/holdings/common")
 def report_holdings_common(
@@ -1250,7 +1234,7 @@ def report_holdings_common(
 
 
 # =========================================================
-# Congress: day-by-day activity feed for UI (unchanged)
+# Congress: day-by-day activity feed for UI
 # =========================================================
 @app.get("/report/congress/daily")
 def report_congress_daily(
@@ -1359,7 +1343,8 @@ def report_congress_daily(
 
 
 # =========================================================
-# Signals (scored ideas) - unchanged
+# Signals (NEW): bring back scored list for Main tab
+# Combines congress participation + watchlist news mentions + sector briefing mentions
 # =========================================================
 def _congress_ticker_agg(congress_payload: dict) -> Dict[str, dict]:
     agg: Dict[str, dict] = {}
@@ -1457,7 +1442,7 @@ def signals_ideas(
 
     wnews = news_watchlist(tickers=",".join(wl), max_items_per_ticker=8)
     watch_titles: List[str] = []
-    for t, arr in (wnews.get("itemsByTicker") or {}).items():
+    for _, arr in (wnews.get("itemsByTicker") or {}).items():
         for x in (arr or [])[:8]:
             watch_titles.append(x.get("title", "") or "")
 
