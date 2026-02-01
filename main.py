@@ -3,8 +3,6 @@ import re
 import time
 import math
 import json
-import csv
-import io
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -19,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.2.1")
+app = FastAPI(title="Finance Signals Backend", version="4.2.2")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -45,14 +43,13 @@ UA_HEADERS = {
     "Connection": "keep-alive",
 }
 
-# A single shared session helps with performance + connection reuse
 SESSION = requests.Session()
 SESSION.headers.update(UA_HEADERS)
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.2.1"}
+    return {"status": "ok", "version": "4.2.2"}
 
 
 # =========================================================
@@ -354,7 +351,7 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 
 # =========================================================
-# Market data (ROBUST): Stooq primary, Yahoo fallback, cached
+# Market data (FRED primary, Yahoo quote fallback)
 # =========================================================
 def _pct(a: float, b: float) -> float:
     if b == 0:
@@ -372,155 +369,75 @@ def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
 
-def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
-    params = {"range": range_str, "interval": interval, "includePrePost": "false", "events": "div,splits"}
+def _fred_series_csv(series_id: str) -> List[Tuple[datetime, float]]:
+    """
+    FRED CSV download endpoint (no API key needed):
+    https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500
+    https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS
+    """
+    ckey = f"fred:{series_id}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
+
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={quote_plus(series_id)}"
+    r = SESSION.get(url, timeout=12)
+    r.raise_for_status()
+    text = (r.text or "").strip()
+    if not text:
+        return cache_set(ckey, [], ttl_seconds=600)
+
+    out: List[Tuple[datetime, float]] = []
+    lines = text.splitlines()
+    # header: DATE,VALUE
+    for ln in lines[1:]:
+        parts = ln.split(",")
+        if len(parts) < 2:
+            continue
+        d, v = parts[0].strip(), parts[1].strip()
+        if not d or not v or v == ".":
+            continue
+        try:
+            dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            out.append((dt, float(v)))
+        except Exception:
+            continue
+
+    out.sort(key=lambda x: x[0])
+    # Keep it modest
+    if len(out) > 520:
+        out = out[-520:]
+
+    return cache_set(ckey, out, ttl_seconds=600)
+
+
+def _yahoo_quote(symbols: str) -> dict:
+    """
+    Yahoo quote endpoint (often lighter than chart, still may rate-limit):
+    https://query1.finance.yahoo.com/v7/finance/quote?symbols=SPY,%5EVIX
+    """
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    params = {"symbols": symbols}
     r = SESSION.get(url, params=params, timeout=8)
-    # If Yahoo rate limits, fail fast with a clear error
     if r.status_code == 429:
         raise RuntimeError("Yahoo rate limited (HTTP 429)")
     r.raise_for_status()
     return r.json()
 
 
-def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> List[Tuple[datetime, float]]:
-    # Cache Yahoo per symbol+range+interval so the UI refresh button doesn't DOS Yahoo
-    ckey = f"yahoo:{symbol}:{range_str}:{interval}"
-    cached = cache_get(ckey)
-    if cached is not None:
-        return cached
-
-    j = _yahoo_chart(symbol, range_str=range_str, interval=interval)
-    res = (j.get("chart") or {}).get("result") or []
-    if not res:
-        return cache_set(ckey, [], ttl_seconds=300)
-
-    result = res[0]
-    ts = result.get("timestamp") or []
-    q = (result.get("indicators") or {}).get("quote") or []
-    if not ts or not q:
-        return cache_set(ckey, [], ttl_seconds=300)
-
-    closes = (q[0] or {}).get("close") or []
-    out: List[Tuple[datetime, float]] = []
-    for t, c in zip(ts, closes):
-        if c is None:
-            continue
-        dt = datetime.fromtimestamp(int(t), tz=timezone.utc)
-        out.append((dt, float(c)))
-    out.sort(key=lambda x: x[0])
-    return cache_set(ckey, out, ttl_seconds=600)
-
-
-def _stooq_symbol(symbol: str) -> str:
-    # Stooq uses lowercase. Indices use special mapping.
-    s = (symbol or "").strip()
-    if not s:
-        return s
-    if s.upper() == "^VIX":
-        return "vix"
-    # SPY is fine
-    return s.lower()
-
-
-def _stooq_closes(symbol: str, max_rows: int = 260) -> List[Tuple[datetime, float]]:
-    """
-    Stooq daily CSV (no key). Often more stable from cloud than Yahoo.
-    Example: https://stooq.com/q/d/l/?s=spy.us&i=d
-    """
-    ckey = f"stooq:{symbol}"
-    cached = cache_get(ckey)
-    if cached is not None:
-        return cached
-
-    s = _stooq_symbol(symbol)
-    if not s:
-        return []
-
-    # Stooq for US tickers uses .us. vix is index series.
-    if s == "vix":
-        url = "https://stooq.com/q/d/l/?s=vix&i=d"
-    else:
-        url = f"https://stooq.com/q/d/l/?s={quote_plus(s)}.us&i=d"
-
-    r = SESSION.get(url, timeout=8)
-    r.raise_for_status()
-
-    text = r.text.strip()
-    if not text or "No data" in text:
-        return cache_set(ckey, [], ttl_seconds=600)
-
-    out: List[Tuple[datetime, float]] = []
-    f = io.StringIO(text)
-    reader = csv.DictReader(f)
-    for row in reader:
-        d = row.get("Date") or row.get("date")
-        c = row.get("Close") or row.get("close")
-        if not d or not c:
-            continue
-        try:
-            dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            out.append((dt, float(c)))
-        except Exception:
-            continue
-
-    out.sort(key=lambda x: x[0])
-    if len(out) > max_rows:
-        out = out[-max_rows:]
-
-    return cache_set(ckey, out, ttl_seconds=600)
-
-
-def _market_closes(symbol: str, preferred: str = "stooq", range_hint: str = "1y") -> Tuple[List[Tuple[datetime, float]], List[str]]:
-    """
-    Returns (closes, errors). Tries Stooq first then Yahoo (or vice versa).
-    """
-    errors: List[str] = []
-
-    def try_stooq():
-        try:
-            return _stooq_closes(symbol), None
-        except Exception as e:
-            return [], f"Stooq: {type(e).__name__}: {str(e)}"
-
-    def try_yahoo():
-        try:
-            # map range_hint to Yahoo ranges
-            rmap = {"1y": "1y", "6mo": "6mo", "3mo": "3mo"}
-            y_range = rmap.get(range_hint, "6mo")
-            return _yahoo_closes(symbol, range_str=y_range, interval="1d"), None
-        except Exception as e:
-            return [], f"Yahoo: {type(e).__name__}: {str(e)}"
-
-    if preferred == "yahoo":
-        a, err = try_yahoo()
-        if err:
-            errors.append(err)
-        if a:
-            return a, errors
-        b, err2 = try_stooq()
-        if err2:
-            errors.append(err2)
-        return b, errors
-
-    # default: stooq first
-    a, err = try_stooq()
-    if err:
-        errors.append(err)
-    if a:
-        return a, errors
-    b, err2 = try_yahoo()
-    if err2:
-        errors.append(err2)
-    return b, errors
+def _last_n_business_like(vals: List[Tuple[datetime, float]], n: int) -> List[float]:
+    # FRED already has trading-day-like series (weekends missing). Just take last n values.
+    if len(vals) < n:
+        return [v for _, v in vals]
+    return [v for _, v in vals[-n:]]
 
 
 # =========================================================
-# CNN Fear & Greed (robust: try recent dates)
+# CNN Fear & Greed (unchanged, but robust)
 # =========================================================
 def _cnn_fear_greed_graphdata(date_str: str) -> dict:
     url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{date_str}"
-    r = SESSION.get(url, timeout=8)
+    r = SESSION.get(url, timeout=10)
     r.raise_for_status()
     return r.json()
 
@@ -532,7 +449,6 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
     if cached is not None:
         return cached
 
-    # If date not provided, try today then prior few days (weekends/holiday issues happen)
     if date:
         try_dates = [date]
     else:
@@ -563,14 +479,11 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
     )
 
 
+# =========================================================
+# Market Snapshot (FRED-based)
+# =========================================================
 @app.get("/market/snapshot")
 def market_snapshot():
-    """
-    Quick market context for News tab:
-    - SPY (proxy for S&P 500) level + 1D/5D/1M returns
-    - VIX level
-    - Fear & Greed score + label (best effort)
-    """
     key = "market:snapshot"
     cached = cache_get(key)
     if cached is not None:
@@ -579,31 +492,39 @@ def market_snapshot():
     now = datetime.now(timezone.utc)
     out = {"date": now.date().isoformat(), "sp500": {}, "vix": {}, "fearGreed": {}, "errors": []}
 
-    # SPY
-    spy, errs = _market_closes("SPY", preferred="stooq", range_hint="3mo")
-    out["errors"].extend(errs)
-    if len(spy) >= 25:
-        closes = [c for _, c in spy]
-        out["sp500"] = {
-            "symbol": "SPY",
-            "last": round(closes[-1], 4),
-            "ret1dPct": round(_pct(closes[-1], closes[-2]), 4) if len(closes) >= 2 else None,
-            "ret5dPct": round(_pct(closes[-1], closes[-6]), 4) if len(closes) >= 6 else None,
-            "ret1mPct": round(_pct(closes[-1], closes[-22]), 4) if len(closes) >= 22 else None,
-            "source": "stooq->yahoo_fallback",
-        }
+    # SP500
+    try:
+        spx = _fred_series_csv("SP500")
+        if len(spx) >= 25:
+            closes = [c for _, c in spx]
+            out["sp500"] = {
+                "symbol": "SP500",
+                "last": round(closes[-1], 4),
+                "ret1dPct": round(_pct(closes[-1], closes[-2]), 4) if len(closes) >= 2 else None,
+                "ret5dPct": round(_pct(closes[-1], closes[-6]), 4) if len(closes) >= 6 else None,
+                "ret1mPct": round(_pct(closes[-1], closes[-22]), 4) if len(closes) >= 22 else None,
+                "source": "fred:SP500",
+            }
+        else:
+            out["errors"].append("FRED SP500: insufficient data points")
+    except Exception as e:
+        out["errors"].append(f"FRED SP500: {type(e).__name__}: {str(e)}")
 
     # VIX
-    vix, errs2 = _market_closes("^VIX", preferred="stooq", range_hint="3mo")
-    out["errors"].extend(errs2)
-    if len(vix) >= 2:
-        closes = [c for _, c in vix]
-        out["vix"] = {
-            "symbol": "^VIX",
-            "last": round(closes[-1], 4),
-            "chg1d": round(closes[-1] - closes[-2], 4),
-            "source": "stooq->yahoo_fallback",
-        }
+    try:
+        vix = _fred_series_csv("VIXCLS")
+        if len(vix) >= 2:
+            closes = [c for _, c in vix]
+            out["vix"] = {
+                "symbol": "^VIX",
+                "last": round(closes[-1], 4),
+                "chg1d": round(closes[-1] - closes[-2], 4),
+                "source": "fred:VIXCLS",
+            }
+        else:
+            out["errors"].append("FRED VIXCLS: insufficient data points")
+    except Exception as e:
+        out["errors"].append(f"FRED VIXCLS: {type(e).__name__}: {str(e)}")
 
     # Fear & Greed
     fg = market_fear_greed(None)
@@ -615,25 +536,56 @@ def market_snapshot():
     if fg.get("error"):
         out["errors"].append(f"FearGreed: {fg.get('error')}")
 
+    # Optional: if FRED failed, try Yahoo quote as fallback (may still 429)
+    if not out["sp500"] or not out["vix"]:
+        try:
+            q = _yahoo_quote("SPY,^VIX")
+            results = (((q or {}).get("quoteResponse") or {}).get("result") or [])
+            bysym = {str(x.get("symbol")): x for x in results if x.get("symbol")}
+            if not out["sp500"] and "SPY" in bysym and bysym["SPY"].get("regularMarketPrice") is not None:
+                out["sp500"] = {
+                    "symbol": "SPY",
+                    "last": float(bysym["SPY"]["regularMarketPrice"]),
+                    "ret1dPct": None,
+                    "ret5dPct": None,
+                    "ret1mPct": None,
+                    "source": "yahoo_quote_fallback",
+                }
+            if not out["vix"] and "^VIX" in bysym and bysym["^VIX"].get("regularMarketPrice") is not None:
+                out["vix"] = {
+                    "symbol": "^VIX",
+                    "last": float(bysym["^VIX"]["regularMarketPrice"]),
+                    "chg1d": None,
+                    "source": "yahoo_quote_fallback",
+                }
+        except Exception as e:
+            out["errors"].append(f"Yahoo quote fallback: {type(e).__name__}: {str(e)}")
+
     return cache_set(key, out, ttl_seconds=300)
 
 
 # =========================================================
-# Market Entry Index (robust)
+# Market Entry Index (FRED-based)
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     now = datetime.now(timezone.utc)
-
     errors: List[str] = []
 
-    # Need ~200 trading days for SMA200. Pull as much as we can from stooq/yahoo.
-    spy, errs = _market_closes("SPY", preferred="stooq", range_hint="1y")
-    errors.extend(errs)
-    vix, errs2 = _market_closes("^VIX", preferred="stooq", range_hint="6mo")
-    errors.extend(errs2)
+    # Pull enough history for SMA200
+    try:
+        spx = _fred_series_csv("SP500")
+    except Exception as e:
+        spx = []
+        errors.append(f"FRED SP500: {type(e).__name__}: {str(e)}")
 
-    if len(spy) < 210 or len(vix) < 30:
+    try:
+        vix = _fred_series_csv("VIXCLS")
+    except Exception as e:
+        vix = []
+        errors.append(f"FRED VIXCLS: {type(e).__name__}: {str(e)}")
+
+    if len(spx) < 210 or len(vix) < 30:
         return {
             "date": now.date().isoformat(),
             "score": 0,
@@ -650,12 +602,12 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             },
         }
 
-    _, spy_close = zip(*spy)
-    _, vix_close = zip(*vix)
+    spx_close = [c for _, c in spx]
+    vix_close = [c for _, c in vix]
 
-    price = float(spy_close[-1])
-    sma50 = _sma(list(spy_close), 50) or price
-    sma200 = _sma(list(spy_close), 200) or price
+    price = float(spx_close[-1])
+    sma50 = _sma(spx_close, 50) or price
+    sma200 = _sma(spx_close, 200) or price
 
     trend_cross = 1.0 if sma50 >= sma200 else 0.0
     price_vs_200 = _clamp01((price / sma200 - 0.90) / (1.10 - 0.90))
@@ -682,7 +634,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         regime = "RISK-OFF"
         signal = "WAIT / SMALL DCA"
 
-    notes = f"SPY={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={v:.2f}"
+    notes = f"SP500={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={v:.2f} (FRED)"
     if errors:
         notes = notes + " | " + " | ".join(errors[:3])
 
@@ -866,7 +818,7 @@ def news_watchlist(
 
 
 # =========================================================
-# News briefing (your existing endpoint)
+# News briefing (NEW): sector-friendly daily summary
 # =========================================================
 DEFAULT_SECTORS = [
     "AI",
@@ -1057,7 +1009,7 @@ def news_briefing(
 
 
 # =========================================================
-# Congress: /report/today
+# Congress: /report/today (unchanged)
 # =========================================================
 @app.get("/report/today")
 def report_today(
@@ -1230,7 +1182,7 @@ def report_today(
 
 
 # =========================================================
-# Congress: holdings proxy endpoint your UI expects
+# Congress: holdings proxy endpoint your UI expects (unchanged)
 # =========================================================
 @app.get("/report/holdings/common")
 def report_holdings_common(
@@ -1298,7 +1250,7 @@ def report_holdings_common(
 
 
 # =========================================================
-# Congress: day-by-day activity feed for UI
+# Congress: day-by-day activity feed for UI (unchanged)
 # =========================================================
 @app.get("/report/congress/daily")
 def report_congress_daily(
@@ -1407,7 +1359,7 @@ def report_congress_daily(
 
 
 # =========================================================
-# Signals (scored ideas) - your existing endpoint
+# Signals (scored ideas) - unchanged
 # =========================================================
 def _congress_ticker_agg(congress_payload: dict) -> Dict[str, dict]:
     agg: Dict[str, dict] = {}
