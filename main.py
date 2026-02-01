@@ -3,8 +3,6 @@ import re
 import time
 import math
 import json
-import csv
-import io
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -19,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.3.1")
+app = FastAPI(title="Finance Signals Backend", version="4.2.1")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -35,6 +33,7 @@ app.add_middleware(
 )
 
 QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
@@ -48,7 +47,7 @@ UA_HEADERS = {
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.3.1"}
+    return {"status": "ok", "version": "4.2.1"}
 
 
 # =========================================================
@@ -72,6 +71,21 @@ def cache_get(key: str) -> Optional[Any]:
 def cache_set(key: str, val: Any, ttl_seconds: int = 120) -> Any:
     _CACHE[key] = (time.time() + ttl_seconds, val)
     return val
+
+
+# =========================================================
+# Provider cooldowns to avoid repeated 429 / timeouts
+# =========================================================
+_PROVIDER_COOLDOWN_UNTIL: Dict[str, float] = {}
+
+
+def _cooldown(provider: str, seconds: int) -> None:
+    _PROVIDER_COOLDOWN_UNTIL[provider] = time.time() + float(seconds)
+
+
+def _is_cooled_down(provider: str) -> bool:
+    until = _PROVIDER_COOLDOWN_UNTIL.get(provider, 0.0)
+    return time.time() < until
 
 
 # =========================================================
@@ -226,7 +240,7 @@ def to_card(x: dict, kind: str) -> dict:
 
 
 # =========================================================
-# Crypto detection (unchanged)
+# Crypto detection
 # =========================================================
 TOP_COINS = ["BTC", "ETH", "SOL", "LINK", "XRP", "ADA", "DOGE", "AVAX", "MATIC", "BNB"]
 
@@ -350,35 +364,23 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 
 # =========================================================
-# Market data with anti-429 protection
+# Market data providers (rate-limit safe)
 # =========================================================
-
-_MARKET_TTL_SECONDS = 900  # 15 minutes
-_MARKET_LAST_GOOD: Dict[str, List[Tuple[datetime, float]]] = {}  # never expires in-process
-
-
-def _pct(a: float, b: float) -> float:
-    if b == 0:
-        return 0.0
-    return 100.0 * (a / b - 1.0)
-
-
-def _sma(vals: List[float], n: int) -> Optional[float]:
-    if n <= 0 or len(vals) < n:
-        return None
-    return sum(vals[-n:]) / n
-
-
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, float(x)))
+def _requests_get(url: str, params: Optional[dict] = None, timeout: int = 14) -> requests.Response:
+    return requests.get(url, params=params, timeout=timeout, headers=UA_HEADERS)
 
 
 def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
+    # Cooldown handling for Yahoo rate limits
+    if _is_cooled_down("yahoo"):
+        raise RuntimeError("Yahoo in cooldown (rate-limit backoff)")
+
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
     params = {"range": range_str, "interval": interval}
-    r = requests.get(url, params=params, timeout=14, headers=UA_HEADERS)
-    # Explicitly surface rate limiting as a distinct error
+
+    r = _requests_get(url, params=params, timeout=14)
     if r.status_code == 429:
+        _cooldown("yahoo", 10 * 60)
         raise RuntimeError("Yahoo rate limited (HTTP 429)")
     r.raise_for_status()
     return r.json()
@@ -405,109 +407,101 @@ def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> 
     return out
 
 
-def _stooq_symbol(symbol: str) -> Optional[str]:
-    s = (symbol or "").upper().strip()
-    if s == "SPY":
-        return "spy.us"
-    if s == "^VIX":
-        return "vix"
-    # extend if needed
-    return None
+def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
+    # Stooq CSV: https://stooq.com/q/d/l/?s=spy.us&i=d
+    # symbol examples: "spy.us", "vix"
+    if _is_cooled_down("stooq"):
+        raise RuntimeError("Stooq in cooldown")
 
+    url = "https://stooq.com/q/d/l/"
+    params = {"s": symbol, "i": "d"}
 
-def _stooq_closes(symbol: str) -> List[Tuple[datetime, float]]:
-    st = _stooq_symbol(symbol)
-    if not st:
-        return []
-    url = f"https://stooq.com/q/d/l/?s={quote_plus(st)}&i=d"
-    r = requests.get(url, timeout=10, headers=UA_HEADERS)
-    r.raise_for_status()
-
-    txt = r.text.strip()
-    if not txt or "No data" in txt:
-        return []
-
-    f = io.StringIO(txt)
-    reader = csv.DictReader(f)
-    out: List[Tuple[datetime, float]] = []
-    for row in reader:
-        d = row.get("Date") or row.get("date")
-        c = row.get("Close") or row.get("close")
-        if not d or not c:
-            continue
+    last_err = None
+    for attempt in range(3):
         try:
-            dt = datetime.strptime(d.strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            out.append((dt, float(c)))
-        except Exception:
-            continue
-    out.sort(key=lambda x: x[0])
-    return out
+            r = _requests_get(url, params=params, timeout=12)
+            if r.status_code >= 400:
+                last_err = f"HTTP {r.status_code}"
+                time.sleep(min(1.5, 0.5 * (attempt + 1)))
+                continue
+
+            lines = (r.text or "").strip().splitlines()
+            if len(lines) < 3:
+                last_err = "insufficient CSV rows"
+                time.sleep(min(1.5, 0.5 * (attempt + 1)))
+                continue
+
+            out: List[Tuple[datetime, float]] = []
+            for line in lines[1:]:
+                parts = line.split(",")
+                if len(parts) < 5:
+                    continue
+                d = parts[0].strip()
+                c = parts[4].strip()
+                if not d or not c or c.lower() == "null":
+                    continue
+                try:
+                    dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    out.append((dt, float(c)))
+                except Exception:
+                    continue
+
+            out.sort(key=lambda x: x[0])
+            if out:
+                return out
+
+            last_err = "parsed empty"
+            time.sleep(min(1.5, 0.5 * (attempt + 1)))
+        except requests.exceptions.Timeout as e:
+            last_err = f"Timeout: {type(e).__name__}"
+            time.sleep(min(1.5, 0.5 * (attempt + 1)))
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:160]}"
+            time.sleep(min(1.5, 0.5 * (attempt + 1)))
+
+    _cooldown("stooq", 90)
+    raise RuntimeError(f"Stooq failed: {last_err or 'unknown'}")
 
 
-def _market_cache_key(symbol: str, range_str: str, interval: str) -> str:
-    return f"mkt:closes:{symbol}:{range_str}:{interval}"
+def _finnhub_quote(symbol: str) -> dict:
+    if not FINNHUB_API_KEY:
+        raise RuntimeError("FINNHUB_API_KEY missing")
+    if _is_cooled_down("finnhub"):
+        raise RuntimeError("Finnhub in cooldown")
+
+    url = "https://finnhub.io/api/v1/quote"
+    params = {"symbol": symbol, "token": FINNHUB_API_KEY}
+    r = _requests_get(url, params=params, timeout=10)
+    if r.status_code == 429:
+        _cooldown("finnhub", 5 * 60)
+        raise RuntimeError("Finnhub rate limited (HTTP 429)")
+    r.raise_for_status()
+    return r.json() if r.text else {}
 
 
-def _get_closes_multi(symbol: str, range_str: str, interval: str, errors: List[str]) -> List[Tuple[datetime, float]]:
-    """
-    Fetch closes with:
-    - long TTL caching
-    - last-known-good fallback (serves stale data if provider rate-limits)
-    - Stooq fallback (best effort)
-    """
-    key = _market_cache_key(symbol, range_str, interval)
+def _pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return 100.0 * (a / b - 1.0)
 
-    cached = cache_get(key)
-    if cached is not None:
-        return cached
 
-    # 1) Yahoo
-    try:
-        data = _yahoo_closes(symbol, range_str=range_str, interval=interval)
-        if data:
-            _MARKET_LAST_GOOD[key] = data
-            return cache_set(key, data, ttl_seconds=_MARKET_TTL_SECONDS)
-    except Exception as e:
-        errors.append(f"Yahoo {symbol}: {type(e).__name__}: {str(e)}")
-        # If Yahoo rate-limits, return last known good immediately
-        last = _MARKET_LAST_GOOD.get(key)
-        if last:
-            return cache_set(key, last, ttl_seconds=_MARKET_TTL_SECONDS)
+def _sma(vals: List[float], n: int) -> Optional[float]:
+    if n <= 0 or len(vals) < n:
+        return None
+    return sum(vals[-n:]) / n
 
-    # 2) Stooq fallback
-    try:
-        data2 = _stooq_closes(symbol)
-        if data2:
-            # Filter range roughly by taking the most recent points
-            if range_str == "3mo":
-                data2 = data2[-70:]
-            elif range_str == "6mo":
-                data2 = data2[-140:]
-            elif range_str == "1y":
-                data2 = data2[-260:]
-            _MARKET_LAST_GOOD[key] = data2
-            return cache_set(key, data2, ttl_seconds=_MARKET_TTL_SECONDS)
-    except Exception as e:
-        errors.append(f"Stooq {symbol}: {type(e).__name__}: {str(e)}")
-        last = _MARKET_LAST_GOOD.get(key)
-        if last:
-            return cache_set(key, last, ttl_seconds=_MARKET_TTL_SECONDS)
 
-    # 3) Nothing worked, return last-good if any
-    last = _MARKET_LAST_GOOD.get(key)
-    if last:
-        return cache_set(key, last, ttl_seconds=_MARKET_TTL_SECONDS)
-
-    return cache_set(key, [], ttl_seconds=120)
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
 
 
 # =========================================================
-# CNN Fear & Greed
+# CNN Fear & Greed (best-effort)
 # =========================================================
 def _cnn_fear_greed_graphdata(date_str: Optional[str] = None) -> dict:
     d = date_str or datetime.now(timezone.utc).date().isoformat()
     url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{d}"
-    r = requests.get(url, timeout=14, headers=UA_HEADERS)
+    r = _requests_get(url, timeout=14)
     r.raise_for_status()
     return r.json()
 
@@ -529,8 +523,9 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
             "rating": now_val.get("valueText") or now_val.get("rating"),
             "raw": data,
         }
-        return cache_set(key, out, ttl_seconds=300)
+        return cache_set(key, out, ttl_seconds=600)
     except Exception as e:
+        # Cache failures briefly so the UI does not spam CNN either
         return cache_set(
             key,
             {
@@ -543,73 +538,215 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
         )
 
 
+# =========================================================
+# Market Snapshot (UPDATED: cache + cooldown + fallbacks)
+# =========================================================
+def _compute_returns_from_closes(closes: List[Tuple[datetime, float]]) -> dict:
+    if not closes or len(closes) < 2:
+        return {"last": None, "ret1dPct": None, "ret5dPct": None, "ret1mPct": None}
+
+    closes_sorted = sorted(closes, key=lambda x: x[0])
+    vals = [c for _, c in closes_sorted]
+    last = vals[-1]
+
+    ret1d = _pct(vals[-1], vals[-2]) if len(vals) >= 2 else None
+    ret5d = _pct(vals[-1], vals[-6]) if len(vals) >= 6 else None
+    ret1m = _pct(vals[-1], vals[-22]) if len(vals) >= 22 else None
+
+    return {
+        "last": round(float(last), 4),
+        "ret1dPct": round(float(ret1d), 4) if ret1d is not None else None,
+        "ret5dPct": round(float(ret5d), 4) if ret5d is not None else None,
+        "ret1mPct": round(float(ret1m), 4) if ret1m is not None else None,
+    }
+
+
+def _try_get_spy_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
+    # Prefer Finnhub if configured (more stable), else Yahoo, else Stooq.
+    if FINNHUB_API_KEY:
+        try:
+            q = _finnhub_quote("SPY")
+            c = float(q.get("c") or 0.0)
+            pc = float(q.get("pc") or 0.0)
+            if c > 0 and pc > 0:
+                now = datetime.now(timezone.utc)
+                return [
+                    (now - timedelta(days=1), pc),
+                    (now, c),
+                ]
+        except Exception as e:
+            errors.append(f"Finnhub SPY: {type(e).__name__}: {str(e)}")
+
+    try:
+        return _yahoo_closes("SPY", range_str="3mo", interval="1d")
+    except Exception as e:
+        errors.append(f"Yahoo SPY: {type(e).__name__}: {str(e)}")
+
+    try:
+        return _stooq_daily_closes("spy.us")
+    except Exception as e:
+        errors.append(f"Stooq SPY: {type(e).__name__}: {str(e)}")
+
+    return []
+
+
+def _try_get_vix_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
+    if FINNHUB_API_KEY:
+        try:
+            q = _finnhub_quote("VIX")
+            c = float(q.get("c") or 0.0)
+            pc = float(q.get("pc") or 0.0)
+            if c > 0 and pc > 0:
+                now = datetime.now(timezone.utc)
+                return [
+                    (now - timedelta(days=1), pc),
+                    (now, c),
+                ]
+        except Exception as e:
+            errors.append(f"Finnhub VIX: {type(e).__name__}: {str(e)}")
+
+    try:
+        return _yahoo_closes("^VIX", range_str="3mo", interval="1d")
+    except Exception as e:
+        errors.append(f"Yahoo VIX: {type(e).__name__}: {str(e)}")
+
+    try:
+        # Stooq has vix as "vix" sometimes, but it can vary.
+        # We still try as a last resort.
+        return _stooq_daily_closes("vix")
+    except Exception as e:
+        errors.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
+
+    return []
+
+
 @app.get("/market/snapshot")
 def market_snapshot():
-    key = "market:snapshot"
+    """
+    Rate-limit safe market context:
+    - SPY (proxy for S&P 500) level + 1D/5D/1M returns (best-effort)
+    - VIX level + 1D delta (best-effort)
+    - Fear & Greed score + label (best-effort)
+    """
+    # Strong cache so refresh spam does not hammer providers.
+    key = "market:snapshot:v2"
     cached = cache_get(key)
     if cached is not None:
         return cached
 
     now = datetime.now(timezone.utc)
-    out = {"date": now.date().isoformat(), "sp500": {}, "vix": {}, "fearGreed": {}}
+    out = {"date": now.date().isoformat(), "sp500": {}, "vix": {}, "fearGreed": {}, "errors": []}
     errors: List[str] = []
 
-    spy = _get_closes_multi("SPY", range_str="3mo", interval="1d", errors=errors)
-    if len(spy) >= 2:
-        closes = [c for _, c in spy]
-        out["sp500"] = {
-            "symbol": "SPY",
-            "last": round(closes[-1], 4),
-            "ret1dPct": round(_pct(closes[-1], closes[-2]), 4) if len(closes) >= 2 else None,
-            "ret5dPct": round(_pct(closes[-1], closes[-6]), 4) if len(closes) >= 6 else None,
-            "ret1mPct": round(_pct(closes[-1], closes[-22]), 4) if len(closes) >= 22 else None,
-        }
-    else:
-        errors.append("SPY: insufficient data")
+    # Try SPY from providers
+    spy_closes = _try_get_spy_closes(errors)
+    spy_ret = _compute_returns_from_closes(spy_closes)
+    out["sp500"] = {
+        "symbol": "SPY",
+        "last": spy_ret.get("last"),
+        "ret1dPct": spy_ret.get("ret1dPct"),
+        "ret5dPct": spy_ret.get("ret5dPct"),
+        "ret1mPct": spy_ret.get("ret1mPct"),
+    }
 
-    vix = _get_closes_multi("^VIX", range_str="3mo", interval="1d", errors=errors)
-    if len(vix) >= 2:
-        closes = [c for _, c in vix]
+    # Try VIX from providers
+    vix_closes = _try_get_vix_closes(errors)
+    if vix_closes and len(vix_closes) >= 2:
+        closes = [c for _, c in sorted(vix_closes, key=lambda x: x[0])]
         out["vix"] = {
             "symbol": "^VIX",
             "last": round(closes[-1], 4),
             "chg1d": round(closes[-1] - closes[-2], 4),
         }
     else:
-        errors.append("VIX: insufficient data")
+        out["vix"] = {"symbol": "^VIX", "last": None, "chg1d": None}
 
+    # Fear and greed: best-effort, cached separately inside its endpoint
     try:
         fg = market_fear_greed(None)
-        out["fearGreed"] = {
-            "score": fg.get("score"),
-            "rating": fg.get("rating"),
-        }
-        if fg.get("score") is None and fg.get("error"):
-            errors.append(f"FearGreed: {fg.get('error')}")
+        out["fearGreed"] = {"score": fg.get("score"), "rating": fg.get("rating")}
     except Exception as e:
         errors.append(f"FearGreed: {type(e).__name__}: {str(e)}")
+        out["fearGreed"] = {"score": None, "rating": None}
 
     out["errors"] = errors
 
-    # Cache snapshot for a while so fast-refresh never hammers providers
-    return cache_set(key, out, ttl_seconds=300)
+    # If live fetch failed badly, return last good snapshot if present
+    last_good = cache_get("market:snapshot:last_good")
+    if (out["sp500"].get("last") is None) and last_good:
+        last_good = dict(last_good)
+        last_good_errors = list(last_good.get("errors") or [])
+        last_good_errors.extend(errors[:3])
+        last_good["errors"] = last_good_errors
+        return cache_set(key, last_good, ttl_seconds=90)
+
+    # Save last good
+    if out["sp500"].get("last") is not None:
+        cache_set("market:snapshot:last_good", out, ttl_seconds=3600)
+
+    return cache_set(key, out, ttl_seconds=120)
 
 
+# =========================================================
+# Market Entry Index (UPDATED: caching + last-good fallback)
+# =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
+    # Cache to prevent repeated provider hits on refresh
+    key = f"market:entry:v2:{window_days}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
     now = datetime.now(timezone.utc)
-    errors: List[str] = []
+    err_notes: List[str] = []
 
-    spy = _get_closes_multi("SPY", range_str="1y", interval="1d", errors=errors)
-    vix = _get_closes_multi("^VIX", range_str="1y", interval="1d", errors=errors)
+    # Try to reuse snapshot cache so we do not re-hit providers
+    snap = market_snapshot()
+    spy_last = (snap.get("sp500") or {}).get("last")
+    vix_last = (snap.get("vix") or {}).get("last")
 
+    # We still want historical series for SMA50/SMA200.
+    # Prefer Yahoo (if not cooled down), else Stooq.
+    spy: List[Tuple[datetime, float]] = []
+    vix: List[Tuple[datetime, float]] = []
+
+    try:
+        spy = _yahoo_closes("SPY", range_str="1y", interval="1d")
+    except Exception as e:
+        err_notes.append(f"Yahoo SPY: {type(e).__name__}: {str(e)}")
+        try:
+            spy = _stooq_daily_closes("spy.us")
+        except Exception as e2:
+            err_notes.append(f"Stooq SPY: {type(e2).__name__}: {str(e2)}")
+            spy = []
+
+    try:
+        vix = _yahoo_closes("^VIX", range_str="1y", interval="1d")
+    except Exception as e:
+        err_notes.append(f"Yahoo VIX: {type(e).__name__}: {str(e)}")
+        try:
+            vix = _stooq_daily_closes("vix")
+        except Exception as e2:
+            err_notes.append(f"Stooq VIX: {type(e2).__name__}: {str(e2)}")
+            vix = []
+
+    # If series are insufficient, fallback to last good entry if available
     if len(spy) < 210 or len(vix) < 30:
-        return {
+        last_good = cache_get("market:entry:last_good")
+        if last_good:
+            last_good = dict(last_good)
+            last_good["notes"] = (last_good.get("notes") or "") + " | " + (" | ".join(err_notes) if err_notes else "Insufficient market data.")
+            last_good.setdefault("errors", [])
+            last_good["errors"] = (last_good.get("errors") or []) + err_notes[:3]
+            return cache_set(key, last_good, ttl_seconds=90)
+
+        out = {
             "date": now.date().isoformat(),
             "score": 0,
             "regime": "NEUTRAL",
             "signal": "DATA UNAVAILABLE",
-            "notes": " | ".join(errors) if errors else "Insufficient market data.",
+            "notes": " | ".join(err_notes) if err_notes else "Insufficient market data.",
             "components": {
                 "spxTrend": 0.5,
                 "vix": 0.5,
@@ -618,12 +755,21 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
                 "rates": 0.5,
                 "buffettProxy": 0.5,
             },
+            "errors": err_notes,
         }
+        return cache_set(key, out, ttl_seconds=90)
 
     _, spy_close = zip(*spy)
     _, vix_close = zip(*vix)
 
     price = float(spy_close[-1])
+    if spy_last is not None:
+        # If snapshot had a fresher value, use it for display, keep SMA from history
+        try:
+            price = float(spy_last)
+        except Exception:
+            pass
+
     sma50 = _sma(list(spy_close), 50) or price
     sma200 = _sma(list(spy_close), 200) or price
 
@@ -632,6 +778,12 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     spx_trend_01 = _clamp01(0.55 * trend_cross + 0.45 * price_vs_200)
 
     v = float(vix_close[-1])
+    if vix_last is not None:
+        try:
+            v = float(vix_last)
+        except Exception:
+            pass
+
     vix_01 = _clamp01(1.0 - ((v - 12.0) / (35.0 - 12.0)))
 
     breadth_01 = spx_trend_01
@@ -653,10 +805,10 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         signal = "WAIT / SMALL DCA"
 
     notes = f"SPY={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={v:.2f}"
-    if errors:
-        notes = notes + " | " + " | ".join(errors)
+    if err_notes:
+        notes = notes + " | " + " | ".join(err_notes)
 
-    return {
+    out = {
         "date": now.date().isoformat(),
         "score": score,
         "regime": regime,
@@ -670,14 +822,19 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             "rates": float(rates_01),
             "buffettProxy": float(buffett_01),
         },
+        "errors": err_notes,
     }
+
+    # Save last good entry
+    cache_set("market:entry:last_good", out, ttl_seconds=3600)
+    return cache_set(key, out, ttl_seconds=180)
 
 
 # =========================================================
 # RSS + sentiment
 # =========================================================
 def _fetch_rss_items(url: str, timeout: int = 12, max_items: int = 30) -> List[dict]:
-    r = requests.get(url, timeout=timeout, headers=UA_HEADERS)
+    r = _requests_get(url, timeout=timeout)
     r.raise_for_status()
 
     text = r.text.strip()
@@ -836,7 +993,7 @@ def news_watchlist(
 
 
 # =========================================================
-# Sector news briefing
+# News briefing
 # =========================================================
 DEFAULT_SECTORS = [
     "AI",
@@ -894,12 +1051,15 @@ SECTOR_QUERIES = {
     ],
 }
 
+
 def _google_news_rss(query: str) -> str:
     q = quote_plus(query)
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
+
 _TICKER_MENTION_RE = re.compile(r"\b([A-Z]{1,5})\b")
 _STOP_TICKERS = set(["A", "I", "AI", "US", "FED", "USA", "CEO", "EPS", "IPO", "ETF", "FDA", "SEC", "DOJ", "EU"])
+
 
 def _extract_tickers_from_titles(titles: List[str], watchlist: List[str]) -> Dict[str, int]:
     wl = set([t.upper() for t in watchlist if t])
@@ -913,11 +1073,13 @@ def _extract_tickers_from_titles(titles: List[str], watchlist: List[str]) -> Dic
                 counts[t] = counts.get(t, 0) + 1
     return counts
 
+
 def _brief_paragraph_from_headlines(headlines: List[str], sector: str) -> str:
     if not headlines:
         return f"No major {sector} headlines in the current pull."
     h = " ".join(headlines[:10]).lower()
     themes = []
+
     def has_any(words):
         return any(w in h for w in words)
 
@@ -940,12 +1102,14 @@ def _brief_paragraph_from_headlines(headlines: List[str], sector: str) -> str:
     s = "; ".join(themes[:3])
     return f"{sector}: {s}."
 
+
 def _implications(sector: str, sentiment_score: int) -> str:
     if sentiment_score >= 60:
         return f"{sector}: headline tone is supportive. If it persists, the next 1 to 3 months often favor momentum and multiple expansion in the strongest names."
     if sentiment_score <= 40:
         return f"{sector}: headline tone is risk-off. If it persists, expect choppier price action and a preference for quality balance sheets and clear catalysts."
     return f"{sector}: headline tone is neutral. If the macro backdrop stays steady, relative winners tend to be those with near-term catalysts or strong guidance."
+
 
 @app.get("/news/briefing")
 def news_briefing(
