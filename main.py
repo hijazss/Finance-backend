@@ -2,8 +2,6 @@ import os
 import re
 import time
 import math
-import json
-import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -18,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.2.2")
+app = FastAPI(title="Finance Signals Backend", version="4.3.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -47,7 +45,7 @@ UA_HEADERS = {
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.2.2"}
+    return {"status": "ok", "version": "4.3.0"}
 
 
 # =========================================================
@@ -225,7 +223,12 @@ def to_card(x: dict, kind: str) -> dict:
 
 
 # =========================================================
-# Crypto detection (unchanged)
+# Crypto detection (UPDATED to be less sparse)
+# Goals:
+# 1) Detect direct coin mentions from descriptions
+# 2) Detect crypto ETFs and trusts even if not in ticker field
+# 3) Treat crypto-linked equities as indirect exposure
+# 4) Provide a useful "exposure" rollup (direct vs ETF/trust vs equity)
 # =========================================================
 TOP_COINS = ["BTC", "ETH", "SOL", "LINK", "XRP", "ADA", "DOGE", "AVAX", "MATIC", "BNB"]
 
@@ -242,22 +245,50 @@ CRYPTO_ALIASES: Dict[str, List[str]] = {
     "BNB": ["bnb", "binance coin"],
 }
 
-CRYPTO_RELATED_TICKERS = set([
-    "IBIT", "FBTC", "ARKB", "BITB", "BTCO", "HODL", "GBTC", "BITO",
-    "ETHE", "ETHA",
-    "COIN", "MSTR", "RIOT", "MARA", "HUT", "CLSK",
+# Expanded list of crypto ETFs, trusts, and proxies
+# This matches what people actually disclose far more often than direct coins.
+CRYPTO_ETF_TRUST_TICKERS = set([
+    # Spot BTC
+    "IBIT", "FBTC", "ARKB", "BITB", "BTCO", "HODL", "EZBC", "BRRR",
+    # BTC futures / legacy
+    "BITO", "XBTF", "BTF", "GBTC",
+    # Spot ETH
+    "ETHA", "FETH", "ETHE", "CETH", "QETH",
+    # Broad crypto or basket
+    "BKCH", "BLOK", "BITQ", "DAPP", "WGMI",
 ])
 
+# Expanded list of crypto-linked equities (indirect exposure)
+CRYPTO_LINKED_EQUITIES = set([
+    "COIN", "MSTR", "RIOT", "MARA", "CLSK", "HUT", "WULF", "CIFR", "BTDR",
+    "SQ", "PYPL", "HOOD", "NVDA", "AMD", "TSLA",
+])
+
+CRYPTO_RELATED_TICKERS = set(list(CRYPTO_ETF_TRUST_TICKERS) + list(CRYPTO_LINKED_EQUITIES))
+
+# Ticker -> coin tags
 TICKER_TO_COINS: Dict[str, List[str]] = {
-    "IBIT": ["BTC"], "FBTC": ["BTC"], "ARKB": ["BTC"], "BITB": ["BTC"], "BTCO": ["BTC"], "HODL": ["BTC"],
-    "GBTC": ["BTC"], "BITO": ["BTC"],
-    "ETHE": ["ETH"], "ETHA": ["ETH"],
+    # BTC ETFs/trusts
+    "IBIT": ["BTC"], "FBTC": ["BTC"], "ARKB": ["BTC"], "BITB": ["BTC"], "BTCO": ["BTC"],
+    "HODL": ["BTC"], "EZBC": ["BTC"], "BRRR": ["BTC"],
+    "GBTC": ["BTC"], "BITO": ["BTC"], "XBTF": ["BTC"], "BTF": ["BTC"],
+    # ETH ETFs/trusts
+    "ETHA": ["ETH"], "FETH": ["ETH"], "ETHE": ["ETH"], "CETH": ["ETH"], "QETH": ["ETH"],
+    # baskets
+    "BKCH": ["CRYPTO-LINKED"], "BLOK": ["CRYPTO-LINKED"], "BITQ": ["CRYPTO-LINKED"], "DAPP": ["CRYPTO-LINKED"], "WGMI": ["CRYPTO-LINKED"],
+    # equities
     "COIN": ["CRYPTO-LINKED"],
     "MSTR": ["BTC", "CRYPTO-LINKED"],
     "RIOT": ["BTC", "CRYPTO-LINKED"],
     "MARA": ["BTC", "CRYPTO-LINKED"],
-    "HUT": ["BTC", "CRYPTO-LINKED"],
     "CLSK": ["BTC", "CRYPTO-LINKED"],
+    "HUT": ["BTC", "CRYPTO-LINKED"],
+    "WULF": ["BTC", "CRYPTO-LINKED"],
+    "CIFR": ["BTC", "CRYPTO-LINKED"],
+    "BTDR": ["BTC", "CRYPTO-LINKED"],
+    "SQ": ["CRYPTO-LINKED"],
+    "PYPL": ["CRYPTO-LINKED"],
+    "HOOD": ["CRYPTO-LINKED"],
 }
 
 _CRYPTO_PATTERNS: Dict[str, List[re.Pattern]] = {}
@@ -274,8 +305,32 @@ _GENERIC_CRYPTO_HINTS = [
     re.compile(r"\bcryptocurrency\b", re.IGNORECASE),
     re.compile(r"\bdigital asset\b", re.IGNORECASE),
     re.compile(r"\bvirtual currency\b", re.IGNORECASE),
+    re.compile(r"\bcrypto\b", re.IGNORECASE),
+    re.compile(r"\bblockchain\b", re.IGNORECASE),
 ]
 
+# Name patterns for ETFs/trusts that may appear in description without ticker
+_ETF_NAME_TO_TICKER_PATTERNS: List[Tuple[re.Pattern, str]] = [
+    # iShares Bitcoin Trust (IBIT)
+    (re.compile(r"\bishares\b.*\bbitcoin\b.*\btrust\b", re.IGNORECASE), "IBIT"),
+    (re.compile(r"\bblackrock\b.*\bbitcoin\b.*\btrust\b", re.IGNORECASE), "IBIT"),
+    # Fidelity Wise Origin Bitcoin Fund (FBTC)
+    (re.compile(r"\bfidelity\b.*\bbitcoin\b", re.IGNORECASE), "FBTC"),
+    (re.compile(r"\bwise origin\b.*\bbitcoin\b", re.IGNORECASE), "FBTC"),
+    # Grayscale Bitcoin Trust (GBTC)
+    (re.compile(r"\bgrayscale\b.*\bbitcoin\b", re.IGNORECASE), "GBTC"),
+    # ARK 21Shares Bitcoin ETF (ARKB)
+    (re.compile(r"\bark\b.*\b21shares\b.*\bbitcoin\b", re.IGNORECASE), "ARKB"),
+    # Bitwise Bitcoin ETF (BITB)
+    (re.compile(r"\bbitwise\b.*\bbitcoin\b", re.IGNORECASE), "BITB"),
+    # ProShares Bitcoin Strategy (BITO)
+    (re.compile(r"\bproshares\b.*\bbitcoin\b.*\bstrategy\b", re.IGNORECASE), "BITO"),
+    # iShares Ethereum Trust (ETHA)
+    (re.compile(r"\bishares\b.*\bethereum\b.*\btrust\b", re.IGNORECASE), "ETHA"),
+    (re.compile(r"\bblackrock\b.*\bethereum\b.*\btrust\b", re.IGNORECASE), "ETHA"),
+    # Grayscale Ethereum Trust (ETHE)
+    (re.compile(r"\bgrayscale\b.*\bethereum\b", re.IGNORECASE), "ETHE"),
+]
 
 def collect_crypto_text(row: dict) -> str:
     fields = [
@@ -318,28 +373,75 @@ def has_generic_crypto_hint(text: str) -> bool:
     return any(p.search(text) for p in _GENERIC_CRYPTO_HINTS)
 
 
-def classify_crypto_trade(ticker: str, text: str) -> Tuple[bool, List[str], str]:
+def infer_etf_ticker_from_text(text: str) -> str:
+    if not text:
+        return ""
+    for pat, ticker in _ETF_NAME_TO_TICKER_PATTERNS:
+        if pat.search(text):
+            return ticker
+    return ""
+
+
+def crypto_bucket_for(ticker: str, crypto_kind: str, coins: List[str]) -> str:
+    """
+    Bucket taxonomy for UI:
+    - direct_coin: description mentions coins explicitly
+    - etf_or_trust: ticker or inferred name matches ETF/trust
+    - equity_proxy: crypto-linked company exposure
+    - hint_only: generic crypto wording with no mapping
+    """
     t = (ticker or "").upper().strip()
+    if crypto_kind == "direct" and coins:
+        return "direct_coin"
+    if t in CRYPTO_ETF_TRUST_TICKERS:
+        return "etf_or_trust"
+    if t in CRYPTO_LINKED_EQUITIES:
+        return "equity_proxy"
+    if crypto_kind == "hint_only":
+        return "hint_only"
+    return "other"
+
+
+def classify_crypto_trade(ticker: str, text: str) -> Tuple[bool, List[str], str, str]:
+    """
+    Returns:
+      is_crypto, coins, crypto_kind, resolved_ticker
+    crypto_kind:
+      - direct
+      - etf_or_trust
+      - equity_proxy
+      - hint_only
+    resolved_ticker:
+      - original ticker if present
+      - inferred ETF ticker if description suggests it
+    """
+    t = (ticker or "").upper().strip()
+
     coins_from_text = detect_coins(text)
-    is_related_ticker = bool(t and t in CRYPTO_RELATED_TICKERS)
-    coins_from_ticker = TICKER_TO_COINS.get(t, []) if is_related_ticker else []
+    inferred = infer_etf_ticker_from_text(text)
+    resolved_ticker = t or inferred
 
-    coins = []
-    merged = set(coins_from_text + coins_from_ticker)
-    for sym in TOP_COINS:
-        if sym in merged:
-            coins.append(sym)
-    if "CRYPTO-LINKED" in merged:
-        coins.append("CRYPTO-LINKED")
+    # If ticker empty but inferred ETF found, treat as ETF/trust
+    if not t and inferred:
+        coins = TICKER_TO_COINS.get(inferred, [])
+        return True, coins if coins else ["CRYPTO-LINKED"], "etf_or_trust", inferred
 
+    # Direct coin mentions take priority
     if coins_from_text:
-        return True, coins, "direct"
-    if is_related_ticker:
-        return True, coins if coins else ["CRYPTO-LINKED"], "etf_or_proxy"
-    if has_generic_crypto_hint(text):
-        return True, coins if coins else ["CRYPTO"], "hint_only"
+        return True, coins_from_text, "direct", resolved_ticker
 
-    return False, [], ""
+    # Known related tickers
+    if t and t in CRYPTO_RELATED_TICKERS:
+        coins = TICKER_TO_COINS.get(t, [])
+        if t in CRYPTO_ETF_TRUST_TICKERS:
+            return True, coins if coins else ["CRYPTO-LINKED"], "etf_or_trust", t
+        return True, coins if coins else ["CRYPTO-LINKED"], "equity_proxy", t
+
+    # Generic hint
+    if has_generic_crypto_hint(text):
+        return True, ["CRYPTO"], "hint_only", resolved_ticker
+
+    return False, [], "", resolved_ticker
 
 
 def counts_to_list(m: Dict[str, int]) -> List[dict]:
@@ -349,117 +451,14 @@ def counts_to_list(m: Dict[str, int]) -> List[dict]:
 
 
 # =========================================================
-# Market data (Yahoo chart) with rate-limit protection
+# Market data (Yahoo chart)
 # =========================================================
-_YAHOO_LOCK = threading.Lock()
-_YAHOO_INFLIGHT: Dict[str, threading.Lock] = {}
-_YAHOO_CACHE: Dict[str, Dict[str, Any]] = {}
-_YAHOO_COOLDOWN_UNTIL = 0.0
-
-
-def _now_ts() -> float:
-    return time.time()
-
-
-def _yahoo_cache_key(symbol: str, range_str: str, interval: str) -> str:
-    return f"{symbol}|{range_str}|{interval}"
-
-
-def _yahoo_get_cached(key: str) -> Optional[dict]:
-    rec = _YAHOO_CACHE.get(key)
-    if not rec:
-        return None
-    return rec.get("data")
-
-
-def _yahoo_get_cached_fresh(key: str) -> Optional[dict]:
-    rec = _YAHOO_CACHE.get(key)
-    if not rec:
-        return None
-    exp = float(rec.get("fresh_until") or 0)
-    if _now_ts() <= exp:
-        return rec.get("data")
-    return None
-
-
-def _yahoo_get_cached_stale(key: str) -> Optional[dict]:
-    rec = _YAHOO_CACHE.get(key)
-    if not rec:
-        return None
-    exp = float(rec.get("stale_until") or 0)
-    if _now_ts() <= exp:
-        return rec.get("data")
-    return None
-
-
-def _yahoo_set_cache(key: str, data: dict, fresh_ttl: int = 300, stale_ttl: int = 7200) -> dict:
-    _YAHOO_CACHE[key] = {
-        "data": data,
-        "fresh_until": _now_ts() + float(fresh_ttl),
-        "stale_until": _now_ts() + float(stale_ttl),
-    }
-    return data
-
-
 def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
-    """
-    Calls Yahoo, but:
-    - serves fresh cached data for 5 min by default
-    - on 429 or during cooldown, serves stale cached data up to 2 hours
-    - prevents thundering herd with per-key inflight locks
-    """
-    global _YAHOO_COOLDOWN_UNTIL
-
-    key = _yahoo_cache_key(symbol, range_str, interval)
-
-    # Serve fresh cache immediately
-    fresh = _yahoo_get_cached_fresh(key)
-    if fresh is not None:
-        return fresh
-
-    # If in cooldown, do not call Yahoo. Serve stale if possible.
-    if _now_ts() < _YAHOO_COOLDOWN_UNTIL:
-        stale = _yahoo_get_cached_stale(key)
-        if stale is not None:
-            return stale
-        raise RuntimeError("Yahoo rate limited (cooldown active, no cached data available)")
-
-    # Create/get per-key inflight lock
-    with _YAHOO_LOCK:
-        if key not in _YAHOO_INFLIGHT:
-            _YAHOO_INFLIGHT[key] = threading.Lock()
-        inflight_lock = _YAHOO_INFLIGHT[key]
-
-    with inflight_lock:
-        # Re-check cache after waiting
-        fresh2 = _yahoo_get_cached_fresh(key)
-        if fresh2 is not None:
-            return fresh2
-
-        # Call Yahoo
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
-        params = {"range": range_str, "interval": interval}
-
-        try:
-            r = requests.get(url, params=params, timeout=14, headers=UA_HEADERS)
-
-            if r.status_code == 429:
-                _YAHOO_COOLDOWN_UNTIL = _now_ts() + 120.0
-                stale = _yahoo_get_cached_stale(key)
-                if stale is not None:
-                    return stale
-                raise RuntimeError("Yahoo rate limited (HTTP 429)")
-
-            r.raise_for_status()
-            data = r.json()
-            return _yahoo_set_cache(key, data, fresh_ttl=300, stale_ttl=7200)
-
-        except Exception as e:
-            # Serve stale cache on any error if possible
-            stale = _yahoo_get_cached_stale(key)
-            if stale is not None:
-                return stale
-            raise e
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + quote_plus(symbol)
+    params = {"range": range_str, "interval": interval}
+    r = requests.get(url, params=params, timeout=14, headers=UA_HEADERS)
+    r.raise_for_status()
+    return r.json()
 
 
 def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> List[Tuple[datetime, float]]:
@@ -500,89 +499,49 @@ def _clamp01(x: float) -> float:
 
 
 # =========================================================
-# CNN Fear & Greed (best effort)
+# CNN Fear & Greed
 # =========================================================
-def _cnn_fear_greed_graphdata(date_str: str) -> dict:
-    url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{date_str}"
+def _cnn_fear_greed_graphdata(date_str: Optional[str] = None) -> dict:
+    d = date_str or datetime.now(timezone.utc).date().isoformat()
+    url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{d}"
     r = requests.get(url, timeout=14, headers=UA_HEADERS)
     r.raise_for_status()
     return r.json()
 
 
-def _parse_fear_greed_payload(data: dict) -> Tuple[Optional[int], Optional[str], str]:
-    fg = (data or {}).get("fear_and_greed") or {}
-
-    # Schema A: fear_and_greed.score / fear_and_greed.rating
-    if isinstance(fg, dict) and ("score" in fg or "rating" in fg):
-        score = fg.get("score")
-        rating = fg.get("rating")
-        try:
-            score_int = int(score) if score is not None else None
-        except Exception:
-            score_int = None
-        rating_str = str(rating).strip() if rating is not None else None
-        return score_int, rating_str, "score/rating"
-
-    # Schema B: fear_and_greed.now.value / valueText
-    now_val = fg.get("now") if isinstance(fg, dict) else None
-    if isinstance(now_val, dict):
-        score = now_val.get("value")
-        rating = now_val.get("valueText") or now_val.get("rating")
-        try:
-            score_int = int(score) if score is not None else None
-        except Exception:
-            score_int = None
-        rating_str = str(rating).strip() if rating is not None else None
-        return score_int, rating_str, "now.value/valueText"
-
-    return None, None, "unknown"
-
-
 @app.get("/market/fear-greed")
 def market_fear_greed(date: Optional[str] = Query(default=None)):
-    key = f"feargreed:{date or 'auto'}"
+    key = f"feargreed:{date or 'today'}"
     cached = cache_get(key)
     if cached is not None:
         return cached
 
-    if date:
-        candidates = [date]
-    else:
-        base = datetime.now(timezone.utc).date()
-        candidates = [(base - timedelta(days=i)).isoformat() for i in range(0, 6)]
-
-    last_err = None
-    for d in candidates:
-        try:
-            data = _cnn_fear_greed_graphdata(d)
-            score, rating, schema = _parse_fear_greed_payload(data)
-            out = {
-                "date": (data or {}).get("date") or d,
-                "score": score,
-                "rating": rating,
-                "schema": schema,
-                "raw": data,
-            }
-            ttl = 600 if score is not None else 120
-            return cache_set(key, out, ttl_seconds=ttl)
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {str(e)}"
-            continue
-
-    out = {
-        "date": date or datetime.now(timezone.utc).date().isoformat(),
-        "score": None,
-        "rating": None,
-        "schema": "error",
-        "error": last_err or "Unknown error",
-    }
-    return cache_set(key, out, ttl_seconds=60)
+    try:
+        data = _cnn_fear_greed_graphdata(date)
+        fg = (data or {}).get("fear_and_greed") or {}
+        now_val = fg.get("now") or {}
+        out = {
+            "date": (data or {}).get("date") or (date or datetime.now(timezone.utc).date().isoformat()),
+            "score": now_val.get("value"),
+            "rating": now_val.get("valueText") or now_val.get("rating"),
+            "raw": data,
+        }
+        return cache_set(key, out, ttl_seconds=300)
+    except Exception as e:
+        return cache_set(
+            key,
+            {"date": date or datetime.now(timezone.utc).date().isoformat(), "score": None, "rating": None, "error": f"{type(e).__name__}: {str(e)}"},
+            ttl_seconds=60,
+        )
 
 
 @app.get("/market/snapshot")
 def market_snapshot():
     """
-    Cached more aggressively so rapid refreshes do not spam Yahoo.
+    Quick market context for News tab:
+    - SPY (proxy for S&P 500) level + 1D/5D/1M returns
+    - VIX level
+    - Fear & Greed score + label (best effort)
     """
     key = "market:snapshot"
     cached = cache_get(key)
@@ -625,27 +584,19 @@ def market_snapshot():
         out["fearGreed"] = {
             "score": fg.get("score"),
             "rating": fg.get("rating"),
-            "schema": fg.get("schema"),
         }
-        if fg.get("score") is None and fg.get("error"):
-            errors.append(f"FearGreed: {fg.get('error')}")
     except Exception as e:
         errors.append(f"FearGreed: {type(e).__name__}: {str(e)}")
 
     out["errors"] = errors
-    return cache_set(key, out, ttl_seconds=300)
+    return cache_set(key, out, ttl_seconds=180)
 
 
 # =========================================================
-# Market Entry Index (cached more aggressively)
+# Market Entry Index
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
-    key = f"market:entry:{window_days}"
-    cached = cache_get(key)
-    if cached is not None:
-        return cached
-
     now = datetime.now(timezone.utc)
 
     err_notes = []
@@ -657,7 +608,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         spy, vix = [], []
 
     if len(spy) < 210 or len(vix) < 30:
-        out = {
+        return {
             "date": now.date().isoformat(),
             "score": 0,
             "regime": "NEUTRAL",
@@ -672,7 +623,6 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
                 "buffettProxy": 0.5,
             },
         }
-        return cache_set(key, out, ttl_seconds=300)
 
     _, spy_close = zip(*spy)
     _, vix_close = zip(*vix)
@@ -710,7 +660,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     if err_notes:
         notes = notes + " | " + " | ".join(err_notes)
 
-    out = {
+    return {
         "date": now.date().isoformat(),
         "score": score,
         "regime": regime,
@@ -725,7 +675,6 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             "buffettProxy": float(buffett_01),
         },
     }
-    return cache_set(key, out, ttl_seconds=300)
 
 
 # =========================================================
@@ -891,7 +840,7 @@ def news_watchlist(
 
 
 # =========================================================
-# News briefing (sector summary)
+# News briefing: sector-friendly daily summary
 # =========================================================
 DEFAULT_SECTORS = [
     "AI",
@@ -973,6 +922,7 @@ def _brief_paragraph_from_headlines(headlines: List[str], sector: str) -> str:
         return f"No major {sector} headlines in the current pull."
     h = " ".join(headlines[:10]).lower()
     themes = []
+
     def has_any(words):
         return any(w in h for w in words)
 
@@ -1082,8 +1032,24 @@ def news_briefing(
 
 
 # =========================================================
-# Congress endpoints + signals (UNCHANGED from your prior full backend)
+# Congress: /report/today
+# UPDATED crypto payload:
+# - raw rows tagged with bucket and resolved_ticker
+# - exposure rollup by bucket
+# - top tickers by crypto exposure (ETF/trust and equity proxies included)
 # =========================================================
+def _push_count(d: Dict[str, int], k: str, n: int = 1):
+    if not k:
+        return
+    d[k] = d.get(k, 0) + n
+
+
+def _top_k_counts(d: Dict[str, int], k: int = 10) -> List[dict]:
+    arr = [{"key": kk, "count": int(vv)} for kk, vv in d.items()]
+    arr.sort(key=lambda x: (-x["count"], x["key"]))
+    return arr[:k]
+
+
 @app.get("/report/today")
 def report_today(
     window_days: Optional[int] = Query(default=None, ge=1, le=365),
@@ -1109,7 +1075,12 @@ def report_today(
             "convergence": [],
             "politicianBuys": [],
             "politicianSells": [],
-            "crypto": {"buys": [], "sells": [], "rawBuys": [], "rawSells": [], "raw": []},
+            "crypto": {
+                "buys": [], "sells": [], "rawBuys": [], "rawSells": [], "raw": [],
+                "exposure": {"direct_coin": [], "etf_or_trust": [], "equity_proxy": [], "hint_only": [], "other": []},
+                "topExposureTickers": [],
+                "topCoins": TOP_COINS,
+            },
         }
 
     try:
@@ -1125,6 +1096,18 @@ def report_today(
     crypto_raw: List[dict] = []
     crypto_raw_buys: List[dict] = []
     crypto_raw_sells: List[dict] = []
+
+    # New rollups
+    exposure_bucket_counts_buy: Dict[str, int] = {}
+    exposure_bucket_counts_sell: Dict[str, int] = {}
+    exposure_ticker_counts: Dict[str, int] = {}
+    exposure_bucket_to_ticker_counts: Dict[str, Dict[str, int]] = {
+        "direct_coin": {},
+        "etf_or_trust": {},
+        "equity_proxy": {},
+        "hint_only": {},
+        "other": {},
+    }
 
     for r in rows:
         best_dt = row_best_dt(r)
@@ -1171,18 +1154,26 @@ def report_today(
                 sells.append(item)
 
         text_blob = collect_crypto_text(r)
-        is_crypto, coins, crypto_kind = classify_crypto_trade(ticker, text_blob)
+        is_crypto, coins, crypto_kind, resolved_ticker = classify_crypto_trade(ticker, text_blob)
 
         if is_crypto:
             target_counts = crypto_counts_buy if kind == "BUY" else crypto_counts_sell
             for c in coins if coins else ["CRYPTO"]:
                 target_counts[c] = target_counts.get(c, 0) + 1
 
+            bucket = crypto_bucket_for(resolved_ticker, crypto_kind, coins)
+
+            _push_count(exposure_bucket_counts_buy if kind == "BUY" else exposure_bucket_counts_sell, bucket, 1)
+            if resolved_ticker:
+                _push_count(exposure_ticker_counts, resolved_ticker.upper(), 1)
+                _push_count(exposure_bucket_to_ticker_counts.get(bucket, {}), resolved_ticker.upper(), 1)
+
             rec = {
                 "kind": kind,
                 "coins": coins if coins else ["CRYPTO"],
                 "cryptoKind": crypto_kind,
-                "ticker": (ticker or "").upper(),
+                "bucket": bucket,
+                "ticker": (resolved_ticker or "").upper(),
                 "description": desc,
                 "party": party,
                 "politician": pol,
@@ -1233,13 +1224,33 @@ def report_today(
     crypto_raw_buys.sort(key=lambda x: (x.get("filed") or x.get("traded") or ""), reverse=True)
     crypto_raw_sells.sort(key=lambda x: (x.get("filed") or x.get("traded") or ""), reverse=True)
 
+    exposure = {
+        "direct_coin": _top_k_counts(exposure_bucket_to_ticker_counts["direct_coin"], 12),
+        "etf_or_trust": _top_k_counts(exposure_bucket_to_ticker_counts["etf_or_trust"], 12),
+        "equity_proxy": _top_k_counts(exposure_bucket_to_ticker_counts["equity_proxy"], 12),
+        "hint_only": _top_k_counts(exposure_bucket_to_ticker_counts["hint_only"], 12),
+        "other": _top_k_counts(exposure_bucket_to_ticker_counts["other"], 12),
+    }
+
+    top_exposure_tickers = _top_k_counts(exposure_ticker_counts, 18)
+
     crypto_payload = {
         "buys": counts_to_list(crypto_counts_buy),
         "sells": counts_to_list(crypto_counts_sell),
-        "rawBuys": crypto_raw_buys[:250],
-        "rawSells": crypto_raw_sells[:250],
-        "raw": crypto_raw[:500],
+        "rawBuys": crypto_raw_buys[:300],
+        "rawSells": crypto_raw_sells[:300],
+        "raw": crypto_raw[:700],
+        "exposure": exposure,
+        "bucketCounts": {
+            "buys": counts_to_list(exposure_bucket_counts_buy),
+            "sells": counts_to_list(exposure_bucket_counts_sell),
+        },
+        "topExposureTickers": top_exposure_tickers,
         "topCoins": TOP_COINS,
+        "notes": [
+            "Crypto in disclosures is often indirect via ETFs/trusts and crypto-linked equities.",
+            "Direct coin trades are comparatively rare and may be described inconsistently.",
+        ],
     }
 
     return {
@@ -1254,6 +1265,9 @@ def report_today(
     }
 
 
+# =========================================================
+# Congress: holdings proxy endpoint
+# =========================================================
 @app.get("/report/holdings/common")
 def report_holdings_common(
     window_days: int = Query(default=365, ge=30, le=365),
@@ -1319,6 +1333,9 @@ def report_holdings_common(
     }
 
 
+# =========================================================
+# Congress: day-by-day activity feed for UI
+# =========================================================
 @app.get("/report/congress/daily")
 def report_congress_daily(
     window_days: int = Query(default=14, ge=1, le=365),
@@ -1408,12 +1425,12 @@ def report_congress_daily(
     items.sort(key=sort_key, reverse=True)
     items = items[:limit]
 
-    days: Dict[str, List[dict]] = {}
+    days_map: Dict[str, List[dict]] = {}
     for it in items:
         d = it.get("filed") or it.get("traded") or it.get("bestDate") or now.date().isoformat()
-        days.setdefault(d, []).append(it)
+        days_map.setdefault(d, []).append(it)
 
-    day_list = [{"date": d, "items": days[d]} for d in sorted(days.keys(), reverse=True)]
+    day_list = [{"date": d, "items": days_map[d]} for d in sorted(days_map.keys(), reverse=True)]
 
     return {
         "date": now.date().isoformat(),
@@ -1425,6 +1442,9 @@ def report_congress_daily(
     }
 
 
+# =========================================================
+# Signals: scored list for Main tab
+# =========================================================
 def _congress_ticker_agg(congress_payload: dict) -> Dict[str, dict]:
     agg: Dict[str, dict] = {}
     for arr_name, buy_mode in [("politicianBuys", True), ("politicianSells", False)]:
@@ -1547,5 +1567,40 @@ def signals_ideas(
         "limit": limit,
         "ideas": rows[:limit],
         "note": "Score blends congress activity with relevance from watchlist + sector headlines.",
+    }
+    return cache_set(key, out, ttl_seconds=180)
+
+
+# =========================================================
+# Optional: dedicated crypto exposure endpoint (nice for UI)
+# You can call this from the Crypto tab if you want a cleaner view than /report/today.
+# =========================================================
+@app.get("/crypto/exposure")
+def crypto_exposure(
+    window_days: int = Query(default=365, ge=1, le=365),
+):
+    """
+    Convenience endpoint:
+    - Pulls /report/today and returns only the crypto exposure rollups plus a few examples.
+    """
+    key = f"cryptoexposure:{window_days}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    payload = report_today(window_days=window_days, horizon_days=None)
+    crypto = payload.get("crypto") or {}
+    out = {
+        "date": payload.get("date"),
+        "windowDays": payload.get("windowDays"),
+        "bucketCounts": crypto.get("bucketCounts", {}),
+        "exposure": crypto.get("exposure", {}),
+        "topExposureTickers": crypto.get("topExposureTickers", []),
+        "examples": {
+            "direct_coin": [x for x in (crypto.get("raw") or []) if x.get("bucket") == "direct_coin"][:12],
+            "etf_or_trust": [x for x in (crypto.get("raw") or []) if x.get("bucket") == "etf_or_trust"][:12],
+            "equity_proxy": [x for x in (crypto.get("raw") or []) if x.get("bucket") == "equity_proxy"][:12],
+        },
+        "note": "This is exposure based on disclosures. It is not a live holdings ledger.",
     }
     return cache_set(key, out, ttl_seconds=180)
