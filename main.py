@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -16,8 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-APP_VERSION = "4.5.0"
-app = FastAPI(title="Finance Signals Backend", version=APP_VERSION)
+app = FastAPI(title="Finance Signals Backend", version="4.4.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -32,7 +32,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-QUIVER_TOKEN = os.getenv("QUIVER_TOKEN", "").strip()
+QUIVER_TOKEN = os.getenv("QUIVER_TOKEN")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
@@ -51,21 +51,37 @@ RSS_HEADERS = {
     "Connection": "keep-alive",
 }
 
+# Nasdaq is picky about headers.
+NASDAQ_HEADERS = {
+    "User-Agent": UA_HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": UA_HEADERS["Accept-Language"],
+    "Connection": "keep-alive",
+    "Referer": "https://www.nasdaq.com/",
+    "Origin": "https://www.nasdaq.com",
+}
+
 SESSION = requests.Session()
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": APP_VERSION}
+    return {"status": "ok", "version": "4.4.0"}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": APP_VERSION, "time": datetime.now(timezone.utc).isoformat()}
+    return {
+        "ok": True,
+        "version": "4.4.0",
+        "hasQuiverToken": bool(QUIVER_TOKEN),
+        "hasFinnhubKey": bool(FINNHUB_API_KEY),
+        "utc": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # =========================================================
-# Stale-while-revalidate cache
+# Stale-while-revalidate cache (Render-friendly)
 # =========================================================
 # key -> (fresh_until_epoch, stale_until_epoch, value)
 _CACHE: Dict[str, Tuple[float, float, Any]] = {}
@@ -92,7 +108,7 @@ def cache_set(key: str, val: Any, ttl_seconds: int = 120, stale_ttl_seconds: int
 
 
 # =========================================================
-# Provider cooldowns
+# Provider cooldowns (split RSS vs chart to stop collateral damage)
 # =========================================================
 _PROVIDER_COOLDOWN_UNTIL: Dict[str, float] = {}
 
@@ -389,8 +405,139 @@ def _requests_get(url: str, params: Optional[dict] = None, timeout: int = 14, he
     return SESSION.get(url, params=params, timeout=timeout, headers=h)
 
 
+def _safe_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip()
+    if not s:
+        return None
+    s = s.replace("$", "").replace(",", "").strip()
+    m = re.search(r"-?\d+(\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
 # =========================================================
-# Yahoo chart (separate cooldown bucket)
+# Nasdaq quotes + chart (primary market data source)
+# =========================================================
+def _nasdaq_assetclass_for_symbol(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    if s in ["SPY", "QQQ", "DIA", "IWM"]:
+        return "etf"
+    if s in ["VIX", "^VIX", "NDX", "^NDX", "SPX", "^SPX"]:
+        return "index"
+    if re.fullmatch(r"[A-Z]{1,5}", s):
+        return "stocks"
+    return "stocks"
+
+
+def _nasdaq_symbol_normalize(symbol: str) -> str:
+    s = (symbol or "").strip()
+    if s.upper() == "^VIX":
+        return "VIX"
+    if s.upper() == "^SPX":
+        return "SPX"
+    if s.upper() == "^NDX":
+        return "NDX"
+    return s.upper()
+
+
+def _nasdaq_quote(symbol: str, assetclass: Optional[str] = None) -> dict:
+    if _is_cooled_down("nasdaq"):
+        raise RuntimeError("Nasdaq in cooldown")
+
+    sym = _nasdaq_symbol_normalize(symbol)
+    ac = assetclass or _nasdaq_assetclass_for_symbol(sym)
+
+    url = f"https://api.nasdaq.com/api/quote/{quote_plus(sym)}/info"
+    params = {"assetclass": ac}
+
+    r = _requests_get(url, params=params, timeout=12, headers=NASDAQ_HEADERS)
+    if r.status_code == 429:
+        _cooldown("nasdaq", 10 * 60)
+        raise RuntimeError("Nasdaq rate limited (HTTP 429)")
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def _nasdaq_chart(symbol: str, assetclass: Optional[str] = None) -> dict:
+    if _is_cooled_down("nasdaq"):
+        raise RuntimeError("Nasdaq in cooldown")
+
+    sym = _nasdaq_symbol_normalize(symbol)
+    ac = assetclass or _nasdaq_assetclass_for_symbol(sym)
+
+    url = f"https://api.nasdaq.com/api/quote/{quote_plus(sym)}/chart"
+    params = {"assetclass": ac}
+
+    r = _requests_get(url, params=params, timeout=12, headers=NASDAQ_HEADERS)
+    if r.status_code == 429:
+        _cooldown("nasdaq", 10 * 60)
+        raise RuntimeError("Nasdaq rate limited (HTTP 429)")
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def _nasdaq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
+    j = _nasdaq_chart(symbol)
+    data = (j or {}).get("data") or {}
+    chart = data.get("chart") or data.get("chartData") or []
+
+    out: List[Tuple[datetime, float]] = []
+    for pt in chart:
+        # Nasdaq tends to return: { date: "01/31/2026", value: "487.12" } or similar.
+        d = pt.get("date") or pt.get("x") or pt.get("label")
+        v = pt.get("value") or pt.get("y") or pt.get("close") or pt.get("last")
+        if not d or v is None:
+            continue
+
+        dt = None
+        ds = str(d).strip()
+        for fmt in ["%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"]:
+            try:
+                dt = datetime.strptime(ds, fmt).replace(tzinfo=timezone.utc)
+                break
+            except Exception:
+                continue
+        if dt is None:
+            # Sometimes includes time, try parse_dt_any
+            dt2 = parse_dt_any(ds)
+            if dt2:
+                dt = dt2.astimezone(timezone.utc)
+
+        fv = _safe_float(v)
+        if dt and fv is not None:
+            out.append((dt, float(fv)))
+
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _nasdaq_last_and_prev(symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    q = _nasdaq_quote(symbol)
+    data = (q or {}).get("data") or {}
+    primary = data.get("primaryData") or {}
+    secondary = data.get("secondaryData") or {}
+    key_stats = data.get("keyStats") or {}
+
+    last = _safe_float(primary.get("lastSalePrice") or primary.get("lastSale") or primary.get("last"))
+    prev = _safe_float(primary.get("previousClose") or secondary.get("previousClose") or key_stats.get("PreviousClose"))
+
+    # Some payloads use "lastSalePrice" but previous close can be nested in "keyStats"
+    if prev is None:
+        prev = _safe_float(key_stats.get("PreviousClose") or key_stats.get("previousClose"))
+
+    return last, prev
+
+
+# =========================================================
+# Yahoo chart (last-resort)
 # =========================================================
 def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
     if _is_cooled_down("yahoo_chart"):
@@ -429,7 +576,7 @@ def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> 
 
 
 # =========================================================
-# Stooq closes (fallback)
+# Stooq closes (last-resort)
 # =========================================================
 def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
     if _is_cooled_down("stooq"):
@@ -521,7 +668,7 @@ def _clamp01(x: float) -> float:
 
 
 # =========================================================
-# CNN Fear & Greed
+# CNN Fear & Greed (best-effort)
 # =========================================================
 def _cnn_fear_greed_graphdata(date_str: Optional[str] = None) -> dict:
     d = date_str or datetime.now(timezone.utc).date().isoformat()
@@ -566,7 +713,7 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
 
 
 # =========================================================
-# Market Snapshot
+# Market Snapshot (cache + fallbacks)
 # =========================================================
 def _compute_returns_from_closes(closes: List[Tuple[datetime, float]]) -> dict:
     if not closes or len(closes) < 2:
@@ -589,11 +736,15 @@ def _compute_returns_from_closes(closes: List[Tuple[datetime, float]]) -> dict:
 
 
 def _try_get_spy_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
+    # Primary: Nasdaq chart
     try:
-        return _stooq_daily_closes("spy.us")
+        c = _nasdaq_daily_closes("SPY")
+        if len(c) >= 2:
+            return c
     except Exception as e:
-        errors.append(f"Stooq SPY: {type(e).__name__}: {str(e)}")
+        errors.append(f"Nasdaq SPY: {type(e).__name__}: {str(e)}")
 
+    # Secondary: Finnhub (2 points)
     if FINNHUB_API_KEY:
         try:
             q = _finnhub_quote("SPY")
@@ -605,6 +756,13 @@ def _try_get_spy_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
         except Exception as e:
             errors.append(f"Finnhub SPY: {type(e).__name__}: {str(e)}")
 
+    # Last resort: Stooq
+    try:
+        return _stooq_daily_closes("spy.us")
+    except Exception as e:
+        errors.append(f"Stooq SPY: {type(e).__name__}: {str(e)}")
+
+    # Last resort: Yahoo
     try:
         return _yahoo_closes("SPY", range_str="3mo", interval="1d")
     except Exception as e:
@@ -614,11 +772,15 @@ def _try_get_spy_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
 
 
 def _try_get_vix_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
+    # Primary: Nasdaq chart (VIX)
     try:
-        return _stooq_daily_closes("vix")
+        c = _nasdaq_daily_closes("VIX")
+        if len(c) >= 2:
+            return c
     except Exception as e:
-        errors.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
+        errors.append(f"Nasdaq VIX: {type(e).__name__}: {str(e)}")
 
+    # Secondary: Finnhub (2 points)
     if FINNHUB_API_KEY:
         try:
             q = _finnhub_quote("VIX")
@@ -630,6 +792,13 @@ def _try_get_vix_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
         except Exception as e:
             errors.append(f"Finnhub VIX: {type(e).__name__}: {str(e)}")
 
+    # Last resort: Stooq
+    try:
+        return _stooq_daily_closes("vix")
+    except Exception as e:
+        errors.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
+
+    # Last resort: Yahoo
     try:
         return _yahoo_closes("^VIX", range_str="3mo", interval="1d")
     except Exception as e:
@@ -694,17 +863,11 @@ def market_snapshot():
 
 
 # =========================================================
-# Market Entry Index
+# Market Entry Index (Nasdaq primary)
 # =========================================================
 @app.get("/market/entry")
-def market_entry(
-    window_days: int = Query(default=365, ge=30, le=365),
-    windowDays: Optional[int] = Query(default=None, ge=30, le=365),
-):
-    # Accept both window_days (snake) and windowDays (camel)
-    wd = int(windowDays) if windowDays is not None else int(window_days)
-
-    key = f"market:entry:v4:{wd}"
+def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
+    key = f"market:entry:v4:{window_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -715,32 +878,50 @@ def market_entry(
     spy: List[Tuple[datetime, float]] = []
     vix: List[Tuple[datetime, float]] = []
 
+    # Primary: Nasdaq chart
     try:
-        spy = _stooq_daily_closes("spy.us")
+        spy = _nasdaq_daily_closes("SPY")
     except Exception as e:
-        err_notes.append(f"Stooq SPY: {type(e).__name__}: {str(e)}")
+        err_notes.append(f"Nasdaq SPY: {type(e).__name__}: {str(e)}")
+
+    try:
+        vix = _nasdaq_daily_closes("VIX")
+    except Exception as e:
+        err_notes.append(f"Nasdaq VIX: {type(e).__name__}: {str(e)}")
+
+    # Secondary: Stooq
+    if len(spy) < 210:
+        try:
+            spy = _stooq_daily_closes("spy.us")
+        except Exception as e:
+            err_notes.append(f"Stooq SPY: {type(e).__name__}: {str(e)}")
+
+    if len(vix) < 30:
+        try:
+            vix = _stooq_daily_closes("vix")
+        except Exception as e:
+            err_notes.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
+
+    # Tertiary: Yahoo
+    if len(spy) < 210:
         try:
             spy = _yahoo_closes("SPY", range_str="1y", interval="1d")
-        except Exception as e2:
-            err_notes.append(f"Yahoo SPY: {type(e2).__name__}: {str(e2)}")
-            spy = []
+        except Exception as e:
+            err_notes.append(f"Yahoo SPY: {type(e).__name__}: {str(e)}")
 
-    try:
-        vix = _stooq_daily_closes("vix")
-    except Exception as e:
-        err_notes.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
+    if len(vix) < 30:
         try:
             vix = _yahoo_closes("^VIX", range_str="1y", interval="1d")
-        except Exception as e2:
-            err_notes.append(f"Yahoo VIX: {type(e2).__name__}: {str(e2)}")
-            vix = []
+        except Exception as e:
+            err_notes.append(f"Yahoo VIX: {type(e).__name__}: {str(e)}")
 
+    # last-good fallback
     if len(spy) < 210 or len(vix) < 30:
         last_good = cache_get("market:entry:last_good", allow_stale=True)
         if last_good:
             merged = dict(last_good)
             merged["notes"] = (merged.get("notes") or "") + " | " + (" | ".join(err_notes) if err_notes else "Insufficient market data.")
-            merged["errors"] = (list(merged.get("errors") or []) + err_notes)[:8]
+            merged["errors"] = (list(merged.get("errors") or []) + err_notes)[:10]
             return cache_set(key, merged, ttl_seconds=90, stale_ttl_seconds=1800)
 
         out = {
@@ -823,7 +1004,7 @@ def market_entry(
 
 
 # =========================================================
-# RSS fetch
+# RSS fetch (stale on 429, provider split: yahoo_rss)
 # =========================================================
 def _fetch_rss_items_uncached(url: str, timeout: int = 8, max_items: int = 25) -> List[dict]:
     r = _requests_get(url, timeout=timeout, headers=RSS_HEADERS)
@@ -875,14 +1056,8 @@ def _provider_for_url(url: str) -> str:
     return "rss"
 
 
-def _fetch_rss_items(
-    url: str,
-    timeout: int = 8,
-    max_items: int = 25,
-    ttl_seconds: int = 240,
-    stale_ttl_seconds: int = 6 * 3600,
-) -> List[dict]:
-    key = f"rss:url:v3:{url}"
+def _fetch_rss_items(url: str, timeout: int = 8, max_items: int = 25, ttl_seconds: int = 240, stale_ttl_seconds: int = 6 * 3600) -> List[dict]:
+    key = f"rss:url:v2:{url}"
     cached_fresh = cache_get(key, allow_stale=False)
     if cached_fresh is not None:
         return cached_fresh
@@ -964,6 +1139,9 @@ def _headline_sentiment(headlines: List[str]) -> Dict[str, Any]:
     return {"label": label, "score": gauge, "pos": pos, "neg": neg, "total": total}
 
 
+# =========================================================
+# News briefing endpoint (matches your frontend signature)
+# =========================================================
 def _google_news_rss(query: str) -> str:
     q = quote_plus(query)
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
@@ -1034,13 +1212,8 @@ def news_briefing(
     sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
     watchlist: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
     max_items_per_sector: int = Query(default=12, ge=5, le=30),
-    limit: Optional[int] = Query(default=None, ge=5, le=30),  # backward compat with your currently deployed v4.4.0
 ):
-    # If someone calls with ?limit=12, map it.
-    if limit is not None and (max_items_per_sector is None):
-        max_items_per_sector = int(limit)
-
-    key = f"news:brief:v4:{sectors}:{watchlist}:{max_items_per_sector}"
+    key = f"news:brief:v3:{sectors}:{watchlist}:{max_items_per_sector}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1058,6 +1231,7 @@ def news_briefing(
 
     errors: List[str] = []
     all_items: List[dict] = []
+
     jobs: List[Tuple[str, str, str, int, str]] = []
 
     for sec in sector_list[:18]:
@@ -1074,6 +1248,7 @@ def news_briefing(
         jobs.append(("watch_google", t, url, max_items_per_sector, "google_rss"))
 
     MAX_WORKERS = 8
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futs = []
         for kind, tag, url, n, provider in jobs:
@@ -1172,57 +1347,35 @@ def news_briefing(
 
 
 # =========================================================
-# Congress endpoints (RESTORED)
+# Congress endpoints your UI calls
 # =========================================================
-def _empty_congress_payload(now: datetime, since: datetime, days: int, note: str = "") -> dict:
-    return {
-        "date": now.date().isoformat(),
-        "windowDays": days,
-        "windowStart": since.date().isoformat(),
-        "windowEnd": now.date().isoformat(),
-        "convergence": [],
-        "politicianBuys": [],
-        "politicianSells": [],
-        "crypto": {"buys": [], "sells": [], "rawBuys": [], "rawSells": [], "raw": [], "topCoins": TOP_COINS},
-        "note": note,
-    }
-
-
 @app.get("/report/today")
 def report_today(
     window_days: Optional[int] = Query(default=None, ge=1, le=365),
-    windowDays: Optional[int] = Query(default=None, ge=1, le=365),
     horizon_days: Optional[int] = Query(default=None, ge=1, le=365),
-    horizonDays: Optional[int] = Query(default=None, ge=1, le=365),
 ):
-    # Accept snake + camel + old alias
-    days = (
-        window_days
-        if window_days is not None
-        else windowDays
-        if windowDays is not None
-        else horizon_days
-        if horizon_days is not None
-        else horizonDays
-        if horizonDays is not None
-        else 30
-    )
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
+
+    days = window_days if window_days is not None else horizon_days if horizon_days is not None else 30
 
     now = datetime.now(timezone.utc)
-    since = now - timedelta(days=int(days))
-
-    if not QUIVER_TOKEN:
-        # Do not 500 the whole UI. Return empty and explain.
-        return _empty_congress_payload(now, since, int(days), note="QUIVER_TOKEN missing in backend environment.")
+    since = now - timedelta(days=days)
 
     q = quiverquant.quiver(QUIVER_TOKEN)
-    try:
-        df = q.congress_trading()
-    except Exception as e:
-        return _empty_congress_payload(now, since, int(days), note=f"Quiver error: {type(e).__name__}: {str(e)}")
+    df = q.congress_trading()
 
     if df is None or len(df) == 0:
-        return _empty_congress_payload(now, since, int(days), note="No congress trading rows returned by Quiver for this pull.")
+        return {
+            "date": now.date().isoformat(),
+            "windowDays": days,
+            "windowStart": since.date().isoformat(),
+            "windowEnd": now.date().isoformat(),
+            "convergence": [],
+            "politicianBuys": [],
+            "politicianSells": [],
+            "crypto": {"buys": [], "sells": [], "rawBuys": [], "rawSells": [], "raw": []},
+        }
 
     try:
         rows = df.to_dict(orient="records")
@@ -1356,7 +1509,7 @@ def report_today(
 
     return {
         "date": now.date().isoformat(),
-        "windowDays": int(days),
+        "windowDays": days,
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "convergence": overlap_cards[:25],
@@ -1369,42 +1522,21 @@ def report_today(
 @app.get("/report/holdings/common")
 def report_holdings_common(
     window_days: int = Query(default=365, ge=30, le=365),
-    windowDays: Optional[int] = Query(default=None, ge=30, le=365),
     top_n: int = Query(default=30, ge=5, le=100),
 ):
-    wd = int(windowDays) if windowDays is not None else int(window_days)
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(days=wd)
-
     if not QUIVER_TOKEN:
-        return {
-            "date": now.date().isoformat(),
-            "windowDays": wd,
-            "windowStart": since.date().isoformat(),
-            "windowEnd": now.date().isoformat(),
-            "commonHoldings": [],
-            "meta": {"uniquePoliticians": 0, "uniqueTickers": 0, "topN": top_n},
-            "note": "QUIVER_TOKEN missing in backend environment.",
-        }
+        raise HTTPException(500, "QUIVER_TOKEN missing")
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=window_days)
 
     q = quiverquant.quiver(QUIVER_TOKEN)
-    try:
-        df = q.congress_trading()
-    except Exception as e:
-        return {
-            "date": now.date().isoformat(),
-            "windowDays": wd,
-            "windowStart": since.date().isoformat(),
-            "windowEnd": now.date().isoformat(),
-            "commonHoldings": [],
-            "meta": {"uniquePoliticians": 0, "uniqueTickers": 0, "topN": top_n},
-            "note": f"Quiver error: {type(e).__name__}: {str(e)}",
-        }
+    df = q.congress_trading()
 
     if df is None or len(df) == 0:
         return {
             "date": now.date().isoformat(),
-            "windowDays": wd,
+            "windowDays": window_days,
             "windowStart": since.date().isoformat(),
             "windowEnd": now.date().isoformat(),
             "commonHoldings": [],
@@ -1443,7 +1575,7 @@ def report_holdings_common(
 
     return {
         "date": now.date().isoformat(),
-        "windowDays": wd,
+        "windowDays": window_days,
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "commonHoldings": common,
@@ -1455,41 +1587,21 @@ def report_holdings_common(
 @app.get("/report/congress/daily")
 def report_congress_daily(
     window_days: int = Query(default=14, ge=1, le=365),
-    windowDays: Optional[int] = Query(default=None, ge=1, le=365),
     limit: int = Query(default=200, ge=50, le=1000),
 ):
-    wd = int(windowDays) if windowDays is not None else int(window_days)
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
 
     now = datetime.now(timezone.utc)
-    since = now - timedelta(days=wd)
-
-    if not QUIVER_TOKEN:
-        return {
-            "date": now.date().isoformat(),
-            "windowDays": wd,
-            "windowStart": since.date().isoformat(),
-            "windowEnd": now.date().isoformat(),
-            "days": [],
-            "note": "QUIVER_TOKEN missing in backend environment.",
-        }
+    since = now - timedelta(days=window_days)
 
     q = quiverquant.quiver(QUIVER_TOKEN)
-    try:
-        df = q.congress_trading()
-    except Exception as e:
-        return {
-            "date": now.date().isoformat(),
-            "windowDays": wd,
-            "windowStart": since.date().isoformat(),
-            "windowEnd": now.date().isoformat(),
-            "days": [],
-            "note": f"Quiver error: {type(e).__name__}: {str(e)}",
-        }
+    df = q.congress_trading()
 
     if df is None or len(df) == 0:
         return {
             "date": now.date().isoformat(),
-            "windowDays": wd,
+            "windowDays": window_days,
             "windowStart": since.date().isoformat(),
             "windowEnd": now.date().isoformat(),
             "days": [],
@@ -1556,16 +1668,16 @@ def report_congress_daily(
     items.sort(key=sort_key, reverse=True)
     items = items[:limit]
 
-    days_map: Dict[str, List[dict]] = {}
+    days: Dict[str, List[dict]] = {}
     for it in items:
         d = it.get("filed") or it.get("traded") or it.get("bestDate") or now.date().isoformat()
-        days_map.setdefault(d, []).append(it)
+        days.setdefault(d, []).append(it)
 
-    day_list = [{"date": d, "items": days_map[d]} for d in sorted(days_map.keys(), reverse=True)]
+    day_list = [{"date": d, "items": days[d]} for d in sorted(days.keys(), reverse=True)]
 
     return {
         "date": now.date().isoformat(),
-        "windowDays": wd,
+        "windowDays": window_days,
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
         "days": day_list,
@@ -1574,7 +1686,7 @@ def report_congress_daily(
 
 
 # =========================================================
-# Crypto News Briefing (kept robust)
+# Crypto News Briefing (kept from your version)
 # =========================================================
 CRYPTO_OUTLETS = [
     {"name": "CoinDesk", "rss": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
@@ -1666,7 +1778,7 @@ def crypto_news_briefing(
         if "SHIB" not in coin_list:
             coin_list.insert(0, "SHIB")
 
-    key = f"crypto:brief:v3:{','.join(coin_list)}:{include_top_n}"
+    key = f"crypto:brief:v2:{','.join(coin_list)}:{include_top_n}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1718,6 +1830,7 @@ def crypto_news_briefing(
                 })
 
         heads = _dedup_items(heads, max_items=18)
+
         titles = [h["title"] for h in heads]
         all_titles_for_overall.extend(titles[:6])
 
