@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.4.0")
+app = FastAPI(title="Finance Signals Backend", version="4.5.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -66,14 +66,14 @@ SESSION = requests.Session()
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.4.0"}
+    return {"status": "ok", "version": "4.5.0"}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "4.4.0",
+        "version": "4.5.0",
         "hasQuiverToken": bool(QUIVER_TOKEN),
         "hasFinnhubKey": bool(FINNHUB_API_KEY),
         "utc": datetime.now(timezone.utc).isoformat(),
@@ -423,8 +423,24 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return 100.0 * (a / b - 1.0)
+
+
+def _sma(vals: List[float], n: int) -> Optional[float]:
+    if n <= 0 or len(vals) < n:
+        return None
+    return sum(vals[-n:]) / n
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
 # =========================================================
-# Nasdaq quotes + chart (primary market data source)
+# Nasdaq quotes + chart (secondary market data source)
 # =========================================================
 def _nasdaq_assetclass_for_symbol(symbol: str) -> str:
     s = (symbol or "").upper().strip()
@@ -491,7 +507,6 @@ def _nasdaq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
 
     out: List[Tuple[datetime, float]] = []
     for pt in chart:
-        # Nasdaq tends to return: { date: "01/31/2026", value: "487.12" } or similar.
         d = pt.get("date") or pt.get("x") or pt.get("label")
         v = pt.get("value") or pt.get("y") or pt.get("close") or pt.get("last")
         if not d or v is None:
@@ -506,7 +521,6 @@ def _nasdaq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
             except Exception:
                 continue
         if dt is None:
-            # Sometimes includes time, try parse_dt_any
             dt2 = parse_dt_any(ds)
             if dt2:
                 dt = dt2.astimezone(timezone.utc)
@@ -517,23 +531,6 @@ def _nasdaq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
 
     out.sort(key=lambda x: x[0])
     return out
-
-
-def _nasdaq_last_and_prev(symbol: str) -> Tuple[Optional[float], Optional[float]]:
-    q = _nasdaq_quote(symbol)
-    data = (q or {}).get("data") or {}
-    primary = data.get("primaryData") or {}
-    secondary = data.get("secondaryData") or {}
-    key_stats = data.get("keyStats") or {}
-
-    last = _safe_float(primary.get("lastSalePrice") or primary.get("lastSale") or primary.get("last"))
-    prev = _safe_float(primary.get("previousClose") or secondary.get("previousClose") or key_stats.get("PreviousClose"))
-
-    # Some payloads use "lastSalePrice" but previous close can be nested in "keyStats"
-    if prev is None:
-        prev = _safe_float(key_stats.get("PreviousClose") or key_stats.get("previousClose"))
-
-    return last, prev
 
 
 # =========================================================
@@ -633,7 +630,7 @@ def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
 
 
 # =========================================================
-# Finnhub (optional)
+# Finnhub (primary when key is present)
 # =========================================================
 def _finnhub_quote(symbol: str) -> dict:
     if not FINNHUB_API_KEY:
@@ -651,20 +648,82 @@ def _finnhub_quote(symbol: str) -> dict:
     return r.json() if r.text else {}
 
 
-def _pct(a: float, b: float) -> float:
-    if b == 0:
-        return 0.0
-    return 100.0 * (a / b - 1.0)
+def _finnhub_candles(symbol: str, days: int = 400) -> List[Tuple[datetime, float]]:
+    """
+    Finnhub daily candles endpoint returns:
+      { c: [...], t: [...], s: 'ok' }
+    We only need (date, close).
+    """
+    if not FINNHUB_API_KEY:
+        raise RuntimeError("FINNHUB_API_KEY missing")
+    if _is_cooled_down("finnhub_candles"):
+        raise RuntimeError("Finnhub candles in cooldown")
+
+    # Request a bigger window than needed to ensure we always have 200 trading days.
+    to_dt = datetime.now(timezone.utc)
+    from_dt = to_dt - timedelta(days=int(max(60, min(1200, days))))
+    url = "https://finnhub.io/api/v1/stock/candle"
+    params = {
+        "symbol": symbol,
+        "resolution": "D",
+        "from": int(from_dt.timestamp()),
+        "to": int(to_dt.timestamp()),
+        "token": FINNHUB_API_KEY,
+    }
+    r = _requests_get(url, params=params, timeout=14, headers=UA_HEADERS)
+    if r.status_code == 429:
+        _cooldown("finnhub_candles", 5 * 60)
+        raise RuntimeError("Finnhub candles rate limited (HTTP 429)")
+    r.raise_for_status()
+
+    j = r.json() if r.text else {}
+    if not isinstance(j, dict):
+        return []
+
+    if (j.get("s") or "").lower() != "ok":
+        # Finnhub uses "no_data" sometimes
+        return []
+
+    closes = j.get("c") or []
+    ts = j.get("t") or []
+    if not closes or not ts or len(closes) != len(ts):
+        return []
+
+    out: List[Tuple[datetime, float]] = []
+    for t, c in zip(ts, closes):
+        if c is None:
+            continue
+        try:
+            dt = datetime.fromtimestamp(int(t), tz=timezone.utc)
+            out.append((dt, float(c)))
+        except Exception:
+            continue
+
+    out.sort(key=lambda x: x[0])
+    # De-dup by date (sometimes providers can repeat)
+    dedup: List[Tuple[datetime, float]] = []
+    last_day = None
+    for dt, c in out:
+        day = dt.date()
+        if last_day == day:
+            dedup[-1] = (dt, c)
+        else:
+            dedup.append((dt, c))
+            last_day = day
+    return dedup
 
 
-def _sma(vals: List[float], n: int) -> Optional[float]:
-    if n <= 0 or len(vals) < n:
-        return None
-    return sum(vals[-n:]) / n
-
-
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, float(x)))
+def _try_finnhub_candles_any(symbols: List[str], days: int, errors: List[str]) -> List[Tuple[datetime, float]]:
+    if not FINNHUB_API_KEY:
+        return []
+    for sym in symbols:
+        try:
+            c = _finnhub_candles(sym, days=days)
+            if len(c) >= 2:
+                return c
+        except Exception as e:
+            errors.append(f"Finnhub candles {sym}: {type(e).__name__}: {str(e)}")
+    return []
 
 
 # =========================================================
@@ -736,7 +795,13 @@ def _compute_returns_from_closes(closes: List[Tuple[datetime, float]]) -> dict:
 
 
 def _try_get_spy_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
-    # Primary: Nasdaq chart
+    # Primary: Finnhub candles
+    if FINNHUB_API_KEY:
+        c = _try_finnhub_candles_any(["SPY"], days=420, errors=errors)
+        if len(c) >= 2:
+            return c
+
+    # Secondary: Nasdaq chart
     try:
         c = _nasdaq_daily_closes("SPY")
         if len(c) >= 2:
@@ -744,19 +809,7 @@ def _try_get_spy_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
     except Exception as e:
         errors.append(f"Nasdaq SPY: {type(e).__name__}: {str(e)}")
 
-    # Secondary: Finnhub (2 points)
-    if FINNHUB_API_KEY:
-        try:
-            q = _finnhub_quote("SPY")
-            c = float(q.get("c") or 0.0)
-            pc = float(q.get("pc") or 0.0)
-            if c > 0 and pc > 0:
-                now = datetime.now(timezone.utc)
-                return [(now - timedelta(days=1), pc), (now, c)]
-        except Exception as e:
-            errors.append(f"Finnhub SPY: {type(e).__name__}: {str(e)}")
-
-    # Last resort: Stooq
+    # Tertiary: Stooq
     try:
         return _stooq_daily_closes("spy.us")
     except Exception as e:
@@ -772,7 +825,13 @@ def _try_get_spy_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
 
 
 def _try_get_vix_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
-    # Primary: Nasdaq chart (VIX)
+    # Primary: Finnhub candles, try variants
+    if FINNHUB_API_KEY:
+        c = _try_finnhub_candles_any(["VIX", "^VIX", "VIX.IND"], days=420, errors=errors)
+        if len(c) >= 2:
+            return c
+
+    # Secondary: Nasdaq chart (VIX)
     try:
         c = _nasdaq_daily_closes("VIX")
         if len(c) >= 2:
@@ -780,19 +839,7 @@ def _try_get_vix_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
     except Exception as e:
         errors.append(f"Nasdaq VIX: {type(e).__name__}: {str(e)}")
 
-    # Secondary: Finnhub (2 points)
-    if FINNHUB_API_KEY:
-        try:
-            q = _finnhub_quote("VIX")
-            c = float(q.get("c") or 0.0)
-            pc = float(q.get("pc") or 0.0)
-            if c > 0 and pc > 0:
-                now = datetime.now(timezone.utc)
-                return [(now - timedelta(days=1), pc), (now, c)]
-        except Exception as e:
-            errors.append(f"Finnhub VIX: {type(e).__name__}: {str(e)}")
-
-    # Last resort: Stooq
+    # Tertiary: Stooq
     try:
         return _stooq_daily_closes("vix")
     except Exception as e:
@@ -809,7 +856,7 @@ def _try_get_vix_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
 
 @app.get("/market/snapshot")
 def market_snapshot():
-    key = "market:snapshot:v4"
+    key = "market:snapshot:v5"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -863,11 +910,11 @@ def market_snapshot():
 
 
 # =========================================================
-# Market Entry Index (Nasdaq primary)
+# Market Entry Index (Finnhub candles primary)
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
-    key = f"market:entry:v4:{window_days}"
+    key = f"market:entry:v5:{window_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -878,18 +925,25 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     spy: List[Tuple[datetime, float]] = []
     vix: List[Tuple[datetime, float]] = []
 
-    # Primary: Nasdaq chart
-    try:
-        spy = _nasdaq_daily_closes("SPY")
-    except Exception as e:
-        err_notes.append(f"Nasdaq SPY: {type(e).__name__}: {str(e)}")
+    # Primary: Finnhub candles
+    if FINNHUB_API_KEY:
+        spy = _try_finnhub_candles_any(["SPY"], days=max(260, window_days + 60), errors=err_notes)
+        vix = _try_finnhub_candles_any(["VIX", "^VIX", "VIX.IND"], days=max(120, window_days + 60), errors=err_notes)
 
-    try:
-        vix = _nasdaq_daily_closes("VIX")
-    except Exception as e:
-        err_notes.append(f"Nasdaq VIX: {type(e).__name__}: {str(e)}")
+    # Secondary: Nasdaq chart
+    if len(spy) < 210:
+        try:
+            spy = _nasdaq_daily_closes("SPY")
+        except Exception as e:
+            err_notes.append(f"Nasdaq SPY: {type(e).__name__}: {str(e)}")
 
-    # Secondary: Stooq
+    if len(vix) < 30:
+        try:
+            vix = _nasdaq_daily_closes("VIX")
+        except Exception as e:
+            err_notes.append(f"Nasdaq VIX: {type(e).__name__}: {str(e)}")
+
+    # Tertiary: Stooq
     if len(spy) < 210:
         try:
             spy = _stooq_daily_closes("spy.us")
@@ -902,7 +956,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         except Exception as e:
             err_notes.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
 
-    # Tertiary: Yahoo
+    # Last resort: Yahoo
     if len(spy) < 210:
         try:
             spy = _yahoo_closes("SPY", range_str="1y", interval="1d")
@@ -945,8 +999,32 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     spy_sorted = sorted(spy, key=lambda x: x[0])
     vix_sorted = sorted(vix, key=lambda x: x[0])
 
+    # Trim to window_days (calendar), still leave enough for SMA200
+    cutoff = now - timedelta(days=window_days + 60)
+    spy_sorted = [(d, c) for d, c in spy_sorted if d >= cutoff]
+    vix_sorted = [(d, c) for d, c in vix_sorted if d >= cutoff]
+
     spy_vals = [c for _, c in spy_sorted]
     vix_vals = [c for _, c in vix_sorted]
+
+    if len(spy_vals) < 210 or len(vix_vals) < 30:
+        out = {
+            "date": now.date().isoformat(),
+            "score": 0,
+            "regime": "NEUTRAL",
+            "signal": "DATA UNAVAILABLE",
+            "notes": "Insufficient market data after window trim." + ((" | " + " | ".join(err_notes)) if err_notes else ""),
+            "components": {
+                "spxTrend": 0.5,
+                "vix": 0.5,
+                "breadth": 0.5,
+                "credit": 0.5,
+                "rates": 0.5,
+                "buffettProxy": 0.5,
+            },
+            "errors": err_notes,
+        }
+        return cache_set(key, out, ttl_seconds=90, stale_ttl_seconds=900)
 
     price = float(spy_vals[-1])
     v = float(vix_vals[-1])
