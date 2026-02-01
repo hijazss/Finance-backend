@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.2.1")
+app = FastAPI(title="Finance Signals Backend", version="4.2.2")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -47,7 +47,7 @@ UA_HEADERS = {
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.2.1"}
+    return {"status": "ok", "version": "4.2.2"}
 
 
 # =========================================================
@@ -240,7 +240,7 @@ def to_card(x: dict, kind: str) -> dict:
 
 
 # =========================================================
-# Crypto detection
+# Crypto detection (disclosures)
 # =========================================================
 TOP_COINS = ["BTC", "ETH", "SOL", "LINK", "XRP", "ADA", "DOGE", "AVAX", "MATIC", "BNB"]
 
@@ -371,7 +371,6 @@ def _requests_get(url: str, params: Optional[dict] = None, timeout: int = 14) ->
 
 
 def _yahoo_chart(symbol: str, range_str: str = "6mo", interval: str = "1d") -> dict:
-    # Cooldown handling for Yahoo rate limits
     if _is_cooled_down("yahoo"):
         raise RuntimeError("Yahoo in cooldown (rate-limit backoff)")
 
@@ -408,8 +407,6 @@ def _yahoo_closes(symbol: str, range_str: str = "6mo", interval: str = "1d") -> 
 
 
 def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
-    # Stooq CSV: https://stooq.com/q/d/l/?s=spy.us&i=d
-    # symbol examples: "spy.us", "vix"
     if _is_cooled_down("stooq"):
         raise RuntimeError("Stooq in cooldown")
 
@@ -525,7 +522,6 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
         }
         return cache_set(key, out, ttl_seconds=600)
     except Exception as e:
-        # Cache failures briefly so the UI does not spam CNN either
         return cache_set(
             key,
             {
@@ -539,7 +535,7 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
 
 
 # =========================================================
-# Market Snapshot (UPDATED: cache + cooldown + fallbacks)
+# Market Snapshot (cache + cooldown + fallbacks)
 # =========================================================
 def _compute_returns_from_closes(closes: List[Tuple[datetime, float]]) -> dict:
     if not closes or len(closes) < 2:
@@ -562,7 +558,6 @@ def _compute_returns_from_closes(closes: List[Tuple[datetime, float]]) -> dict:
 
 
 def _try_get_spy_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
-    # Prefer Finnhub if configured (more stable), else Yahoo, else Stooq.
     if FINNHUB_API_KEY:
         try:
             q = _finnhub_quote("SPY")
@@ -570,10 +565,7 @@ def _try_get_spy_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
             pc = float(q.get("pc") or 0.0)
             if c > 0 and pc > 0:
                 now = datetime.now(timezone.utc)
-                return [
-                    (now - timedelta(days=1), pc),
-                    (now, c),
-                ]
+                return [(now - timedelta(days=1), pc), (now, c)]
         except Exception as e:
             errors.append(f"Finnhub SPY: {type(e).__name__}: {str(e)}")
 
@@ -598,10 +590,7 @@ def _try_get_vix_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
             pc = float(q.get("pc") or 0.0)
             if c > 0 and pc > 0:
                 now = datetime.now(timezone.utc)
-                return [
-                    (now - timedelta(days=1), pc),
-                    (now, c),
-                ]
+                return [(now - timedelta(days=1), pc), (now, c)]
         except Exception as e:
             errors.append(f"Finnhub VIX: {type(e).__name__}: {str(e)}")
 
@@ -611,8 +600,6 @@ def _try_get_vix_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
         errors.append(f"Yahoo VIX: {type(e).__name__}: {str(e)}")
 
     try:
-        # Stooq has vix as "vix" sometimes, but it can vary.
-        # We still try as a last resort.
         return _stooq_daily_closes("vix")
     except Exception as e:
         errors.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
@@ -622,13 +609,6 @@ def _try_get_vix_closes(errors: List[str]) -> List[Tuple[datetime, float]]:
 
 @app.get("/market/snapshot")
 def market_snapshot():
-    """
-    Rate-limit safe market context:
-    - SPY (proxy for S&P 500) level + 1D/5D/1M returns (best-effort)
-    - VIX level + 1D delta (best-effort)
-    - Fear & Greed score + label (best-effort)
-    """
-    # Strong cache so refresh spam does not hammer providers.
     key = "market:snapshot:v2"
     cached = cache_get(key)
     if cached is not None:
@@ -638,7 +618,6 @@ def market_snapshot():
     out = {"date": now.date().isoformat(), "sp500": {}, "vix": {}, "fearGreed": {}, "errors": []}
     errors: List[str] = []
 
-    # Try SPY from providers
     spy_closes = _try_get_spy_closes(errors)
     spy_ret = _compute_returns_from_closes(spy_closes)
     out["sp500"] = {
@@ -649,7 +628,6 @@ def market_snapshot():
         "ret1mPct": spy_ret.get("ret1mPct"),
     }
 
-    # Try VIX from providers
     vix_closes = _try_get_vix_closes(errors)
     if vix_closes and len(vix_closes) >= 2:
         closes = [c for _, c in sorted(vix_closes, key=lambda x: x[0])]
@@ -661,7 +639,6 @@ def market_snapshot():
     else:
         out["vix"] = {"symbol": "^VIX", "last": None, "chg1d": None}
 
-    # Fear and greed: best-effort, cached separately inside its endpoint
     try:
         fg = market_fear_greed(None)
         out["fearGreed"] = {"score": fg.get("score"), "rating": fg.get("rating")}
@@ -671,7 +648,6 @@ def market_snapshot():
 
     out["errors"] = errors
 
-    # If live fetch failed badly, return last good snapshot if present
     last_good = cache_get("market:snapshot:last_good")
     if (out["sp500"].get("last") is None) and last_good:
         last_good = dict(last_good)
@@ -680,7 +656,6 @@ def market_snapshot():
         last_good["errors"] = last_good_errors
         return cache_set(key, last_good, ttl_seconds=90)
 
-    # Save last good
     if out["sp500"].get("last") is not None:
         cache_set("market:snapshot:last_good", out, ttl_seconds=3600)
 
@@ -688,11 +663,10 @@ def market_snapshot():
 
 
 # =========================================================
-# Market Entry Index (UPDATED: caching + last-good fallback)
+# Market Entry Index (caching + last-good fallback)
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
-    # Cache to prevent repeated provider hits on refresh
     key = f"market:entry:v2:{window_days}"
     cached = cache_get(key)
     if cached is not None:
@@ -701,13 +675,10 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
     now = datetime.now(timezone.utc)
     err_notes: List[str] = []
 
-    # Try to reuse snapshot cache so we do not re-hit providers
     snap = market_snapshot()
     spy_last = (snap.get("sp500") or {}).get("last")
     vix_last = (snap.get("vix") or {}).get("last")
 
-    # We still want historical series for SMA50/SMA200.
-    # Prefer Yahoo (if not cooled down), else Stooq.
     spy: List[Tuple[datetime, float]] = []
     vix: List[Tuple[datetime, float]] = []
 
@@ -731,7 +702,6 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
             err_notes.append(f"Stooq VIX: {type(e2).__name__}: {str(e2)}")
             vix = []
 
-    # If series are insufficient, fallback to last good entry if available
     if len(spy) < 210 or len(vix) < 30:
         last_good = cache_get("market:entry:last_good")
         if last_good:
@@ -764,7 +734,6 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
 
     price = float(spy_close[-1])
     if spy_last is not None:
-        # If snapshot had a fresher value, use it for display, keep SMA from history
         try:
             price = float(spy_last)
         except Exception:
@@ -825,7 +794,6 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
         "errors": err_notes,
     }
 
-    # Save last good entry
     cache_set("market:entry:last_good", out, ttl_seconds=3600)
     return cache_set(key, out, ttl_seconds=180)
 
@@ -912,286 +880,130 @@ def _headline_sentiment(headlines: List[str]) -> Dict[str, Any]:
     return {"label": label, "score": gauge, "pos": pos, "neg": neg, "total": total}
 
 
-@app.get("/news/top")
-def news_top(max_items: int = Query(default=30, ge=10, le=100)):
-    feeds = [
-        "https://www.yahoo.com/news/rss/finance",
-        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-        "https://www.marketwatch.com/rss/topstories",
-    ]
-
-    items: List[dict] = []
-    errors: List[str] = []
-
-    for f in feeds:
-        try:
-            it = _fetch_rss_items(f, max_items=max_items)
-            for x in it:
-                x["sourceFeed"] = f
-            items.extend(it)
-        except Exception as e:
-            errors.append(f"{f} -> {type(e).__name__}: {str(e)}")
-
-    seen = set()
-    deduped = []
-    for x in items:
-        lk = (x.get("link") or "").strip()
-        if not lk or lk in seen:
-            continue
-        seen.add(lk)
-        deduped.append(x)
-
-    deduped = deduped[:max_items]
-    sentiment = _headline_sentiment([x.get("title", "") for x in deduped])
-
-    return {
-        "date": datetime.now(timezone.utc).date().isoformat(),
-        "items": deduped,
-        "sentiment": sentiment,
-        "errors": errors,
-        "note": "Sentiment is a lightweight headline-based gauge, not a price predictor.",
-    }
-
-
-@app.get("/news/watchlist")
-def news_watchlist(
-    tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
-    max_items_per_ticker: int = Query(default=8, ge=3, le=25),
-):
-    syms = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-    syms = syms[:40]
-
-    all_items: Dict[str, List[dict]] = {}
-    errors: List[str] = []
-
-    for t in syms:
-        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(t)}&region=US&lang=en-US"
-        try:
-            it = _fetch_rss_items(url, max_items=max_items_per_ticker)
-            for x in it:
-                x["ticker"] = t
-                x["sourceFeed"] = "yahoo_ticker_rss"
-            all_items[t] = it
-        except Exception as e:
-            errors.append(f"{t}: {type(e).__name__}: {str(e)}")
-            all_items[t] = []
-
-    headlines = []
-    for t in syms:
-        headlines.extend([x.get("title", "") for x in all_items.get(t, [])])
-
-    sentiment = _headline_sentiment(headlines)
-
-    return {
-        "date": datetime.now(timezone.utc).date().isoformat(),
-        "tickers": syms,
-        "itemsByTicker": all_items,
-        "sentiment": sentiment,
-        "errors": errors,
-        "note": "Ticker news via Yahoo RSS. If a ticker has no feed items, it may be temporarily empty.",
-    }
-
-
 # =========================================================
-# News briefing
+# News briefing endpoints
 # =========================================================
-DEFAULT_SECTORS = [
-    "AI",
-    "Medical",
-    "Energy",
-    "Robotics",
-    "Infrastructure",
-    "Semiconductors",
-    "Cloud",
-    "Cybersecurity",
-    "Defense",
-    "Financials",
-    "Consumer",
-]
-
-SECTOR_QUERIES = {
-    "AI": [
-        "artificial intelligence OR AI chips OR foundation models OR inference OR datacenter AI",
-        "NVIDIA OR NVDA OR AMD OR ARM OR hyperscalers AI",
-    ],
-    "Medical": [
-        "biotech OR medtech OR medical devices OR FDA approval OR clinical trial",
-        "healthcare AI OR radiology AI OR genomics",
-    ],
-    "Energy": [
-        "oil OR OPEC OR crude OR LNG OR refinery",
-        "solar OR wind OR nuclear OR grid OR battery storage",
-    ],
-    "Robotics": [
-        "robotics OR humanoid robots OR automation OR industrial robots",
-        "warehouse robots OR autonomous systems",
-    ],
-    "Infrastructure": [
-        "infrastructure spending OR data center buildout OR power grid upgrade",
-        "construction materials OR industrials",
-    ],
-    "Semiconductors": [
-        "semiconductor OR chip shortage OR fab OR foundry OR lithography",
-        "TSMC OR ASML OR Intel OR Samsung foundry",
-    ],
-    "Cloud": [
-        "cloud computing OR AWS OR Azure OR Google Cloud OR enterprise software",
-    ],
-    "Cybersecurity": [
-        "cybersecurity OR ransomware OR breach OR zero trust",
-    ],
-    "Defense": [
-        "defense spending OR missiles OR drones OR aerospace defense",
-    ],
-    "Financials": [
-        "banks OR credit OR regional banks OR liquidity OR net interest margin",
-    ],
-    "Consumer": [
-        "retail OR consumer spending OR inflation impact OR pricing power",
-    ],
-}
-
-
 def _google_news_rss(query: str) -> str:
     q = quote_plus(query)
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 
-_TICKER_MENTION_RE = re.compile(r"\b([A-Z]{1,5})\b")
-_STOP_TICKERS = set(["A", "I", "AI", "US", "FED", "USA", "CEO", "EPS", "IPO", "ETF", "FDA", "SEC", "DOJ", "EU"])
-
-
-def _extract_tickers_from_titles(titles: List[str], watchlist: List[str]) -> Dict[str, int]:
-    wl = set([t.upper() for t in watchlist if t])
-    counts: Dict[str, int] = {}
-    for title in titles:
-        for m in _TICKER_MENTION_RE.findall(title or ""):
-            t = m.upper()
-            if t in _STOP_TICKERS:
-                continue
-            if t in wl:
-                counts[t] = counts.get(t, 0) + 1
-    return counts
-
-
-def _brief_paragraph_from_headlines(headlines: List[str], sector: str) -> str:
-    if not headlines:
-        return f"No major {sector} headlines in the current pull."
-    h = " ".join(headlines[:10]).lower()
-    themes = []
-
-    def has_any(words):
-        return any(w in h for w in words)
-
-    if has_any(["earnings", "revenue", "guidance", "forecast", "margin"]):
-        themes.append("earnings and guidance are a key driver")
-    if has_any(["rates", "yield", "inflation", "fed", "cuts", "hike"]):
-        themes.append("rates and inflation expectations remain influential")
-    if has_any(["data center", "datacenter", "gpu", "chips", "semiconductor", "foundry"]):
-        themes.append("compute supply chain and data center buildout are in focus")
-    if has_any(["regulation", "doj", "sec", "antitrust", "probe", "lawsuit"]):
-        themes.append("regulatory and legal risk is present")
-    if has_any(["geopolitical", "china", "taiwan", "ukraine", "middle east"]):
-        themes.append("geopolitical risk is affecting sentiment")
-    if has_any(["capex", "spending", "buildout", "infrastructure", "grid"]):
-        themes.append("capex and buildout signals are showing up")
-
-    if not themes:
-        themes = ["headlines are mixed and mostly event-driven"]
-
-    s = "; ".join(themes[:3])
-    return f"{sector}: {s}."
-
-
-def _implications(sector: str, sentiment_score: int) -> str:
-    if sentiment_score >= 60:
-        return f"{sector}: headline tone is supportive. If it persists, the next 1 to 3 months often favor momentum and multiple expansion in the strongest names."
-    if sentiment_score <= 40:
-        return f"{sector}: headline tone is risk-off. If it persists, expect choppier price action and a preference for quality balance sheets and clear catalysts."
-    return f"{sector}: headline tone is neutral. If the macro backdrop stays steady, relative winners tend to be those with near-term catalysts or strong guidance."
-
-
 @app.get("/news/briefing")
 def news_briefing(
-    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
-    watchlist: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
-    max_items_per_sector: int = Query(default=12, ge=5, le=40),
+    tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
+    max_general: int = Query(default=55, ge=10, le=200),
+    max_per_ticker: int = Query(default=6, ge=2, le=25),
 ):
-    key = f"briefing:{sectors}:{watchlist}:{max_items_per_sector}"
+    """
+    Your frontend expects /news/briefing.
+    This returns sector-like grouping using Google News RSS for general plus Yahoo ticker RSS for watchlist.
+    """
+    key = f"news:brief:{tickers}:{max_general}:{max_per_ticker}"
     cached = cache_get(key)
     if cached is not None:
         return cached
 
-    sector_list = [s.strip() for s in sectors.split(",") if s.strip()]
-    if not sector_list:
-        sector_list = DEFAULT_SECTORS
+    syms = [t.strip().upper() for t in (tickers or "").split(",") if t.strip()]
+    syms = syms[:50]
 
-    wl = [t.strip().upper() for t in watchlist.split(",") if t.strip()]
-    wl = wl[:60]
+    errors: Dict[str, List[str]] = {"general": [], "watchlist": []}
 
-    market = market_snapshot()
-    sector_tiles: List[dict] = []
-    errors: List[str] = []
+    # General pull
+    general_queries = [
+        "markets stocks macro inflation fed earnings",
+        "AI semiconductors datacenter nvidia amd",
+        "energy oil opec natural gas",
+        "healthcare biotech fda clinical trial",
+        "crypto bitcoin ethereum etf",
+    ]
 
-    for sec in sector_list:
-        queries = SECTOR_QUERIES.get(sec, [sec])
-        items: List[dict] = []
-        for q in queries[:2]:
-            url = _google_news_rss(q)
-            try:
-                got = _fetch_rss_items(url, max_items=max_items_per_sector)
-                for x in got:
-                    x["sourceFeed"] = "google_news_rss"
-                    x["sector"] = sec
-                items.extend(got)
-            except Exception as e:
-                errors.append(f"{sec}: {type(e).__name__}: {str(e)}")
+    general_items: List[dict] = []
+    for q in general_queries:
+        try:
+            items = _fetch_rss_items(_google_news_rss(q), max_items=max(10, max_general // len(general_queries)))
+            for x in items:
+                x["bucket"] = "General"
+            general_items.extend(items)
+        except Exception as e:
+            errors["general"].append(f"{type(e).__name__}: {str(e)}")
 
-        seen = set()
-        ded = []
-        for x in items:
-            lk = (x.get("link") or "").strip()
-            if not lk or lk in seen:
-                continue
-            seen.add(lk)
-            ded.append(x)
+    # Dedup general
+    seen = set()
+    gen_ded = []
+    for x in general_items:
+        lk = (x.get("link") or "").strip()
+        if not lk or lk in seen:
+            continue
+        seen.add(lk)
+        gen_ded.append(x)
+    gen_ded = gen_ded[:max_general]
 
-        ded = ded[:max_items_per_sector]
-        titles = [x.get("title", "") for x in ded]
+    # Watchlist pull (Yahoo RSS)
+    watch_items: List[dict] = []
+    for t in syms:
+        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(t)}&region=US&lang=en-US"
+        try:
+            items = _fetch_rss_items(url, max_items=max_per_ticker)
+            for x in items:
+                x["bucket"] = "Watchlist"
+                x["ticker"] = t
+            watch_items.extend(items)
+        except Exception as e:
+            errors["watchlist"].append(f"{t}: {type(e).__name__}: {str(e)}")
+
+    # Make simple "sector" groups by keyword buckets
+    def bucketize(title: str) -> str:
+        s = (title or "").lower()
+        if any(w in s for w in ["nvidia", "amd", "chip", "semiconductor", "ai", "datacenter"]):
+            return "AI"
+        if any(w in s for w in ["biotech", "fda", "clinical", "medical", "health"]):
+            return "Medical"
+        if any(w in s for w in ["oil", "opec", "gas", "energy", "lng"]):
+            return "Energy"
+        if any(w in s for w in ["robot", "automation", "humanoid"]):
+            return "Robotics"
+        if any(w in s for w in ["crypto", "bitcoin", "ethereum", "etf", "blockchain"]):
+            return "Crypto"
+        return "General"
+
+    sector_map: Dict[str, List[dict]] = {}
+    for x in (gen_ded + watch_items):
+        sec = bucketize(x.get("title", ""))
+        sector_map.setdefault(sec, []).append(x)
+
+    sectors_out = []
+    for sec, items in sector_map.items():
+        titles = [i.get("title", "") for i in items]
         sent = _headline_sentiment(titles)
-
-        ticker_mentions = _extract_tickers_from_titles(titles, wl)
-        top_mentions = [{"ticker": k, "count": v} for k, v in sorted(ticker_mentions.items(), key=lambda kv: (-kv[1], kv[0]))][:6]
-
-        tile = {
+        top = items[:12]
+        sectors_out.append({
             "sector": sec,
+            "count": len(items),
             "sentiment": sent,
-            "summary": _brief_paragraph_from_headlines(titles, sec),
-            "implications": _implications(sec, int(sent.get("score", 50) or 50)),
-            "topHeadlines": ded[:8],
-            "watchlistMentions": top_mentions,
-        }
-        sector_tiles.append(tile)
+            "summary": "",
+            "implications_2_12_weeks": [],
+            "headlines": top,
+        })
 
-    all_titles = []
-    for t in sector_tiles:
-        for h in t.get("topHeadlines", [])[:6]:
-            all_titles.append(h.get("title", "") or "")
-    overall_sent = _headline_sentiment(all_titles)
+    # Overall sentiment on top titles
+    overall = _headline_sentiment([x.get("title", "") for x in (gen_ded[:20] + watch_items[:20])])
 
     out = {
         "date": datetime.now(timezone.utc).date().isoformat(),
-        "market": market,
-        "overallSentiment": overall_sent,
-        "sectors": sector_tiles,
+        "overallSentiment": overall,
+        "sectors": sorted(sectors_out, key=lambda x: (-int(x["count"]), x["sector"])),
+        "sources": {
+            "general": "Google News RSS (queries)",
+            "watchlist": "Yahoo Finance RSS (per ticker)",
+        },
         "errors": errors,
-        "note": "Briefing uses RSS headline signals. Treat as context, not prediction.",
+        "note": "Headline grouping for context. Not a prediction engine.",
     }
     return cache_set(key, out, ttl_seconds=180)
 
 
 # =========================================================
-# Congress: /report/today
+# Congress endpoints your UI calls
 # =========================================================
 @app.get("/report/today")
 def report_today(
@@ -1363,9 +1175,6 @@ def report_today(
     }
 
 
-# =========================================================
-# Congress: holdings proxy endpoint your UI expects
-# =========================================================
 @app.get("/report/holdings/common")
 def report_holdings_common(
     window_days: int = Query(default=365, ge=30, le=365),
@@ -1431,9 +1240,6 @@ def report_holdings_common(
     }
 
 
-# =========================================================
-# Congress: day-by-day activity feed for UI
-# =========================================================
 @app.get("/report/congress/daily")
 def report_congress_daily(
     window_days: int = Query(default=14, ge=1, le=365),
@@ -1488,13 +1294,8 @@ def report_congress_daily(
 
         desc = str(pick_first(r, ["AssetDescription", "asset_description", "Description", "description", "Asset", "asset"], "")).strip()
 
-        cap_url = ""
-        if pol:
-            cap_url = "https://www.capitoltrades.com/politicians/" + quote_plus(pol)
-
-        ticker_url = ""
-        if ticker:
-            ticker_url = "https://www.capitoltrades.com/trades?search=" + quote_plus(ticker)
+        cap_url = "https://www.capitoltrades.com/politicians/" + quote_plus(pol) if pol else ""
+        ticker_url = "https://www.capitoltrades.com/trades?search=" + quote_plus(ticker) if ticker else ""
 
         items.append({
             "kind": kind,
@@ -1541,129 +1342,220 @@ def report_congress_daily(
 
 
 # =========================================================
-# Signals: scored list for Main tab
+# Crypto News Briefing (NEW endpoint your frontend needs)
 # =========================================================
-def _congress_ticker_agg(congress_payload: dict) -> Dict[str, dict]:
-    agg: Dict[str, dict] = {}
-    for arr_name, buy_mode in [("politicianBuys", True), ("politicianSells", False)]:
-        arr = congress_payload.get(arr_name) or []
-        if not isinstance(arr, list):
+CRYPTO_OUTLETS = [
+    {"name": "CoinDesk", "rss": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
+    {"name": "Cointelegraph", "rss": "https://cointelegraph.com/rss"},
+    {"name": "Decrypt", "rss": "https://decrypt.co/feed"},
+    {"name": "CryptoSlate", "rss": "https://cryptoslate.com/feed/"},
+    {"name": "Bitcoin Magazine", "rss": "https://bitcoinmagazine.com/.rss/full/"},
+]
+
+COIN_CANON = {
+    "BTC": {"name": "Bitcoin", "strict_terms": [r"\bbitcoin\b", r"\bBTC\b"]},
+    "ETH": {"name": "Ethereum", "strict_terms": [r"\bethereum\b", r"\bETH\b", r"\bether\b"]},
+    "SOL": {"name": "Solana", "strict_terms": [r"\bsolana\b", r"\bSOL\b"]},
+    "LINK": {"name": "Chainlink", "strict_terms": [r"\bchainlink\b", r"\bLINK\b"]},  # avoids generic "link"
+    "XRP": {"name": "XRP", "strict_terms": [r"\bxrp\b", r"\bripple\b"]},
+    "ADA": {"name": "Cardano", "strict_terms": [r"\bcardano\b", r"\bADA\b"]},
+    "DOGE": {"name": "Dogecoin", "strict_terms": [r"\bdogecoin\b", r"\bDOGE\b"]},
+    "AVAX": {"name": "Avalanche", "strict_terms": [r"\bavalanche\b", r"\bAVAX\b"]},
+    "MATIC": {"name": "Polygon", "strict_terms": [r"\bpolygon\b", r"\bMATIC\b"]},
+    "BNB": {"name": "BNB", "strict_terms": [r"\bBNB\b", r"\bbinance coin\b"]},
+}
+
+# A simple “catalyst” extractor from headlines.
+_CATALYST_KEYWORDS = [
+    "ETF", "SEC", "lawsuit", "approval", "hack", "exploit", "upgrade",
+    "fork", "mainnet", "airdrop", "staking", "rate", "Fed", "CPI",
+    "FOMC", "earnings", "regulation", "ban",
+]
+
+
+def _clean_coin_list(coins: str, include_top_n: int) -> List[str]:
+    raw = [c.strip().upper() for c in (coins or "").split(",") if c.strip()]
+    out: List[str] = []
+    for c in raw:
+        if c in COIN_CANON and c not in out:
+            out.append(c)
+    # If user list is empty, fall back to top_n canonical list
+    if not out:
+        base = list(COIN_CANON.keys())
+        return base[: max(1, min(30, include_top_n))]
+    # Expand to include top N if requested
+    if include_top_n and include_top_n > len(out):
+        for c in list(COIN_CANON.keys()):
+            if len(out) >= include_top_n:
+                break
+            if c not in out:
+                out.append(c)
+    return out[: max(1, min(30, include_top_n or 15))]
+
+
+def _matches_coin(title: str, symbol: str) -> bool:
+    t = (title or "").strip()
+    if not t:
+        return False
+    canon = COIN_CANON.get(symbol)
+    if not canon:
+        return False
+    for pat in canon["strict_terms"]:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
+    seen = set()
+    out = []
+    for x in items:
+        lk = (x.get("link") or "").strip()
+        ttl = (x.get("title") or "").strip()
+        key = lk or ttl
+        if not key or key in seen:
             continue
-        for x in arr:
-            t = str(x.get("ticker") or "").upper().strip()
-            if not t:
-                continue
-            cur = agg.get(t) or {"ticker": t, "buy": 0, "sell": 0, "dem": 0, "rep": 0, "last": ""}
-            dem = int(x.get("demBuyers") or 0) + int(x.get("demSellers") or 0)
-            rep = int(x.get("repBuyers") or 0) + int(x.get("repSellers") or 0)
-            cur["dem"] += dem
-            cur["rep"] += rep
-            if buy_mode:
-                cur["buy"] += int(x.get("demBuyers") or 0) + int(x.get("repBuyers") or 0)
-            else:
-                cur["sell"] += int(x.get("demSellers") or 0) + int(x.get("repSellers") or 0)
-            last = str(x.get("lastFiledAt") or "")
-            if last and (not cur["last"] or last > cur["last"]):
-                cur["last"] = last
-            agg[t] = cur
-    return agg
+        seen.add(key)
+        out.append(x)
+        if len(out) >= max_items:
+            break
+    return out
 
 
-def _score_row(cong: dict, news_mentions: int, sector_mentions: int) -> dict:
-    buy = int(cong.get("buy") or 0)
-    sell = int(cong.get("sell") or 0)
-    dem = int(cong.get("dem") or 0)
-    rep = int(cong.get("rep") or 0)
-
-    participation = buy + sell
-    net = buy - sell
-    bipartisan = min(dem, rep)
-
-    score = 0.0
-    score += 6.0 * participation
-    score += 5.0 * max(0, net)
-    score += 2.5 * bipartisan
-    score += 2.0 * news_mentions
-    score += 1.5 * sector_mentions
-
-    score_100 = int(max(0, min(100, round(100.0 * (1.0 - math.exp(-score / 25.0))))))
-
-    drivers = []
-    if participation >= 4:
-        drivers.append("high participation")
-    if net >= 2:
-        drivers.append("net accumulation")
-    if bipartisan >= 2:
-        drivers.append("bipartisan")
-    if news_mentions >= 2:
-        drivers.append("watchlist headlines")
-    if sector_mentions >= 2:
-        drivers.append("sector headlines")
-
-    return {
-        "ticker": cong.get("ticker"),
-        "score": score_100,
-        "congress": {
-            "buys": buy,
-            "sells": sell,
-            "net": net,
-            "bipartisan": bipartisan,
-            "lastFiledAt": cong.get("last") or "",
-        },
-        "news": {
-            "watchlistMentions": int(news_mentions),
-            "sectorMentions": int(sector_mentions),
-        },
-        "drivers": drivers[:4],
-    }
+def _summarize_titles(titles: List[str], coin_name: str) -> str:
+    if not titles:
+        return f"No major {coin_name} headlines in the current pull."
+    # Heuristic summary: pick top repeated theme words
+    blob = " ".join(titles[:12]).lower()
+    themes = []
+    if any(w in blob for w in ["etf", "sec", "approval", "lawsuit", "regulat"]):
+        themes.append("regulatory headlines are in focus")
+    if any(w in blob for w in ["hack", "exploit", "breach", "stolen"]):
+        themes.append("security and incident risk is present")
+    if any(w in blob for w in ["upgrade", "fork", "mainnet", "testnet", "staking"]):
+        themes.append("protocol and network updates are being watched")
+    if any(w in blob for w in ["whale", "flows", "exchange", "liquidation"]):
+        themes.append("positioning and flows appear to be a driver")
+    if not themes:
+        themes = ["headlines are mixed and event-driven"]
+    return f"{coin_name}: " + "; ".join(themes[:2]) + "."
 
 
-@app.get("/signals/ideas")
-def signals_ideas(
-    window_days: int = Query(default=30, ge=1, le=365),
-    watchlist: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
-    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense"),
-    limit: int = Query(default=25, ge=5, le=100),
+@app.get("/crypto/news/briefing")
+def crypto_news_briefing(
+    coins: str = Query(default="BTC,ETH,LINK,SHIB"),
+    include_top_n: int = Query(default=15, ge=5, le=30),
 ):
-    key = f"ideas:{window_days}:{watchlist}:{sectors}:{limit}"
+    """
+    Returns JSON expected by your frontend:
+    {
+      date, note, errors, sources:{outlets:[...]},
+      overallSentiment:{label,score},
+      catalysts:[...],
+      coins:[{symbol, summary, sentiment:{label,score}, headlines:[{title,link,published,source}]}]
+    }
+    """
+    coin_list = _clean_coin_list(coins, include_top_n)
+
+    # Add SHIB support even though it is not in COIN_CANON above by default.
+    # We include it because your UI default includes SHIB.
+    if "SHIB" in [c.strip().upper() for c in (coins or "").split(",")]:
+        if "SHIB" not in COIN_CANON:
+            COIN_CANON["SHIB"] = {"name": "Shiba Inu", "strict_terms": [r"\bshib\b", r"\bshiba\b", r"\bshiba inu\b"]}
+        if "SHIB" not in coin_list:
+            coin_list.insert(0, "SHIB")
+
+    key = f"crypto:brief:{','.join(coin_list)}:{include_top_n}"
     cached = cache_get(key)
     if cached is not None:
         return cached
 
-    wl = [t.strip().upper() for t in watchlist.split(",") if t.strip()]
-    sec_str = sectors
+    errors: List[str] = []
+    all_items: List[dict] = []
 
-    congress = report_today(window_days=window_days, horizon_days=None)
-    cong_agg = _congress_ticker_agg(congress)
+    # Pull from major crypto outlets
+    for outlet in CRYPTO_OUTLETS:
+        try:
+            items = _fetch_rss_items(outlet["rss"], max_items=50, timeout=12)
+            for x in items:
+                x["source"] = outlet["name"]
+            all_items.extend(items)
+        except Exception as e:
+            errors.append(f"{outlet['name']}: {type(e).__name__}: {str(e)}")
 
-    wnews = news_watchlist(tickers=",".join(wl), max_items_per_ticker=8)
-    watch_titles: List[str] = []
-    for _, arr in (wnews.get("itemsByTicker") or {}).items():
-        for x in (arr or [])[:8]:
-            watch_titles.append(x.get("title", "") or "")
+    # Safety net: Google News RSS for each coin by name (helps if an outlet feed is blocked)
+    for sym in coin_list[: min(12, len(coin_list))]:
+        try:
+            nm = COIN_CANON.get(sym, {}).get("name", sym)
+            q = f"{nm} {sym} crypto"
+            g_items = _fetch_rss_items(_google_news_rss(q), max_items=18, timeout=12)
+            for x in g_items:
+                x["source"] = "Google News"
+            all_items.extend(g_items)
+        except Exception as e:
+            errors.append(f"GoogleNews {sym}: {type(e).__name__}: {str(e)}")
 
-    briefing = news_briefing(sectors=sec_str, watchlist=",".join(wl), max_items_per_sector=12)
-    sector_titles: List[str] = []
-    for sec in briefing.get("sectors") or []:
-        for x in (sec.get("topHeadlines") or [])[:10]:
-            sector_titles.append(x.get("title", "") or "")
+    # Dedup globally
+    all_items = _dedup_items(all_items, max_items=260)
 
-    watch_counts = _extract_tickers_from_titles(watch_titles, wl)
-    sector_counts = _extract_tickers_from_titles(sector_titles, wl)
+    # Group per coin with strict matching
+    coin_blocks = []
+    all_titles_for_overall: List[str] = []
+    catalysts: List[str] = []
+    seen_cat = set()
 
-    tickers = set(cong_agg.keys()) | set(watch_counts.keys()) | set(sector_counts.keys())
+    for sym in coin_list:
+        canon = COIN_CANON.get(sym, {"name": sym, "strict_terms": [rf"\b{re.escape(sym)}\b"]})
+        nm = canon["name"]
 
-    rows = []
-    for t in tickers:
-        cong = cong_agg.get(t) or {"ticker": t, "buy": 0, "sell": 0, "dem": 0, "rep": 0, "last": ""}
-        rows.append(_score_row(cong, watch_counts.get(t, 0), sector_counts.get(t, 0)))
+        heads = []
+        for x in all_items:
+            title = x.get("title", "") or ""
+            if _matches_coin(title, sym):
+                heads.append({
+                    "title": title,
+                    "link": x.get("link", ""),
+                    "published": x.get("published", ""),
+                    "source": x.get("source", ""),
+                    "bucket": x.get("source", ""),
+                })
 
-    rows.sort(key=lambda x: (-int(x.get("score") or 0), x.get("ticker") or ""))
+        heads = _dedup_items(heads, max_items=18)
+
+        titles = [h["title"] for h in heads]
+        all_titles_for_overall.extend(titles[:6])
+
+        sent = _headline_sentiment(titles)
+        summary = _summarize_titles(titles, nm)
+
+        # Extract catalyst-like lines
+        for t in titles[:10]:
+            for kw in _CATALYST_KEYWORDS:
+                if kw.lower() in (t or "").lower():
+                    k = f"{sym}:{kw}"
+                    if k not in seen_cat:
+                        seen_cat.add(k)
+                        catalysts.append(f"{sym}: watch {kw}-driven headlines (from current feed pull)")
+                    break
+
+        coin_blocks.append({
+            "symbol": sym,
+            "coin": nm,
+            "summary": summary,
+            "sentiment": {"label": sent.get("label", "NEUTRAL"), "score": int(sent.get("score", 50) or 50)},
+            "headlines": heads,
+        })
+
+    overall = _headline_sentiment(all_titles_for_overall)
+
     out = {
         "date": datetime.now(timezone.utc).date().isoformat(),
-        "windowDays": window_days,
-        "limit": limit,
-        "ideas": rows[:limit],
-        "note": "Score blends congress activity with relevance from watchlist + sector headlines.",
+        "note": "Crypto briefing is headline-based context. It highlights what could move price, but it is not predictive.",
+        "errors": errors,
+        "sources": {"outlets": [o["name"] for o in CRYPTO_OUTLETS] + ["Google News"]},
+        "overallSentiment": {"label": overall.get("label", "NEUTRAL"), "score": int(overall.get("score", 50) or 50)},
+        "catalysts": catalysts[:12],
+        "coins": coin_blocks,
     }
-    return cache_set(key, out, ttl_seconds=180)
+
+    return cache_set(key, out, ttl_seconds=240)
