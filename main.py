@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.8.0")
+app = FastAPI(title="Finance Signals Backend", version="4.9.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -70,14 +70,14 @@ SESSION = requests.Session()
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.8.0"}
+    return {"status": "ok", "version": "4.9.0"}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "4.8.0",
+        "version": "4.9.0",
         "hasQuiverToken": bool(QUIVER_TOKEN),
         "hasFinnhubKey": bool(FINNHUB_API_KEY),
         "utc": datetime.now(timezone.utc).isoformat(),
@@ -367,7 +367,7 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
 # =========================================================
 @app.get("/market/snapshot")
 def market_snapshot():
-    key = "market:snapshot:v480"
+    key = "market:snapshot:v490"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -458,7 +458,7 @@ def market_snapshot():
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
-    key = f"market:entry:v480:{window_days}"
+    key = f"market:entry:v490:{window_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -571,7 +571,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
 
 
 # =========================================================
-# RSS helpers + News briefing with summaries + implications
+# RSS helpers + News briefing with flowing reads + dedupe + actionable implications
 # =========================================================
 def _google_news_rss(query: str) -> str:
     q = quote_plus(query)
@@ -635,14 +635,23 @@ def _fetch_rss_items(url: str, timeout: int = 10, max_items: int = 25, ttl_secon
         raise
 
 
-def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
-    seen = set()
+def _norm_key(title: str, link: str) -> str:
+    t = (title or "").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^a-z0-9 \-:/]", "", t)[:220]
+    lk = (link or "").strip()
+    # Google News often wraps URLs and can vary params. Key on title primarily, then link.
+    return f"{t}|{lk[:160]}"
+
+
+def _dedup_items(items: List[dict], max_items: int, global_seen: Optional[set] = None) -> List[dict]:
+    seen = global_seen if global_seen is not None else set()
     out = []
     for x in items:
         lk = (x.get("link") or "").strip()
         ttl = (x.get("title") or "").strip()
-        k = lk or ttl
-        if not k or k in seen:
+        k = _norm_key(ttl, lk)
+        if not ttl or k in seen:
             continue
         seen.add(k)
         out.append(x)
@@ -651,7 +660,7 @@ def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
     return out
 
 
-# --- Optional deep snippet extraction (meta description / og:description) ---
+# Optional deep snippet extraction (meta description / og:description)
 _META_DESC_RE = re.compile(r'<meta[^>]+(?:name="description"|property="og:description")[^>]+content="([^"]+)"', re.IGNORECASE)
 _TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
@@ -672,34 +681,46 @@ def _fetch_meta_description(url: str, timeout: int = 8) -> str:
         m = _META_DESC_RE.search(html)
         if m:
             desc = _clean_text(m.group(1))
-            return cache_set(ck, desc[:360], ttl_seconds=1800, stale_ttl_seconds=12 * 3600)
+            return cache_set(ck, desc[:420], ttl_seconds=1800, stale_ttl_seconds=12 * 3600)
 
         m2 = _TITLE_TAG_RE.search(html)
         if m2:
             t = _clean_text(m2.group(1))
-            return cache_set(ck, t[:240], ttl_seconds=900, stale_ttl_seconds=6 * 3600)
+            return cache_set(ck, t[:260], ttl_seconds=900, stale_ttl_seconds=6 * 3600)
 
         return cache_set(ck, "", ttl_seconds=600, stale_ttl_seconds=6 * 3600)
     except Exception:
         return cache_set(ck, "", ttl_seconds=300, stale_ttl_seconds=3 * 3600)
 
 
-# --- Sector scoring + summary heuristics ---
+# Scoring and theme detection
 POS_WORDS = {
     "beat", "beats", "surge", "surges", "soar", "soars", "record", "profit", "profits", "growth",
     "upgrade", "upgraded", "strong", "stronger", "guidance raised", "raises guidance", "rally", "rallies",
     "partnership", "contract win", "wins contract", "backlog", "bullish", "outperform", "breakthrough",
+    "margin expansion", "re-accelerate", "reaccelerate",
 }
 NEG_WORDS = {
     "miss", "misses", "plunge", "plunges", "drop", "drops", "slump", "slumps", "loss", "losses",
     "downgrade", "downgraded", "weak", "weaker", "guidance cut", "cuts guidance", "layoffs",
     "probe", "investigation", "lawsuit", "recall", "ban", "antitrust", "fine", "breach", "hack",
+    "data leak", "outage", "warning", "cuts forecast", "lowers forecast",
 }
 INTENSIFIERS = {
-    "sec", "doj", "ftc", "antitrust", "sanction", "ban", "ai chip", "export controls", "rate cut",
-    "rate hike", "inflation", "earnings", "guidance", "cpi", "fomc", "defaults", "downgrade", "upgrade",
-    "merger", "acquisition", "bankruptcy",
+    "sec", "doj", "ftc", "antitrust", "sanction", "ban", "export controls", "rates", "inflation", "cpi", "fomc",
+    "earnings", "guidance", "forecast", "quarter", "merger", "acquisition", "bankruptcy", "strike",
+    "ransomware", "breach", "hack", "outage",
 }
+
+THEME_BUCKETS = [
+    ("earnings and guidance", ["earnings", "guidance", "forecast", "revenue", "margin", "profit", "results", "quarter"]),
+    ("regulation and policy", ["sec", "doj", "ftc", "antitrust", "ban", "sanction", "export", "controls", "regulator", "law"]),
+    ("chips and supply chain", ["chip", "gpu", "semiconductor", "tsmc", "asml", "supply", "fab", "foundry", "hbm", "packaging"]),
+    ("product and platform launches", ["launch", "release", "rollout", "product", "platform", "model", "copilot", "gemini", "llama", "agent"]),
+    ("cyber incidents", ["breach", "hack", "ransomware", "outage", "security", "leak"]),
+    ("m&a and partnerships", ["acquire", "acquisition", "merge", "merger", "buyout", "partnership", "deal", "contract"]),
+    ("macro and rates", ["cpi", "inflation", "rates", "fomc", "fed", "yield", "recession", "soft landing"]),
+]
 
 SECTOR_WATCHLIST = {
     "AI": ["NVDA", "MSFT", "GOOGL", "AMZN", "META", "AAPL", "AMD", "AVGO", "TSM", "ASML", "SMCI", "PLTR", "NOW", "ORCL"],
@@ -709,19 +730,47 @@ SECTOR_WATCHLIST = {
     "Defense": ["LMT", "NOC", "RTX", "GD", "BA", "HII"],
     "Medical": ["JNJ", "PFE", "LLY", "NVO", "MRK", "ABBV", "ISRG", "SYK", "MDT", "BSX"],
     "Energy": ["XOM", "CVX", "SLB", "COP", "EOG", "OXY", "NEE", "ENPH"],
-    "Robotics": ["TSLA", "NVDA", "ABB", "FANUY", "ROK", "TER", "SYM"],
+    "Robotics": ["TSLA", "ABB", "ROK", "TER", "SYM"],
     "Infrastructure": ["CAT", "DE", "URI", "VMC", "MLM", "CSX", "UNP", "ETN"],
     "Financials": ["JPM", "BAC", "WFC", "GS", "MS", "BLK", "SCHW"],
     "Consumer": ["AMZN", "WMT", "COST", "TGT", "NKE", "SBUX", "MCD"],
     "General": ["SPY", "QQQ", "IWM"],
 }
 
+# Ticker extraction: $NVDA, (NVDA), NVDA, but avoid common words
+_TICKER_RE = re.compile(r"(?:\$(?P<t1>[A-Z]{1,5})|\b(?P<t2>[A-Z]{1,5})\b)")
+_TICKER_BLACKLIST = {
+    "AI", "ETF", "USD", "CEO", "CFO", "SEC", "DOJ", "FTC", "FDA", "FOMC", "CPI", "US", "UK", "EU",
+    "SPY", "QQQ",  # allow these via watchlist if needed, but blacklist in extraction to reduce noise
+}
+
+
+def _extract_tickers(text: str) -> List[str]:
+    if not text:
+        return []
+    out: List[str] = []
+    for m in _TICKER_RE.finditer(text):
+        t = (m.group("t1") or m.group("t2") or "").upper().strip()
+        if not t:
+            continue
+        if t in _TICKER_BLACKLIST:
+            continue
+        # very short ones often false positives, but allow 2-5. Allow 1 char only if it is a real watchlist match later.
+        if len(t) == 1:
+            continue
+        out.append(t)
+    # dedup preserve order
+    seen = set()
+    out2 = []
+    for t in out:
+        if t in seen:
+            continue
+        seen.add(t)
+        out2.append(t)
+    return out2
+
 
 def _score_items(items: List[dict]) -> Tuple[int, str]:
-    """
-    Produces a 0-100 score and label.
-    Uses headline + description text. This is heuristic, not a prediction.
-    """
     if not items:
         return 50, "NEUTRAL"
 
@@ -744,17 +793,14 @@ def _score_items(items: List[dict]) -> Tuple[int, str]:
             if w in text:
                 intensity += 0.35
 
-        # Very rough weighting: earnings and guidance tend to matter more
-        if "earnings" in text or "guidance" in text:
+        if "earnings" in text or "guidance" in text or "forecast" in text:
             intensity += 0.8
         if "sec" in text or "doj" in text or "ftc" in text:
             intensity += 0.9
 
-    # Convert to score: baseline 50, shift by sentiment, then modulate by intensity
     raw = 50.0 + 7.5 * (pos - neg)
     raw = raw + 3.0 * intensity
 
-    # Clamp and label
     score = int(round(max(0.0, min(100.0, raw))))
     if score >= 62:
         label = "POSITIVE"
@@ -763,17 +809,6 @@ def _score_items(items: List[dict]) -> Tuple[int, str]:
     else:
         label = "NEUTRAL"
     return score, label
-
-
-THEME_BUCKETS = [
-    ("Earnings and guidance", ["earnings", "guidance", "forecast", "revenue", "margin", "profit", "results", "quarter"]),
-    ("Regulation and policy", ["sec", "doj", "ftc", "antitrust", "ban", "sanction", "export", "controls", "regulator", "law"]),
-    ("AI model and product launches", ["model", "launch", "release", "chatbot", "copilot", "gemini", "llama", "openai", "anthropic"]),
-    ("Chips and supply chain", ["chip", "gpu", "semiconductor", "tsmc", "asml", "supply", "fab", "foundry"]),
-    ("Cyber incidents", ["breach", "hack", "ransomware", "outage", "security", "leak"]),
-    ("M&A and partnerships", ["acquire", "acquisition", "merge", "merger", "buyout", "partnership", "deal", "contract"]),
-    ("Macro and rates", ["cpi", "inflation", "rates", "fomc", "fed", "yield", "recession"]),
-]
 
 
 def _themes_from_items(items: List[dict], max_themes: int = 3) -> List[Tuple[str, List[dict]]]:
@@ -796,64 +831,194 @@ def _themes_from_items(items: List[dict], max_themes: int = 3) -> List[Tuple[str
 
     out = ranked[:max_themes]
     if len(out) < max_themes and other:
-        out.append(("Other notable headlines", other[:6]))
+        out.append(("other notable headlines", other[:6]))
     return out[:max_themes]
 
 
-def _brief_sector_summary(sector: str, items: List[dict], score: int, label: str) -> str:
+def _fmt_sentiment_line(score: int, label: str) -> str:
+    if label == "POSITIVE":
+        return f"Tone is constructive ({score}/100)."
+    if label == "NEGATIVE":
+        return f"Tone is risk-heavy ({score}/100)."
+    return f"Tone is mixed ({score}/100)."
+
+
+def _build_today_read(sector: str, items: List[dict], score: int, label: str) -> str:
+    """
+    Flowing narrative. Avoids repeating the same headline by using themed picks.
+    """
     if not items:
-        return "No recent headlines returned."
+        return "No notable headlines returned in this sector."
 
     themes = _themes_from_items(items, max_themes=3)
 
-    bullets: List[str] = []
-    bullets.append(f"Sentiment: {label} ({score}/100).")
+    # Pick 1 representative story per theme, and stitch into a short paragraph
+    picks: List[dict] = []
+    for _, lst in themes:
+        if lst:
+            picks.append(lst[0])
 
-    for theme, theme_items in themes:
-        top = theme_items[0]
-        line = top.get("title") or ""
-        # Add a short snippet if present
-        snip = (top.get("description") or "").strip()
-        if snip:
-            snip = snip[:200].rstrip()
-            bullets.append(f"{theme}: {line}. {snip}")
+    # Create a smooth narrative with minimal snippet use
+    lines: List[str] = []
+    lines.append(_fmt_sentiment_line(score, label))
+
+    # Intro
+    if sector.lower() in ["ai", "semiconductors", "cloud", "cybersecurity"]:
+        lines.append("The main drivers today are a mix of product/platform momentum and catalyst risk.")
+    else:
+        lines.append("The tape today is being shaped by a handful of headline catalysts and follow-through risk.")
+
+    # Body: 2-3 key updates
+    used = 0
+    for x in picks[:3]:
+        title = (x.get("title") or "").strip()
+        desc = (x.get("description") or "").strip()
+
+        if not title:
+            continue
+
+        # Keep it readable: 1 headline + optional short clause from description
+        if desc:
+            desc2 = desc
+            desc2 = re.sub(r"\s+", " ", desc2).strip()
+            if len(desc2) > 220:
+                desc2 = desc2[:220].rstrip() + "…"
+            lines.append(f"{title}. {desc2}")
         else:
-            bullets.append(f"{theme}: {line}.")
+            lines.append(f"{title}.")
+        used += 1
 
-    # One “so what” line
+    if used == 0:
+        lines.append("No clean summary could be generated from the returned headlines.")
+
+    # Close with a practical framing
     if label == "POSITIVE":
-        bullets.append("So what: This backdrop tends to favor adding on pullbacks rather than chasing spikes.")
+        lines.append("Bottom line: favor adds on pullbacks, and prioritize the strongest operators in the group.")
     elif label == "NEGATIVE":
-        bullets.append("So what: Consider tighter risk controls and smaller adds until the headline pressure eases.")
+        lines.append("Bottom line: stay selective, reduce chasing, and keep sizing tighter until the catalyst clears.")
     else:
-        bullets.append("So what: Mixed tape. Let price action confirm before increasing position size.")
+        lines.append("Bottom line: stay patient, and let price action confirm which narrative wins.")
 
-    return "\n".join([f"- {b}" for b in bullets])
+    return " ".join(lines)
 
 
-def _sector_implications(sector: str, score: int, label: str) -> Tuple[List[str], List[str]]:
-    watch = SECTOR_WATCHLIST.get(sector, SECTOR_WATCHLIST.get("General", []))
+def _is_positive_text(text: str) -> bool:
+    t = (text or "").lower()
+    return any(w in t for w in POS_WORDS)
 
-    implications: List[str] = []
-    if label == "POSITIVE":
-        implications.append("If you are underweight, consider scaling in via small buys (DCA) on red days.")
-        implications.append("Watch for earnings/guidance follow-through. Strong beats can extend momentum.")
-        implications.append("Avoid adding after gap-ups unless you have a plan for volatility.")
-    elif label == "NEGATIVE":
-        implications.append("If you are overweight, consider trimming into strength or hedging (smaller size, tighter stops).")
-        implications.append("Wait for bad-news exhaustion or confirmation that guidance risk is done.")
-        implications.append("Prefer higher quality balance sheets and durable cash flows in this sector.")
-    else:
-        implications.append("Keep exposure but size entries. Let the next earnings and macro prints set direction.")
-        implications.append("Prioritize names with clear catalysts and strong relative strength.")
-        implications.append("Use the score as a throttle, not as a trade signal.")
 
-    # Score-based extra note
-    if score >= 75:
-        implications.append("High conviction environment. Momentum strategies tend to work better.")
-    elif score <= 25:
-        implications.append("High risk environment. Defensive posture is usually rewarded.")
-    return implications, watch
+def _is_negative_text(text: str) -> bool:
+    t = (text or "").lower()
+    return any(w in t for w in NEG_WORDS)
+
+
+def _is_risk_catalyst(text: str) -> bool:
+    t = (text or "").lower()
+    # catalyst risk: regulation, guidance/earnings, cyber, bans/export controls
+    risk_kws = ["sec", "doj", "ftc", "antitrust", "ban", "sanction", "export", "controls", "guidance", "forecast", "earnings", "breach", "hack", "outage", "probe", "investigation", "lawsuit", "recall"]
+    return any(k in t for k in risk_kws)
+
+
+def _rank_unique(items: List[Tuple[str, str]], limit: int = 10) -> List[dict]:
+    # items: [(ticker, reason)]
+    seen = set()
+    out = []
+    for t, r in items:
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append({"ticker": t, "reason": r})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _build_actionable_implications(sector: str, score: int, label: str, items: List[dict]) -> Dict[str, List[dict]]:
+    """
+    Returns:
+      - goAfter: names worth accumulating (positive bias)
+      - watchClosely: names with active catalysts or headline risk
+    """
+    watchlist = SECTOR_WATCHLIST.get(sector, SECTOR_WATCHLIST.get("General", []))
+
+    extracted: List[Tuple[str, str, dict]] = []  # (ticker, reason, item)
+    for x in items[:18]:
+        text = ((x.get("title") or "") + " " + (x.get("description") or "")).strip()
+        for t in _extract_tickers(text):
+            extracted.append((t, "Mentioned in headlines", x))
+
+    # Score tickers based on context
+    go_after: List[Tuple[str, str]] = []
+    watch_close: List[Tuple[str, str]] = []
+
+    # Prefer tickers mentioned explicitly first
+    for t, _, x in extracted:
+        text = ((x.get("title") or "") + " " + (x.get("description") or "")).strip()
+        pos = _is_positive_text(text)
+        neg = _is_negative_text(text)
+        risk = _is_risk_catalyst(text)
+
+        if pos and not neg and label in ["POSITIVE", "NEUTRAL"] and score >= 50:
+            go_after.append((t, "Positive catalyst in headlines"))
+        if risk or neg:
+            watch_close.append((t, "Active catalyst risk in headlines"))
+
+    # Add watchlist names as candidates if extraction is sparse
+    # goAfter: only when sector tone is positive
+    if label == "POSITIVE" and score >= 62:
+        for t in watchlist[:10]:
+            go_after.append((t, "Sector leader to accumulate on pullbacks"))
+
+    # watchClosely: when sector tone is negative or very high intensity
+    if label == "NEGATIVE" or score <= 38:
+        for t in watchlist[:12]:
+            watch_close.append((t, "Sector exposure to monitor closely"))
+
+    # If we still have too little, keep it useful
+    if len(go_after) < 4 and label != "NEGATIVE":
+        for t in watchlist[:8]:
+            go_after.append((t, "High-quality name to keep on the short list"))
+
+    if len(watch_close) < 4:
+        for t in watchlist[:10]:
+            watch_close.append((t, "Watchlist name"))
+
+    return {
+        "goAfter": _rank_unique(go_after, limit=10),
+        "watchClosely": _rank_unique(watch_close, limit=12),
+    }
+
+
+def _build_global_today_read(sector_blocks: List[dict]) -> str:
+    """
+    Combine the most important sector reads into one morning-style briefing without duplication.
+    """
+    if not sector_blocks:
+        return "No sector reads available."
+
+    # pick the 4 most "notable" sectors by distance from neutral
+    def _notability(s: dict) -> int:
+        sc = int((s.get("sentiment") or {}).get("score") or 50)
+        return abs(sc - 50)
+
+    ranked = sorted(sector_blocks, key=_notability, reverse=True)
+    picks = ranked[:4] if len(ranked) >= 4 else ranked
+
+    parts: List[str] = []
+    parts.append("Here is the clean read for today across your sectors.")
+
+    for s in picks:
+        sec = s.get("sector", "Sector")
+        sent = s.get("sentiment") or {}
+        sc = int(sent.get("score") or 50)
+        lab = sent.get("label") or "NEUTRAL"
+        tr = (s.get("todayRead") or "").strip()
+        # One short section per sector
+        if tr:
+            parts.append(f"{sec}: {lab} ({sc}/100). {tr}")
+
+    parts.append("If you want this even tighter, reduce sectors or set max_items_per_sector lower.")
+    return "\n\n".join(parts)
 
 
 @app.get("/news/briefing")
@@ -864,13 +1029,12 @@ def news_briefing(
 ):
     """
     Returns sector headlines plus:
-    - sentiment score that varies
-    - a brief summary you can read without opening articles
-    - implications and a watchlist tickers list per sector
-
-    deep=1: attempts to fetch each story URL and pull meta description (best-effort)
+      - sentiment score that varies
+      - todayRead: a flowing narrative you can read quickly
+      - implications: goAfter vs watchClosely
+    deep=1: attempts to fetch story URLs and pull meta descriptions (best-effort).
     """
-    key = f"news:brief:v480:{sectors}:{max_items_per_sector}:deep{deep}"
+    key = f"news:brief:v490:{sectors}:{max_items_per_sector}:deep{deep}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -887,7 +1051,7 @@ def news_briefing(
         jobs.append((sec, _google_news_rss(f"{sec} stocks markets")))
 
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = [(sec, ex.submit(_fetch_rss_items, url, 10, max_items_per_sector * 2, 240, 6 * 3600)) for sec, url in jobs]
+        futs = [(sec, ex.submit(_fetch_rss_items, url, 10, max_items_per_sector * 3, 240, 6 * 3600)) for sec, url in jobs]
         for sec, fut in futs:
             try:
                 items = fut.result()
@@ -898,46 +1062,43 @@ def news_briefing(
             except Exception as e:
                 errors.append(f"{sec}: {type(e).__name__}: {str(e)}")
 
-    all_items = _dedup_items(all_items, 800)
+    # Global dedupe to reduce cross-sector repeats
+    global_seen: set = set()
+    all_items = _dedup_items(all_items, 1200, global_seen=global_seen)
 
-    # Optional deep enrichment: pull meta descriptions for the top items per sector
+    # Optional deep enrichment: pull meta descriptions for top items overall
     if deep == 1:
-        # throttle total fetches
-        to_fetch: List[Tuple[int, dict]] = []
-        for i, x in enumerate(all_items[:300]):
-            if x.get("link"):
-                to_fetch.append((i, x))
-
+        to_fetch: List[dict] = [x for x in all_items[:360] if x.get("link")]
         with ThreadPoolExecutor(max_workers=10) as ex:
-            futures = {ex.submit(_fetch_meta_description, x["link"], 8): (i, x) for i, x in to_fetch[:120]}
+            futures = {ex.submit(_fetch_meta_description, x["link"], 8): x for x in to_fetch[:140]}
             for f in as_completed(futures):
-                i, x = futures[f]
+                x = futures[f]
                 try:
                     md = f.result() or ""
                     if md:
-                        # Only overwrite if RSS description is empty or low-quality
                         if not x.get("description") or len(str(x.get("description") or "")) < 40:
                             x["description"] = md
                         x["metaDescription"] = md
                 except Exception:
                     continue
 
-    sectors_out = []
-    for sec in sector_list:
-        sec_items = [x for x in all_items if x.get("sector") == sec][:max_items_per_sector]
-        score, label = _score_items(sec_items)
-        implications, watch = _sector_implications(sec, score, label)
-        summary = _brief_sector_summary(sec, sec_items, score, label)
+    sectors_out: List[dict] = []
 
-        watch_mentions = []
-        if watch:
-            watch_mentions = [{"ticker": t, "reason": "Sector watchlist"} for t in watch[:18]]
+    # Per-sector: local dedupe as well (using shared global_seen would over-prune; use a local set)
+    for sec in sector_list:
+        sec_raw = [x for x in all_items if x.get("sector") == sec]
+        sec_seen: set = set()
+        sec_items = _dedup_items(sec_raw, max_items_per_sector, global_seen=sec_seen)
+
+        score, label = _score_items(sec_items)
+        today_read = _build_today_read(sec, sec_items, score, label)
+        implications = _build_actionable_implications(sec, score, label, sec_items)
 
         sectors_out.append({
             "sector": sec,
             "sentiment": {"label": label, "score": score},
-            "summary": summary,
-            "implications": implications,
+            "todayRead": today_read,
+            "implications": implications,  # now structured: goAfter + watchClosely
             "topHeadlines": [
                 {
                     "title": x.get("title", ""),
@@ -949,10 +1110,8 @@ def news_briefing(
                 }
                 for x in sec_items
             ],
-            "watchlistMentions": watch_mentions,
         })
 
-    # Overall sentiment as mean of sector scores (simple)
     scores = [int(s.get("sentiment", {}).get("score", 50)) for s in sectors_out if s.get("sentiment")]
     overall_score = int(round(sum(scores) / len(scores))) if scores else 50
     if overall_score >= 62:
@@ -965,108 +1124,10 @@ def news_briefing(
     out = {
         "date": datetime.now(timezone.utc).date().isoformat(),
         "overallSentiment": {"label": overall_label, "score": overall_score},
+        "todayRead": _build_global_today_read(sectors_out),
         "sectors": sectors_out,
         "errors": errors,
-        "note": "Summaries are heuristic and based on RSS title + snippet (and optional meta descriptions if deep=1).",
-    }
-    return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
-
-
-# =========================================================
-# Crypto News Briefing
-# =========================================================
-def _split_csv(s: str) -> List[str]:
-    return [x.strip().upper() for x in (s or "").split(",") if x.strip()]
-
-
-@app.get("/crypto/news/briefing")
-def crypto_news_briefing(
-    coins: str = Query(default="BTC,ETH,LINK,SHIB"),
-    include_top_n: int = Query(default=15, ge=5, le=30),
-    deep: int = Query(default=0, ge=0, le=1),
-):
-    key = f"crypto:news:v480:{coins}:{include_top_n}:deep{deep}"
-    cached = cache_get(key, allow_stale=True)
-    if cached is not None:
-        return cached
-
-    coin_list = _split_csv(coins)
-    if not coin_list:
-        coin_list = ["BTC", "ETH"]
-
-    errors: List[str] = []
-    now = datetime.now(timezone.utc).date().isoformat()
-
-    catalysts = [
-        "Macro prints (CPI, FOMC, jobs) often drive risk-on/risk-off for crypto.",
-        "ETF/flows headlines can move BTC and ETH quickly.",
-        "Regulatory headlines can change sentiment fast.",
-    ]
-
-    def _coin_query(sym: str) -> str:
-        if sym in ["BTC", "BITCOIN"]:
-            return "Bitcoin"
-        if sym in ["ETH", "ETHEREUM"]:
-            return "Ethereum"
-        return sym
-
-    coins_out: List[dict] = []
-    for sym in coin_list[:12]:
-        try:
-            url = _google_news_rss(f"{_coin_query(sym)} crypto")
-            items = _fetch_rss_items(url, timeout=10, max_items=include_top_n, ttl_seconds=240, stale_ttl_seconds=6 * 3600)
-            items = _dedup_items(items, include_top_n)
-
-            if deep == 1:
-                with ThreadPoolExecutor(max_workers=8) as ex:
-                    futs = {ex.submit(_fetch_meta_description, x.get("link", ""), 8): x for x in items[:10] if x.get("link")}
-                    for f in as_completed(futs):
-                        x = futs[f]
-                        try:
-                            md = f.result() or ""
-                            if md and (not x.get("description") or len(str(x.get("description") or "")) < 40):
-                                x["description"] = md
-                        except Exception:
-                            continue
-
-            score, label = _score_items(items)
-            summary = _brief_sector_summary(sym, items, score, label)
-
-            headlines = [
-                {
-                    "title": x.get("title", ""),
-                    "link": x.get("link", ""),
-                    "published": x.get("published", ""),
-                    "source": "Google News",
-                    "bucket": "Google News",
-                    "description": x.get("description", ""),
-                }
-                for x in items
-            ]
-
-            coins_out.append({
-                "symbol": sym,
-                "sentiment": {"label": label, "score": score},
-                "summary": summary,
-                "headlines": headlines,
-            })
-        except Exception as e:
-            errors.append(f"{sym}: {type(e).__name__}: {str(e)}")
-            coins_out.append({
-                "symbol": sym,
-                "sentiment": {"label": "NEUTRAL", "score": 50},
-                "summary": "No headlines returned.",
-                "headlines": [],
-            })
-
-    out = {
-        "date": now,
-        "note": "Crypto news uses Google News RSS only, plus optional meta descriptions if deep=1.",
-        "errors": errors,
-        "sources": {"outlets": ["Google News RSS"]},
-        "overallSentiment": {"label": "NEUTRAL", "score": 50},
-        "catalysts": catalysts,
-        "coins": coins_out,
+        "note": "todayRead is heuristic and based on titles + snippets (and optional meta descriptions if deep=1). Implications are watchlist and catalyst based, not financial advice.",
     }
     return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
 
