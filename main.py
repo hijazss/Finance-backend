@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import quiverquant
@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.7.1")
+app = FastAPI(title="Finance Signals Backend", version="4.8.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -33,7 +33,7 @@ app.add_middleware(
 )
 
 QUIVER_TOKEN = os.getenv("QUIVER_TOKEN", "").strip()
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()  # kept for compatibility, not required
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()  # kept for compatibility
 
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
@@ -58,19 +58,26 @@ NASDAQ_HEADERS = {
     "Origin": "https://www.nasdaq.com",
 }
 
+HTML_HEADERS = {
+    "User-Agent": UA_HEADERS["User-Agent"],
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": UA_HEADERS["Accept-Language"],
+    "Connection": "keep-alive",
+}
+
 SESSION = requests.Session()
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.7.1"}
+    return {"status": "ok", "version": "4.8.0"}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "4.7.1",
+        "version": "4.8.0",
         "hasQuiverToken": bool(QUIVER_TOKEN),
         "hasFinnhubKey": bool(FINNHUB_API_KEY),
         "utc": datetime.now(timezone.utc).isoformat(),
@@ -154,6 +161,14 @@ def _sma(vals: List[float], n: int) -> Optional[float]:
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
+
+
+def _clean_text(s: str) -> str:
+    if not s:
+        return ""
+    s2 = re.sub(r"<[^>]+>", " ", s)  # strip HTML tags
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    return s2
 
 
 # =========================================================
@@ -267,11 +282,6 @@ def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
 
 
 def _stooq_last_prev_and_returns(symbol: str) -> Dict[str, Optional[float]]:
-    """
-    Returns last, prev, ret1dPct, ret5dPct, ret1mPct computed from trading days.
-    5D uses last vs close 5 trading days ago (index -6).
-    1M uses last vs close 21 trading days ago (index -22).
-    """
     closes = _stooq_daily_closes(symbol)
     vals = [c for _, c in closes if c is not None]
     if len(vals) < 2:
@@ -294,12 +304,10 @@ def _stooq_last_prev_and_returns(symbol: str) -> Dict[str, Optional[float]]:
 
 
 # =========================================================
-# CNN Fear & Greed (best-effort, with weekend fallback)
+# CNN Fear & Greed (best-effort, weekend fallback)
 # =========================================================
 def _cnn_fear_greed_graphdata(date_str: Optional[str] = None) -> dict:
     d0 = date_str or datetime.now(timezone.utc).date().isoformat()
-
-    # CNN sometimes 404s on weekends/holidays. Walk back up to 10 days.
     start_date = datetime.fromisoformat(d0).date()
     last_err: Optional[str] = None
 
@@ -355,11 +363,11 @@ def market_fear_greed(date: Optional[str] = Query(default=None)):
 
 
 # =========================================================
-# Market Snapshot (now includes 1D/5D/1M via Stooq, with fallbacks)
+# Market Snapshot
 # =========================================================
 @app.get("/market/snapshot")
 def market_snapshot():
-    key = "market:snapshot:v471"
+    key = "market:snapshot:v480"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -367,7 +375,6 @@ def market_snapshot():
     now = datetime.now(timezone.utc)
     errors: List[str] = []
 
-    # Prefer Stooq for returns because it gives consistent history
     spy_hist = {"last": None, "prev": None, "ret1dPct": None, "ret5dPct": None, "ret1mPct": None}
     try:
         spy_hist = _stooq_last_prev_and_returns("spy.us")
@@ -382,7 +389,6 @@ def market_snapshot():
     except Exception as e:
         errors.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
 
-    # Nasdaq quote as optional supplement / fallback for last+prev if Stooq was empty
     spy_last = spy_prev = None
     try:
         spy_last, spy_prev = _nasdaq_last_and_prev("SPY")
@@ -395,11 +401,9 @@ def market_snapshot():
     except Exception as e:
         errors.append(f"Nasdaq VIX: {type(e).__name__}: {str(e)}")
 
-    # Decide SPY values: prefer Stooq last/prev if present, else Nasdaq, else None
     spy_last_final = spy_hist.get("last") if spy_hist.get("last") is not None else spy_last
     spy_prev_final = spy_hist.get("prev") if spy_hist.get("prev") is not None else spy_prev
 
-    # Returns: prefer Stooq computed values; if missing, compute 1D from last/prev if we can
     ret1d = spy_hist.get("ret1dPct")
     if ret1d is None and spy_last_final is not None and spy_prev_final is not None and spy_prev_final:
         ret1d = _pct(float(spy_last_final), float(spy_prev_final))
@@ -407,7 +411,6 @@ def market_snapshot():
     ret5d = spy_hist.get("ret5dPct")
     ret1m = spy_hist.get("ret1mPct")
 
-    # Decide VIX values: prefer Nasdaq for "live-ish" if present, else Stooq
     vix_last_final = vix_last if vix_last is not None else vix_hist_last
     vix_prev_final = vix_prev if vix_prev is not None else vix_hist_prev
 
@@ -437,7 +440,6 @@ def market_snapshot():
         "note": "Snapshot uses Stooq for 1D/5D/1M returns and CNN for Fear & Greed, with weekend fallbacks. Nasdaq is best-effort for quotes.",
     }
 
-    # Keep a last_good
     if out["sp500"]["last"] is not None:
         cache_set("market:snapshot:last_good", out, ttl_seconds=3600, stale_ttl_seconds=24 * 3600)
     else:
@@ -456,7 +458,7 @@ def market_snapshot():
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
-    key = f"market:entry:v471:{window_days}"
+    key = f"market:entry:v480:{window_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -569,7 +571,7 @@ def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
 
 
 # =========================================================
-# RSS helpers + News briefing
+# RSS helpers + News briefing with summaries + implications
 # =========================================================
 def _google_news_rss(query: str) -> str:
     q = quote_plus(query)
@@ -602,8 +604,9 @@ def _fetch_rss_items_uncached(url: str, timeout: int = 10, max_items: int = 25) 
             link_el = e.find("{http://www.w3.org/2005/Atom}link")
             link = (link_el.get("href") if link_el is not None else "") or ""
             pub = (e.findtext("{http://www.w3.org/2005/Atom}updated") or "").strip()
+            summary = (e.findtext("{http://www.w3.org/2005/Atom}summary") or "").strip()
             if title:
-                out.append({"title": title, "link": link, "published": pub})
+                out.append({"title": title, "link": link, "published": pub, "description": _clean_text(summary)})
         return out
 
     out = []
@@ -611,8 +614,9 @@ def _fetch_rss_items_uncached(url: str, timeout: int = 10, max_items: int = 25) 
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
         pub = (item.findtext("pubDate") or "").strip()
+        desc = (item.findtext("description") or "").strip()
         if title:
-            out.append({"title": title, "link": link, "published": pub})
+            out.append({"title": title, "link": link, "published": pub, "description": _clean_text(desc)})
     return out
 
 
@@ -647,12 +651,226 @@ def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
     return out
 
 
+# --- Optional deep snippet extraction (meta description / og:description) ---
+_META_DESC_RE = re.compile(r'<meta[^>]+(?:name="description"|property="og:description")[^>]+content="([^"]+)"', re.IGNORECASE)
+_TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def _fetch_meta_description(url: str, timeout: int = 8) -> str:
+    if not url:
+        return ""
+    ck = f"meta_desc:{url}"
+    cached = cache_get(ck, allow_stale=True)
+    if cached is not None:
+        return str(cached or "")
+
+    try:
+        r = _requests_get(url, timeout=timeout, headers=HTML_HEADERS)
+        if r.status_code >= 400:
+            return cache_set(ck, "", ttl_seconds=600, stale_ttl_seconds=6 * 3600)
+        html = (r.text or "")[:250_000]
+        m = _META_DESC_RE.search(html)
+        if m:
+            desc = _clean_text(m.group(1))
+            return cache_set(ck, desc[:360], ttl_seconds=1800, stale_ttl_seconds=12 * 3600)
+
+        m2 = _TITLE_TAG_RE.search(html)
+        if m2:
+            t = _clean_text(m2.group(1))
+            return cache_set(ck, t[:240], ttl_seconds=900, stale_ttl_seconds=6 * 3600)
+
+        return cache_set(ck, "", ttl_seconds=600, stale_ttl_seconds=6 * 3600)
+    except Exception:
+        return cache_set(ck, "", ttl_seconds=300, stale_ttl_seconds=3 * 3600)
+
+
+# --- Sector scoring + summary heuristics ---
+POS_WORDS = {
+    "beat", "beats", "surge", "surges", "soar", "soars", "record", "profit", "profits", "growth",
+    "upgrade", "upgraded", "strong", "stronger", "guidance raised", "raises guidance", "rally", "rallies",
+    "partnership", "contract win", "wins contract", "backlog", "bullish", "outperform", "breakthrough",
+}
+NEG_WORDS = {
+    "miss", "misses", "plunge", "plunges", "drop", "drops", "slump", "slumps", "loss", "losses",
+    "downgrade", "downgraded", "weak", "weaker", "guidance cut", "cuts guidance", "layoffs",
+    "probe", "investigation", "lawsuit", "recall", "ban", "antitrust", "fine", "breach", "hack",
+}
+INTENSIFIERS = {
+    "sec", "doj", "ftc", "antitrust", "sanction", "ban", "ai chip", "export controls", "rate cut",
+    "rate hike", "inflation", "earnings", "guidance", "cpi", "fomc", "defaults", "downgrade", "upgrade",
+    "merger", "acquisition", "bankruptcy",
+}
+
+SECTOR_WATCHLIST = {
+    "AI": ["NVDA", "MSFT", "GOOGL", "AMZN", "META", "AAPL", "AMD", "AVGO", "TSM", "ASML", "SMCI", "PLTR", "NOW", "ORCL"],
+    "Semiconductors": ["NVDA", "AMD", "AVGO", "TSM", "ASML", "AMAT", "LRCX", "KLAC", "MU", "INTC", "QCOM"],
+    "Cloud": ["MSFT", "AMZN", "GOOGL", "ORCL", "NOW", "CRM", "SNOW", "DDOG", "MDB"],
+    "Cybersecurity": ["CRWD", "PANW", "ZS", "NET", "OKTA", "S", "FTNT"],
+    "Defense": ["LMT", "NOC", "RTX", "GD", "BA", "HII"],
+    "Medical": ["JNJ", "PFE", "LLY", "NVO", "MRK", "ABBV", "ISRG", "SYK", "MDT", "BSX"],
+    "Energy": ["XOM", "CVX", "SLB", "COP", "EOG", "OXY", "NEE", "ENPH"],
+    "Robotics": ["TSLA", "NVDA", "ABB", "FANUY", "ROK", "TER", "SYM"],
+    "Infrastructure": ["CAT", "DE", "URI", "VMC", "MLM", "CSX", "UNP", "ETN"],
+    "Financials": ["JPM", "BAC", "WFC", "GS", "MS", "BLK", "SCHW"],
+    "Consumer": ["AMZN", "WMT", "COST", "TGT", "NKE", "SBUX", "MCD"],
+    "General": ["SPY", "QQQ", "IWM"],
+}
+
+
+def _score_items(items: List[dict]) -> Tuple[int, str]:
+    """
+    Produces a 0-100 score and label.
+    Uses headline + description text. This is heuristic, not a prediction.
+    """
+    if not items:
+        return 50, "NEUTRAL"
+
+    pos = 0.0
+    neg = 0.0
+    intensity = 0.0
+
+    for x in items[:18]:
+        t = (x.get("title") or "").lower()
+        d = (x.get("description") or "").lower()
+        text = (t + " " + d).strip()
+
+        for w in POS_WORDS:
+            if w in text:
+                pos += 1.0
+        for w in NEG_WORDS:
+            if w in text:
+                neg += 1.0
+        for w in INTENSIFIERS:
+            if w in text:
+                intensity += 0.35
+
+        # Very rough weighting: earnings and guidance tend to matter more
+        if "earnings" in text or "guidance" in text:
+            intensity += 0.8
+        if "sec" in text or "doj" in text or "ftc" in text:
+            intensity += 0.9
+
+    # Convert to score: baseline 50, shift by sentiment, then modulate by intensity
+    raw = 50.0 + 7.5 * (pos - neg)
+    raw = raw + 3.0 * intensity
+
+    # Clamp and label
+    score = int(round(max(0.0, min(100.0, raw))))
+    if score >= 62:
+        label = "POSITIVE"
+    elif score <= 38:
+        label = "NEGATIVE"
+    else:
+        label = "NEUTRAL"
+    return score, label
+
+
+THEME_BUCKETS = [
+    ("Earnings and guidance", ["earnings", "guidance", "forecast", "revenue", "margin", "profit", "results", "quarter"]),
+    ("Regulation and policy", ["sec", "doj", "ftc", "antitrust", "ban", "sanction", "export", "controls", "regulator", "law"]),
+    ("AI model and product launches", ["model", "launch", "release", "chatbot", "copilot", "gemini", "llama", "openai", "anthropic"]),
+    ("Chips and supply chain", ["chip", "gpu", "semiconductor", "tsmc", "asml", "supply", "fab", "foundry"]),
+    ("Cyber incidents", ["breach", "hack", "ransomware", "outage", "security", "leak"]),
+    ("M&A and partnerships", ["acquire", "acquisition", "merge", "merger", "buyout", "partnership", "deal", "contract"]),
+    ("Macro and rates", ["cpi", "inflation", "rates", "fomc", "fed", "yield", "recession"]),
+]
+
+
+def _themes_from_items(items: List[dict], max_themes: int = 3) -> List[Tuple[str, List[dict]]]:
+    buckets: Dict[str, List[dict]] = {name: [] for name, _ in THEME_BUCKETS}
+    other: List[dict] = []
+
+    for x in items[:18]:
+        text = ((x.get("title") or "") + " " + (x.get("description") or "")).lower()
+        matched = False
+        for name, kws in THEME_BUCKETS:
+            if any(kw in text for kw in kws):
+                buckets[name].append(x)
+                matched = True
+                break
+        if not matched:
+            other.append(x)
+
+    ranked = [(k, v) for k, v in buckets.items() if v]
+    ranked.sort(key=lambda t: len(t[1]), reverse=True)
+
+    out = ranked[:max_themes]
+    if len(out) < max_themes and other:
+        out.append(("Other notable headlines", other[:6]))
+    return out[:max_themes]
+
+
+def _brief_sector_summary(sector: str, items: List[dict], score: int, label: str) -> str:
+    if not items:
+        return "No recent headlines returned."
+
+    themes = _themes_from_items(items, max_themes=3)
+
+    bullets: List[str] = []
+    bullets.append(f"Sentiment: {label} ({score}/100).")
+
+    for theme, theme_items in themes:
+        top = theme_items[0]
+        line = top.get("title") or ""
+        # Add a short snippet if present
+        snip = (top.get("description") or "").strip()
+        if snip:
+            snip = snip[:200].rstrip()
+            bullets.append(f"{theme}: {line}. {snip}")
+        else:
+            bullets.append(f"{theme}: {line}.")
+
+    # One “so what” line
+    if label == "POSITIVE":
+        bullets.append("So what: This backdrop tends to favor adding on pullbacks rather than chasing spikes.")
+    elif label == "NEGATIVE":
+        bullets.append("So what: Consider tighter risk controls and smaller adds until the headline pressure eases.")
+    else:
+        bullets.append("So what: Mixed tape. Let price action confirm before increasing position size.")
+
+    return "\n".join([f"- {b}" for b in bullets])
+
+
+def _sector_implications(sector: str, score: int, label: str) -> Tuple[List[str], List[str]]:
+    watch = SECTOR_WATCHLIST.get(sector, SECTOR_WATCHLIST.get("General", []))
+
+    implications: List[str] = []
+    if label == "POSITIVE":
+        implications.append("If you are underweight, consider scaling in via small buys (DCA) on red days.")
+        implications.append("Watch for earnings/guidance follow-through. Strong beats can extend momentum.")
+        implications.append("Avoid adding after gap-ups unless you have a plan for volatility.")
+    elif label == "NEGATIVE":
+        implications.append("If you are overweight, consider trimming into strength or hedging (smaller size, tighter stops).")
+        implications.append("Wait for bad-news exhaustion or confirmation that guidance risk is done.")
+        implications.append("Prefer higher quality balance sheets and durable cash flows in this sector.")
+    else:
+        implications.append("Keep exposure but size entries. Let the next earnings and macro prints set direction.")
+        implications.append("Prioritize names with clear catalysts and strong relative strength.")
+        implications.append("Use the score as a throttle, not as a trade signal.")
+
+    # Score-based extra note
+    if score >= 75:
+        implications.append("High conviction environment. Momentum strategies tend to work better.")
+    elif score <= 25:
+        implications.append("High risk environment. Defensive posture is usually rewarded.")
+    return implications, watch
+
+
 @app.get("/news/briefing")
 def news_briefing(
     sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
     max_items_per_sector: int = Query(default=12, ge=5, le=30),
+    deep: int = Query(default=0, ge=0, le=1),
 ):
-    key = f"news:brief:v471:{sectors}:{max_items_per_sector}"
+    """
+    Returns sector headlines plus:
+    - sentiment score that varies
+    - a brief summary you can read without opening articles
+    - implications and a watchlist tickers list per sector
+
+    deep=1: attempts to fetch each story URL and pull meta description (best-effort)
+    """
+    key = f"news:brief:v480:{sectors}:{max_items_per_sector}:deep{deep}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -680,35 +898,82 @@ def news_briefing(
             except Exception as e:
                 errors.append(f"{sec}: {type(e).__name__}: {str(e)}")
 
-    all_items = _dedup_items(all_items, 600)
+    all_items = _dedup_items(all_items, 800)
+
+    # Optional deep enrichment: pull meta descriptions for the top items per sector
+    if deep == 1:
+        # throttle total fetches
+        to_fetch: List[Tuple[int, dict]] = []
+        for i, x in enumerate(all_items[:300]):
+            if x.get("link"):
+                to_fetch.append((i, x))
+
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futures = {ex.submit(_fetch_meta_description, x["link"], 8): (i, x) for i, x in to_fetch[:120]}
+            for f in as_completed(futures):
+                i, x = futures[f]
+                try:
+                    md = f.result() or ""
+                    if md:
+                        # Only overwrite if RSS description is empty or low-quality
+                        if not x.get("description") or len(str(x.get("description") or "")) < 40:
+                            x["description"] = md
+                        x["metaDescription"] = md
+                except Exception:
+                    continue
 
     sectors_out = []
     for sec in sector_list:
         sec_items = [x for x in all_items if x.get("sector") == sec][:max_items_per_sector]
+        score, label = _score_items(sec_items)
+        implications, watch = _sector_implications(sec, score, label)
+        summary = _brief_sector_summary(sec, sec_items, score, label)
+
+        watch_mentions = []
+        if watch:
+            watch_mentions = [{"ticker": t, "reason": "Sector watchlist"} for t in watch[:18]]
+
         sectors_out.append({
             "sector": sec,
-            "sentiment": {"label": "NEUTRAL", "score": 50},
-            "summary": "",
-            "implications": [],
+            "sentiment": {"label": label, "score": score},
+            "summary": summary,
+            "implications": implications,
             "topHeadlines": [
-                {"title": x.get("title", ""), "link": x.get("link", ""), "published": x.get("published", ""), "sourceFeed": x.get("source", "Google News"), "sector": sec}
+                {
+                    "title": x.get("title", ""),
+                    "link": x.get("link", ""),
+                    "published": x.get("published", ""),
+                    "sourceFeed": x.get("source", "Google News"),
+                    "sector": sec,
+                    "description": x.get("description", ""),
+                }
                 for x in sec_items
             ],
-            "watchlistMentions": [],
+            "watchlistMentions": watch_mentions,
         })
+
+    # Overall sentiment as mean of sector scores (simple)
+    scores = [int(s.get("sentiment", {}).get("score", 50)) for s in sectors_out if s.get("sentiment")]
+    overall_score = int(round(sum(scores) / len(scores))) if scores else 50
+    if overall_score >= 62:
+        overall_label = "POSITIVE"
+    elif overall_score <= 38:
+        overall_label = "NEGATIVE"
+    else:
+        overall_label = "NEUTRAL"
 
     out = {
         "date": datetime.now(timezone.utc).date().isoformat(),
-        "overallSentiment": {"label": "NEUTRAL", "score": 50},
+        "overallSentiment": {"label": overall_label, "score": overall_score},
         "sectors": sectors_out,
         "errors": errors,
-        "note": "News briefing uses Google News RSS only.",
+        "note": "Summaries are heuristic and based on RSS title + snippet (and optional meta descriptions if deep=1).",
     }
     return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
 
 
 # =========================================================
-# Crypto News Briefing (for your Crypto tab)
+# Crypto News Briefing
 # =========================================================
 def _split_csv(s: str) -> List[str]:
     return [x.strip().upper() for x in (s or "").split(",") if x.strip()]
@@ -718,8 +983,9 @@ def _split_csv(s: str) -> List[str]:
 def crypto_news_briefing(
     coins: str = Query(default="BTC,ETH,LINK,SHIB"),
     include_top_n: int = Query(default=15, ge=5, le=30),
+    deep: int = Query(default=0, ge=0, le=1),
 ):
-    key = f"crypto:news:v471:{coins}:{include_top_n}"
+    key = f"crypto:news:v480:{coins}:{include_top_n}:deep{deep}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -732,9 +998,9 @@ def crypto_news_briefing(
     now = datetime.now(timezone.utc).date().isoformat()
 
     catalysts = [
-        "Watch major macro prints (CPI, FOMC, jobs) for risk-on/risk-off shifts.",
+        "Macro prints (CPI, FOMC, jobs) often drive risk-on/risk-off for crypto.",
         "ETF/flows headlines can move BTC and ETH quickly.",
-        "Regulatory headlines (SEC, CFTC, EU MiCA updates) can change sentiment fast.",
+        "Regulatory headlines can change sentiment fast.",
     ]
 
     def _coin_query(sym: str) -> str:
@@ -751,6 +1017,21 @@ def crypto_news_briefing(
             items = _fetch_rss_items(url, timeout=10, max_items=include_top_n, ttl_seconds=240, stale_ttl_seconds=6 * 3600)
             items = _dedup_items(items, include_top_n)
 
+            if deep == 1:
+                with ThreadPoolExecutor(max_workers=8) as ex:
+                    futs = {ex.submit(_fetch_meta_description, x.get("link", ""), 8): x for x in items[:10] if x.get("link")}
+                    for f in as_completed(futs):
+                        x = futs[f]
+                        try:
+                            md = f.result() or ""
+                            if md and (not x.get("description") or len(str(x.get("description") or "")) < 40):
+                                x["description"] = md
+                        except Exception:
+                            continue
+
+            score, label = _score_items(items)
+            summary = _brief_sector_summary(sym, items, score, label)
+
             headlines = [
                 {
                     "title": x.get("title", ""),
@@ -758,14 +1039,15 @@ def crypto_news_briefing(
                     "published": x.get("published", ""),
                     "source": "Google News",
                     "bucket": "Google News",
+                    "description": x.get("description", ""),
                 }
                 for x in items
             ]
 
             coins_out.append({
                 "symbol": sym,
-                "sentiment": {"label": "NEUTRAL", "score": 50},
-                "summary": "",
+                "sentiment": {"label": label, "score": score},
+                "summary": summary,
                 "headlines": headlines,
             })
         except Exception as e:
@@ -773,13 +1055,13 @@ def crypto_news_briefing(
             coins_out.append({
                 "symbol": sym,
                 "sentiment": {"label": "NEUTRAL", "score": 50},
-                "summary": "",
+                "summary": "No headlines returned.",
                 "headlines": [],
             })
 
     out = {
         "date": now,
-        "note": "Crypto news uses Google News RSS only.",
+        "note": "Crypto news uses Google News RSS only, plus optional meta descriptions if deep=1.",
         "errors": errors,
         "sources": {"outlets": ["Google News RSS"]},
         "overallSentiment": {"label": "NEUTRAL", "score": 50},
@@ -790,7 +1072,7 @@ def crypto_news_briefing(
 
 
 # =========================================================
-# Congress parsing helpers
+# Congress endpoint you’re using (kept compatible)
 # =========================================================
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
@@ -890,85 +1172,23 @@ def _row_best_dt(row: dict) -> Optional[datetime]:
     return _parse_dt_any(traded) or _parse_dt_any(filed)
 
 
-def _row_filed_dt(row: dict) -> Optional[datetime]:
-    filed = _pick_first(row, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], "")
-    return _parse_dt_any(filed)
-
-
-def _row_traded_dt(row: dict) -> Optional[datetime]:
-    traded = _pick_first(row, ["Traded", "traded", "TransactionDate", "transaction_date"], "")
-    return _parse_dt_any(traded)
-
-
-def _norm_politician(row: dict) -> str:
-    return str(_pick_first(row, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
-
-
-def _norm_chamber(row: dict) -> str:
-    v = _pick_first(row, ["Chamber", "chamber", "HouseSenate", "house_senate"], "")
-    s = str(v).strip()
-    if not s:
-        return ""
-    up = s.upper()
-    if "HOUSE" in up:
-        return "House"
-    if "SENATE" in up:
-        return "Senate"
-    return s
-
-
-def _norm_amount_range(row: dict) -> str:
-    v = _pick_first(row, ["Amount", "amount", "AmountRange", "amountRange", "Range", "range"], "")
-    return str(v).strip()
-
-
-def _capitoltrades_links(politician: str, ticker: str) -> Dict[str, str]:
-    pol_slug = quote_plus((politician or "").strip())
-    t = quote_plus((ticker or "").strip().upper())
-    return {
-        "capitoltrades_politician": f"https://www.capitoltrades.com/politicians?search={pol_slug}" if pol_slug else "",
-        "capitoltrades_ticker": f"https://www.capitoltrades.com/trades?search={t}" if t else "",
-    }
-
-
-# =========================================================
-# Quiver access helper (cached)
-# =========================================================
-def _get_congress_df_cached(ttl_seconds: int = 180) -> Any:
-    key = "quiver:congress_df"
-    cached = cache_get(key, allow_stale=True)
-    if cached is not None:
-        return cached
-
-    if not QUIVER_TOKEN:
-        raise HTTPException(500, "QUIVER_TOKEN missing")
-
-    q = quiverquant.quiver(QUIVER_TOKEN)
-    df = q.congress_trading()
-    return cache_set(key, df, ttl_seconds=ttl_seconds, stale_ttl_seconds=6 * 3600)
-
-
-# =========================================================
-# /report/today (aggregated tickers + convergence)
-# =========================================================
 @app.get("/report/today")
 def report_today(
     window_days: Optional[int] = Query(default=None, ge=1, le=365),
     horizon_days: Optional[int] = Query(default=None, ge=1, le=365),
 ):
+    if not QUIVER_TOKEN:
+        raise HTTPException(500, "QUIVER_TOKEN missing")
+
     days = window_days if window_days is not None else horizon_days if horizon_days is not None else 30
-
-    cache_key = f"report:today:v471:{days}"
-    cached = cache_get(cache_key, allow_stale=True)
-    if cached is not None:
-        return cached
-
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
 
-    df = _get_congress_df_cached(ttl_seconds=180)
+    q = quiverquant.quiver(QUIVER_TOKEN)
+    df = q.congress_trading()
+
     if df is None or len(df) == 0:
-        out = {
+        return {
             "date": now.date().isoformat(),
             "windowDays": days,
             "windowStart": since.date().isoformat(),
@@ -978,11 +1198,12 @@ def report_today(
             "politicianSells": [],
             "crypto": {"buys": [], "sells": [], "rawBuys": [], "rawSells": [], "raw": []},
         }
-        return cache_set(cache_key, out, ttl_seconds=120, stale_ttl_seconds=1800)
 
     rows = df.to_dict(orient="records") if hasattr(df, "to_dict") else list(df)
 
-    agg: Dict[str, Dict[str, Any]] = {}
+    buys: List[dict] = []
+    sells: List[dict] = []
+
     for r in rows:
         best_dt = _row_best_dt(r)
         if best_dt is None or best_dt < since or best_dt > now:
@@ -1000,198 +1221,36 @@ def report_today(
         ticker = _norm_ticker(r)
         if not ticker:
             continue
-        ticker = ticker.upper()
 
-        filed_dt = _row_filed_dt(r)
-        traded_dt = _row_traded_dt(r)
-        last_dt = filed_dt or traded_dt or best_dt
+        pol = str(_pick_first(r, ["Politician", "politician", "Representative", "Senator", "Name", "name"], "")).strip()
+        filed_dt = _parse_dt_any(_pick_first(r, ["Filed", "filed", "ReportDate", "report_date", "Date", "date"], ""))
+        traded_dt = _parse_dt_any(_pick_first(r, ["Traded", "traded", "TransactionDate", "transaction_date"], ""))
 
-        cur = agg.get(ticker)
-        if not cur:
-            cur = {
-                "ticker": ticker,
-                "companyName": "",
-                "demBuyers": 0,
-                "repBuyers": 0,
-                "demSellers": 0,
-                "repSellers": 0,
-                "lastFiledAt": "",
-                "_last_dt": last_dt,
-            }
-            agg[ticker] = cur
+        card = {
+            "ticker": ticker,
+            "companyName": pol,
+            "demBuyers": 1 if (kind == "BUY" and party == "D") else 0,
+            "repBuyers": 1 if (kind == "BUY" and party == "R") else 0,
+            "demSellers": 1 if (kind == "SELL" and party == "D") else 0,
+            "repSellers": 1 if (kind == "SELL" and party == "R") else 0,
+            "lastFiledAt": _iso_date_only(filed_dt) or _iso_date_only(traded_dt),
+            "strength": kind,
+            "traded": _iso_date_only(traded_dt),
+            "filed": _iso_date_only(filed_dt),
+        }
 
         if kind == "BUY":
-            if party == "D":
-                cur["demBuyers"] += 1
-            elif party == "R":
-                cur["repBuyers"] += 1
+            buys.append(card)
         else:
-            if party == "D":
-                cur["demSellers"] += 1
-            elif party == "R":
-                cur["repSellers"] += 1
+            sells.append(card)
 
-        if last_dt and (cur.get("_last_dt") is None or last_dt > cur["_last_dt"]):
-            cur["_last_dt"] = last_dt
-
-    all_cards = list(agg.values())
-    for c in all_cards:
-        c["lastFiledAt"] = _iso_date_only(c.get("_last_dt"))
-        c.pop("_last_dt", None)
-
-    buys = [c for c in all_cards if (c.get("demBuyers", 0) + c.get("repBuyers", 0)) > 0]
-    sells = [c for c in all_cards if (c.get("demSellers", 0) + c.get("repSellers", 0)) > 0]
-
-    convergence = [
-        c for c in buys
-        if (c.get("demBuyers", 0) > 0 and c.get("repBuyers", 0) > 0)
-    ]
-
-    def _strength(c: Dict[str, Any]) -> int:
-        return int(c.get("demBuyers", 0) + c.get("repBuyers", 0) + c.get("demSellers", 0) + c.get("repSellers", 0))
-
-    def _sort_key(c: Dict[str, Any]) -> Tuple[int, str]:
-        return (_strength(c), str(c.get("ticker", "")))
-
-    buys.sort(key=_sort_key, reverse=True)
-    sells.sort(key=_sort_key, reverse=True)
-    convergence.sort(key=_sort_key, reverse=True)
-
-    out = {
+    return {
         "date": now.date().isoformat(),
         "windowDays": days,
         "windowStart": since.date().isoformat(),
         "windowEnd": now.date().isoformat(),
-        "convergence": convergence[:120],
-        "politicianBuys": buys[:220],
-        "politicianSells": sells[:220],
+        "convergence": [],
+        "politicianBuys": buys[:200],
+        "politicianSells": sells[:200],
         "crypto": {"buys": [], "sells": [], "rawBuys": [], "rawSells": [], "raw": []},
     }
-    return cache_set(cache_key, out, ttl_seconds=120, stale_ttl_seconds=1800)
-
-
-# =========================================================
-# /report/holdings/common
-# =========================================================
-@app.get("/report/holdings/common")
-def holdings_common(
-    window_days: int = Query(default=365, ge=1, le=365),
-    top_n: int = Query(default=30, ge=5, le=100),
-):
-    cache_key = f"report:holdings:common:v471:{window_days}:{top_n}"
-    cached = cache_get(cache_key, allow_stale=True)
-    if cached is not None:
-        return cached
-
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(days=window_days)
-
-    df = _get_congress_df_cached(ttl_seconds=240)
-    rows = df.to_dict(orient="records") if hasattr(df, "to_dict") else list(df)
-
-    holders_by_ticker: Dict[str, set] = {}
-    for r in rows:
-        dt = _row_best_dt(r)
-        if dt is None or dt < since or dt > now:
-            continue
-        ticker = _norm_ticker(r)
-        if not ticker:
-            continue
-        pol = _norm_politician(r)
-        if not pol:
-            continue
-        t = ticker.upper()
-        if t not in holders_by_ticker:
-            holders_by_ticker[t] = set()
-        holders_by_ticker[t].add(pol)
-
-    common = [{"ticker": t, "holders": len(pols)} for t, pols in holders_by_ticker.items()]
-    common.sort(key=lambda x: (int(x["holders"]), str(x["ticker"])), reverse=True)
-
-    out = {
-        "date": now.date().isoformat(),
-        "windowDays": window_days,
-        "commonHoldings": common[:top_n],
-        "note": "Holders = unique politicians with activity in the ticker during the window.",
-    }
-    return cache_set(cache_key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
-
-
-# =========================================================
-# /report/congress/daily
-# =========================================================
-@app.get("/report/congress/daily")
-def congress_daily(
-    window_days: int = Query(default=30, ge=1, le=365),
-    limit: int = Query(default=250, ge=50, le=1000),
-):
-    cache_key = f"report:congress:daily:v471:{window_days}:{limit}"
-    cached = cache_get(cache_key, allow_stale=True)
-    if cached is not None:
-        return cached
-
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(days=window_days)
-
-    df = _get_congress_df_cached(ttl_seconds=180)
-    rows = df.to_dict(orient="records") if hasattr(df, "to_dict") else list(df)
-
-    items: List[dict] = []
-    for r in rows:
-        best_dt = _row_best_dt(r)
-        if best_dt is None or best_dt < since or best_dt > now:
-            continue
-
-        party = _norm_party(r)
-        tx = _tx_text(r)
-        kind = "BUY" if _is_buy(tx) else "SELL" if _is_sell(tx) else ""
-        if not kind:
-            continue
-
-        ticker = _norm_ticker(r).upper()
-        if not ticker:
-            continue
-
-        politician = _norm_politician(r)
-        chamber = _norm_chamber(r)
-        filed_dt = _row_filed_dt(r)
-        traded_dt = _row_traded_dt(r)
-        amount_range = _norm_amount_range(r)
-
-        group_dt = filed_dt or traded_dt or best_dt
-
-        desc = str(_pick_first(r, ["Description", "description", "AssetDescription", "asset_description"], "")).strip()
-
-        items.append({
-            "_group_dt": group_dt,
-            "kind": kind,
-            "party": party,
-            "ticker": ticker,
-            "politician": politician,
-            "chamber": chamber,
-            "amountRange": amount_range,
-            "traded": _iso_date_only(traded_dt),
-            "filed": _iso_date_only(filed_dt),
-            "description": desc,
-            "links": _capitoltrades_links(politician, ticker),
-        })
-
-    items.sort(key=lambda x: (x.get("_group_dt") or datetime(1970, 1, 1, tzinfo=timezone.utc), x.get("ticker", "")), reverse=True)
-    items = items[:limit]
-
-    by_day: Dict[str, List[dict]] = {}
-    for it in items:
-        d = _iso_date_only(it.get("_group_dt"))
-        it.pop("_group_dt", None)
-        by_day.setdefault(d, []).append(it)
-
-    days_sorted = sorted(by_day.keys(), reverse=True)
-    days_out = [{"date": d, "items": by_day[d]} for d in days_sorted]
-
-    out = {
-        "date": now.date().isoformat(),
-        "windowDays": window_days,
-        "days": days_out,
-        "note": "Grouped by filed date when present, else traded date.",
-    }
-    return cache_set(cache_key, out, ttl_seconds=120, stale_ttl_seconds=1800)
