@@ -3,7 +3,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit, urlunsplit
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="5.0.0")
+app = FastAPI(title="Finance Signals Backend", version="4.9.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -62,14 +62,14 @@ SESSION = requests.Session()
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "5.0.0"}
+    return {"status": "ok", "version": "4.9.0"}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "5.0.0",
+        "version": "4.9.0",
         "hasQuiverToken": bool(QUIVER_TOKEN),
         "hasFinnhubKey": bool(FINNHUB_API_KEY),
         "utc": datetime.now(timezone.utc).isoformat(),
@@ -121,7 +121,7 @@ def _is_cooled_down(provider: str) -> bool:
 # HTTP helpers
 # =========================================================
 def _requests_get(url: str, params: Optional[dict] = None, timeout: int = 16, headers: Optional[dict] = None) -> requests.Response:
-    return SESSION.get(url, params=params, timeout=timeout, headers=headers or UA_HEADERS)
+    return SESSION.get(url, params=params, timeout=timeout, headers=headers or UA_HEADERS, allow_redirects=True)
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -274,87 +274,56 @@ def _ret_from_series(vals: List[float], offset: int) -> Optional[float]:
 
 
 # =========================================================
-# CNN Fear & Greed (hardened)
+# CNN Fear & Greed (best effort)
 # =========================================================
-def _cnn_fear_greed_graphdata(date_str: str) -> dict:
-    url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{date_str}"
+def _cnn_fear_greed_graphdata(date_str: Optional[str] = None) -> dict:
+    d = date_str or datetime.now(timezone.utc).date().isoformat()
+    url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{d}"
     r = _requests_get(url, timeout=16, headers=UA_HEADERS)
     r.raise_for_status()
     return r.json()
 
 
-def _fg_from_graphdata(data: dict, date_fallback: str) -> Dict[str, Any]:
-    fg = (data or {}).get("fear_and_greed") or {}
-    now_val = fg.get("now") or {}
-    score = now_val.get("value")
-    rating = now_val.get("valueText") or now_val.get("rating")
-    score_num = _safe_float(score)
-    return {
-        "date": (data or {}).get("date") or date_fallback,
-        "score": int(score_num) if isinstance(score_num, (int, float)) else None,
-        "rating": rating if rating else None,
-    }
-
-
 @app.get("/market/fear-greed")
 def market_fear_greed(date: Optional[str] = Query(default=None)):
-    req_key = f"feargreed:{date or 'auto'}"
-    cached = cache_get(req_key, allow_stale=True)
+    key = f"feargreed:{date or 'today'}"
+    cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
 
-    last_good_key = "feargreed:last_good"
-    errors: List[str] = []
-
-    def try_date(d: str) -> Optional[Dict[str, Any]]:
-        try:
-            data = _cnn_fear_greed_graphdata(d)
-            out = _fg_from_graphdata(data, d)
-            if isinstance(out.get("score"), int) and out.get("rating"):
-                cache_set(last_good_key, out, ttl_seconds=6 * 3600, stale_ttl_seconds=48 * 3600)
-                return out
-            errors.append(f"FG null/partial for {d}")
-            return None
-        except Exception as e:
-            errors.append(f"{d}: {type(e).__name__}: {str(e)[:160]}")
-            return None
-
-    if date:
-        out = try_date(date)
-        if out:
-            return cache_set(req_key, out, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
-
-        lg = cache_get(last_good_key, allow_stale=True)
-        if lg is not None:
-            merged = dict(lg)
-            merged["error"] = " | ".join(errors[:3])
-            return cache_set(req_key, merged, ttl_seconds=120, stale_ttl_seconds=900)
-
-        return cache_set(req_key, {"date": date, "score": None, "rating": None, "error": " | ".join(errors[:3])}, ttl_seconds=120, stale_ttl_seconds=900)
-
-    today = datetime.now(timezone.utc).date()
-    candidates = [today.isoformat(), (today - timedelta(days=1)).isoformat(), (today - timedelta(days=2)).isoformat()]
-
-    for d in candidates:
-        out = try_date(d)
-        if out:
-            return cache_set(req_key, out, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
-
-    lg = cache_get(last_good_key, allow_stale=True)
-    if lg is not None:
-        merged = dict(lg)
-        merged["error"] = " | ".join(errors[:3])
-        return cache_set(req_key, merged, ttl_seconds=120, stale_ttl_seconds=900)
-
-    return cache_set(req_key, {"date": candidates[0], "score": None, "rating": None, "error": " | ".join(errors[:3])}, ttl_seconds=120, stale_ttl_seconds=900)
+    try:
+        data = _cnn_fear_greed_graphdata(date)
+        fg = (data or {}).get("fear_and_greed") or {}
+        now_val = fg.get("now") or {}
+        out = {
+            "date": (data or {}).get("date") or (date or datetime.now(timezone.utc).date().isoformat()),
+            "score": now_val.get("value"),
+            "rating": now_val.get("valueText") or now_val.get("rating"),
+        }
+        return cache_set(key, out, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
+    except Exception as e:
+        stale = cache_get(key, allow_stale=True)
+        if stale is not None:
+            return stale
+        return cache_set(
+            key,
+            {
+                "date": date or datetime.now(timezone.utc).date().isoformat(),
+                "score": None,
+                "rating": None,
+                "error": f"{type(e).__name__}: {str(e)}",
+            },
+            ttl_seconds=120,
+            stale_ttl_seconds=900,
+        )
 
 
 # =========================================================
-# Daily market read (matches your HTML expectations)
+# Daily market read
 # =========================================================
 @app.get("/market/read")
 def market_read():
-    key = "market:read:v500"
+    key = "market:read:v490"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -418,8 +387,6 @@ def market_read():
     try:
         fgd = market_fear_greed(None)
         fg = {"score": fgd.get("score"), "rating": fgd.get("rating")}
-        if fgd.get("error"):
-            errors.append(f"FearGreed: {fgd.get('error')}")
     except Exception as e:
         errors.append(f"FearGreed: {type(e).__name__}: {str(e)}")
 
@@ -442,7 +409,7 @@ def market_read():
 
     if vix_last is not None:
         parts.append(f"VIX {vix_last:.2f}.")
-    if isinstance(fg.get("score"), int):
+    if isinstance(fg.get("score"), (int, float)):
         parts.append(f"Fear & Greed {fg.get('score')} ({fg.get('rating') or '—'}).")
 
     out = {
@@ -453,87 +420,56 @@ def market_read():
         "vix": {"symbol": "^VIX", "last": vix_last},
         "fearGreed": fg,
         "errors": errors,
-        "note": "Uses Stooq daily history first; falls back to Nasdaq quote when needed. Fear & Greed falls back to prior days and last-good.",
+        "note": "Uses Stooq daily history first; falls back to Nasdaq quote when needed.",
     }
     return cache_set(key, out, ttl_seconds=180, stale_ttl_seconds=1800)
 
 
 # =========================================================
-# RSS parsing + summaries (NEW)
+# RSS + freshness + dedupe helpers
 # =========================================================
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_WS_RE = re.compile(r"\s+")
-_META_DESC_RE = re.compile(r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']{20,500})["\']', re.IGNORECASE)
-_OG_DESC_RE = re.compile(r'<meta\s+property=["\']og:description["\']\s+content=["\']([^"\']{20,500})["\']', re.IGNORECASE)
+def _google_news_rss(query: str) -> str:
+    q = quote_plus(query)
+    return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 
-def _strip_html(s: str) -> str:
-    if not s:
+def _normalize_url_for_dedupe(url: str) -> str:
+    if not url:
         return ""
-    s2 = _HTML_TAG_RE.sub(" ", s)
-    s2 = s2.replace("&nbsp;", " ").replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
-    s2 = _WS_RE.sub(" ", s2).strip()
-    return s2
-
-
-def _parse_rfc822_or_iso(dt_str: str) -> Optional[datetime]:
-    if not dt_str:
-        return None
-    s = dt_str.strip()
-    s = s.replace("Z", "+00:00")
     try:
-        dt = datetime.fromisoformat(s)
+        u = url.strip()
+        sp = urlsplit(u)
+        # Drop query/fragment so Google tracking variations do not create duplicates
+        return urlunsplit((sp.scheme, sp.netloc, sp.path, "", ""))
+    except Exception:
+        return url.strip()
+
+
+def _parse_rss_datetime(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    txt = s.strip()
+    # Atom updated often ISO
+    try:
+        dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         pass
 
-    # RFC822-ish: "Mon, 29 Jan 2026 14:22:00 GMT"
-    for fmt in ["%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z", "%d %b %Y %H:%M:%S %Z"]:
+    # Common RSS: "Wed, 31 Jan 2026 15:04:05 GMT"
+    fmts = [
+        "%a, %d %b %Y %H:%M:%S %Z",
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%d %b %Y %H:%M:%S %Z",
+        "%Y-%m-%d",
+    ]
+    for f in fmts:
         try:
-            dt = datetime.strptime(s, fmt)
-            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+            dt = datetime.strptime(txt, f)
+            return dt.replace(tzinfo=timezone.utc)
         except Exception:
             continue
     return None
-
-
-def _within_days(dt: Optional[datetime], days: int) -> bool:
-    if dt is None:
-        return True  # if missing date, keep it (some feeds omit dates)
-    now = datetime.now(timezone.utc)
-    return dt >= (now - timedelta(days=days))
-
-
-def _best_effort_page_summary(url: str, timeout: int = 8) -> str:
-    """
-    Optional: fetch article page and try to extract meta/og description.
-    Many sites block bots. This is best-effort.
-    """
-    if not url:
-        return ""
-    cache_key = f"pagedesc:{url}"
-    cached = cache_get(cache_key, allow_stale=True)
-    if cached is not None:
-        return cached
-
-    try:
-        r = _requests_get(url, timeout=timeout, headers=UA_HEADERS)
-        if r.status_code >= 400:
-            return cache_set(cache_key, "", ttl_seconds=900, stale_ttl_seconds=6 * 3600)
-        html = (r.text or "")[:200000]
-        m = _OG_DESC_RE.search(html) or _META_DESC_RE.search(html)
-        if not m:
-            return cache_set(cache_key, "", ttl_seconds=900, stale_ttl_seconds=6 * 3600)
-        desc = _strip_html(m.group(1))
-        desc = desc[:240].rstrip()
-        return cache_set(cache_key, desc, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
-    except Exception:
-        return cache_set(cache_key, "", ttl_seconds=900, stale_ttl_seconds=6 * 3600)
-
-
-def _google_news_rss(query: str) -> str:
-    q = quote_plus(query)
-    return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 
 def _fetch_rss_items_uncached(url: str, timeout: int = 10, max_items: int = 25) -> List[dict]:
@@ -555,7 +491,6 @@ def _fetch_rss_items_uncached(url: str, timeout: int = 10, max_items: int = 25) 
 
     channel = root.find("channel")
     if channel is None:
-        # Atom
         entries = root.findall("{http://www.w3.org/2005/Atom}entry")
         out = []
         for e in entries[:max_items]:
@@ -563,9 +498,8 @@ def _fetch_rss_items_uncached(url: str, timeout: int = 10, max_items: int = 25) 
             link_el = e.find("{http://www.w3.org/2005/Atom}link")
             link = (link_el.get("href") if link_el is not None else "") or ""
             pub = (e.findtext("{http://www.w3.org/2005/Atom}updated") or "").strip()
-            summary = (e.findtext("{http://www.w3.org/2005/Atom}summary") or "").strip()
             if title:
-                out.append({"title": title, "link": link, "published": pub, "summary": _strip_html(summary)})
+                out.append({"title": title, "link": link, "published": pub})
         return out
 
     out = []
@@ -573,19 +507,12 @@ def _fetch_rss_items_uncached(url: str, timeout: int = 10, max_items: int = 25) 
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
         pub = (item.findtext("pubDate") or "").strip()
-        desc = (item.findtext("description") or "").strip()
         if title:
-            out.append({"title": title, "link": link, "published": pub, "summary": _strip_html(desc)})
+            out.append({"title": title, "link": link, "published": pub})
     return out
 
 
-def _fetch_rss_items(
-    url: str,
-    timeout: int = 10,
-    max_items: int = 25,
-    ttl_seconds: int = 240,
-    stale_ttl_seconds: int = 6 * 3600
-) -> List[dict]:
+def _fetch_rss_items(url: str, timeout: int = 10, max_items: int = 25, ttl_seconds: int = 240, stale_ttl_seconds: int = 6 * 3600) -> List[dict]:
     key = f"rss:{url}"
     fresh = cache_get(key, allow_stale=False)
     if fresh is not None:
@@ -600,13 +527,26 @@ def _fetch_rss_items(
         raise
 
 
+def _is_within_days(published: str, max_age_days: int) -> bool:
+    if not published:
+        return True  # some feeds omit, keep but it will be deduped
+    dt = _parse_rss_datetime(published)
+    if not dt:
+        return True
+    now = datetime.now(timezone.utc)
+    return dt >= (now - timedelta(days=max_age_days))
+
+
 def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
     seen = set()
     out = []
     for x in items:
-        lk = (x.get("link") or "").strip()
+        lk = _normalize_url_for_dedupe((x.get("link") or "").strip())
         ttl = (x.get("title") or "").strip()
-        k = lk or ttl
+        ttl_key = re.sub(r"\s+", " ", ttl.lower()).strip()
+
+        # Combine to catch "same headline, different Google wrapper URL"
+        k = lk or ttl_key
         if not k or k in seen:
             continue
         seen.add(k)
@@ -616,6 +556,102 @@ def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
     return out
 
 
+def _dedup_within_list_by_title(items: List[dict]) -> List[dict]:
+    seen = set()
+    out = []
+    for x in items:
+        ttl = re.sub(r"\s+", " ", str(x.get("title") or "").lower()).strip()
+        if not ttl or ttl in seen:
+            continue
+        seen.add(ttl)
+        out.append(x)
+    return out
+
+
+# =========================================================
+# Headline summary extraction (lazy)
+# =========================================================
+_TAG_RE = re.compile(r"<[^>]+>")
+_META_OG_DESC = re.compile(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE)
+_META_DESC = re.compile(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE)
+_META_TW_DESC = re.compile(r'<meta[^>]+name=["\']twitter:description["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def _clean_text(s: str) -> str:
+    s2 = (s or "").replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'").strip()
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    return s2
+
+
+def _html_to_text(html: str) -> str:
+    if not html:
+        return ""
+    # Remove script/style quickly
+    html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    txt = _TAG_RE.sub(" ", html)
+    txt = _clean_text(txt)
+    return txt
+
+
+def _extract_description_from_html(html: str) -> str:
+    if not html:
+        return ""
+    for rx in (_META_OG_DESC, _META_DESC, _META_TW_DESC):
+        m = rx.search(html)
+        if m and m.group(1):
+            return _clean_text(m.group(1))
+    return ""
+
+
+def _headline_summary_from_url(url: str) -> dict:
+    if not url:
+        return {"summary": "", "finalUrl": "", "error": "missing url"}
+
+    key = f"sum:{_normalize_url_for_dedupe(url)}"
+    cached = cache_get(key, allow_stale=True)
+    if cached is not None:
+        return cached
+
+    try:
+        r = _requests_get(url, timeout=14, headers=UA_HEADERS)
+        final_url = getattr(r, "url", url)
+        html = (r.text or "")[:350_000]
+
+        desc = _extract_description_from_html(html)
+        if desc and len(desc) >= 50:
+            out = {"summary": desc[:420], "finalUrl": final_url, "error": ""}
+            return cache_set(key, out, ttl_seconds=12 * 3600, stale_ttl_seconds=48 * 3600)
+
+        # fallback: take first short chunk of visible text
+        txt = _html_to_text(html)
+        # crude "first sentences"
+        snippet = txt[:900]
+        # trim at sentence-ish boundary
+        cut = re.split(r"(?<=[.!?])\s+", snippet)
+        summary = " ".join(cut[:2]).strip()
+        summary = summary[:420]
+
+        out = {"summary": summary, "finalUrl": final_url, "error": ""}
+        return cache_set(key, out, ttl_seconds=6 * 3600, stale_ttl_seconds=48 * 3600)
+
+    except Exception as e:
+        out = {"summary": "", "finalUrl": url, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        return cache_set(key, out, ttl_seconds=600, stale_ttl_seconds=3600)
+
+
+@app.get("/news/article/summary")
+def news_article_summary(url: str = Query(..., min_length=5)):
+    return _headline_summary_from_url(url)
+
+
+@app.get("/crypto/article/summary")
+def crypto_article_summary(url: str = Query(..., min_length=5)):
+    return _headline_summary_from_url(url)
+
+
+# =========================================================
+# Sentiment + implications (unchanged)
+# =========================================================
 _TICKER_RE = re.compile(r"\b[A-Z]{1,5}\b")
 
 
@@ -648,30 +684,19 @@ _NEG_WORDS = {
 }
 
 
-def _sentiment_from_titles(titles: List[str]) -> Dict[str, Any]:
-    titles = [t for t in (titles or []) if (t or "").strip()]
-    n = len(titles)
-    if n == 0:
-        return {"score": 50, "label": "NEUTRAL", "sampleSize": 0, "posHits": 0, "negHits": 0, "confidence": "LOW"}
-
-    pos_hits = 0
-    neg_hits = 0
+def _sentiment_from_titles(titles: List[str]) -> Tuple[int, str]:
+    if not titles:
+        return 50, "NEUTRAL"
+    score = 50
     for t in titles:
         s = (t or "").lower()
-        pos_hits += sum(1 for w in _POS_WORDS if w in s)
-        neg_hits += sum(1 for w in _NEG_WORDS if w in s)
-
-    net_per = (pos_hits - neg_hits) / max(1, n)
-    net_per = max(-3.0, min(3.0, net_per))
-
-    gain = 10.0
-    score = int(round(50.0 + gain * net_per))
-    score = max(0, min(100, score))
-
+        pos = sum(1 for w in _POS_WORDS if w in s)
+        neg = sum(1 for w in _NEG_WORDS if w in s)
+        score += 4 * pos
+        score -= 5 * neg
+    score = int(max(0, min(100, score)))
     label = "BULLISH" if score >= 62 else "BEARISH" if score <= 38 else "NEUTRAL"
-    confidence = "LOW" if n < 12 else "MED" if n < 28 else "HIGH"
-
-    return {"score": score, "label": label, "sampleSize": n, "posHits": int(pos_hits), "negHits": int(neg_hits), "confidence": confidence}
+    return score, label
 
 
 def _flowing_summary(sector: str, titles: List[str], watchlist: List[str]) -> Tuple[str, List[str], List[str]]:
@@ -717,7 +742,7 @@ def _flowing_summary(sector: str, titles: List[str], watchlist: List[str]) -> Tu
 
 
 # =========================================================
-# News briefing (UPDATED: 30-day filter + headline summary)
+# News briefing (recency + dedupe improvements)
 # =========================================================
 @app.get("/news/briefing")
 def news_briefing(
@@ -726,14 +751,9 @@ def news_briefing(
     max_per_ticker: int = Query(default=6, ge=1, le=30),
     sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
     max_items_per_sector: int = Query(default=12, ge=5, le=30),
-    lookback_days: int = Query(default=30, ge=7, le=45),
-    fetch_summaries: int = Query(default=0, ge=0, le=1),
+    max_age_days: int = Query(default=30, ge=7, le=60),
 ):
-    """
-    lookback_days: filter out headlines older than this (default 30).
-    fetch_summaries: when 1, if RSS summary is empty, try page meta description.
-    """
-    key = f"news:brief:v500:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}:{lookback_days}:{fetch_summaries}"
+    key = f"news:brief:v490:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}:{max_age_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -746,47 +766,20 @@ def news_briefing(
     errors: List[str] = []
     all_items: List[dict] = []
 
-    def normalize_item(x: dict, sector: str) -> Optional[dict]:
-        title = (x.get("title") or "").strip()
-        link = (x.get("link") or "").strip()
-        published = (x.get("published") or "").strip()
-        summary = (x.get("summary") or "").strip()
-
-        dt = _parse_rfc822_or_iso(published)
-        if dt is not None and not _within_days(dt, lookback_days):
-            return None
-
-        if fetch_summaries == 1 and (not summary or len(summary) < 25) and link:
-            summary2 = _best_effort_page_summary(link)
-            if summary2:
-                summary = summary2
-
-        # Final clamp
-        summary = summary[:280].rstrip()
-
-        return {
-            "title": title,
-            "link": link,
-            "published": published,
-            "_published_dt": dt.isoformat() if dt else "",
-            "summary": summary,
-            "sector": sector,
-            "source": "Google News",
-        }
-
     jobs: List[Tuple[str, str]] = []
     for sec in sector_list[:18]:
         jobs.append((sec, _google_news_rss(f"{sec} stocks markets")))
 
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = [(sec, ex.submit(_fetch_rss_items, url, 10, max_items_per_sector * 5, 240, 6 * 3600)) for sec, url in jobs]
+        futs = [(sec, ex.submit(_fetch_rss_items, url, 10, max_items_per_sector * 3, 240, 6 * 3600)) for sec, url in jobs]
         for sec, fut in futs:
             try:
                 items = fut.result()
+                items = [x for x in items if _is_within_days(str(x.get("published") or ""), max_age_days)]
                 for x in items:
-                    nx = normalize_item(x, sec)
-                    if nx:
-                        all_items.append(nx)
+                    x["sector"] = sec
+                    x["source"] = "Google News"
+                all_items.extend(items)
             except Exception as e:
                 errors.append(f"{sec}: {type(e).__name__}: {str(e)}")
 
@@ -795,32 +788,28 @@ def news_briefing(
         for t in watch[:40]:
             ticker_jobs.append((t, _google_news_rss(f"{t} stock")))
         with ThreadPoolExecutor(max_workers=8) as ex:
-            futs2 = [(t, ex.submit(_fetch_rss_items, url, 10, max_per_ticker * 4, 240, 6 * 3600)) for t, url in ticker_jobs]
+            futs2 = [(t, ex.submit(_fetch_rss_items, url, 10, max_per_ticker * 3, 240, 6 * 3600)) for t, url in ticker_jobs]
             for t, fut in futs2:
                 try:
                     items = fut.result()
+                    items = [x for x in items if _is_within_days(str(x.get("published") or ""), max_age_days)]
                     for x in items:
-                        nx = normalize_item(x, "Watchlist")
-                        if nx:
-                            nx["ticker"] = t
-                            all_items.append(nx)
+                        x["sector"] = "Watchlist"
+                        x["source"] = "Google News"
+                        x["ticker"] = t
+                    all_items.extend(items)
                 except Exception as e:
                     errors.append(f"{t}: {type(e).__name__}: {str(e)}")
 
-    # Dedup and then sort newest first (when dates exist)
-    all_items = _dedup_items(all_items, 2000)
-
-    def sort_key(it: dict):
-        s = it.get("_published_dt") or ""
-        return s
-
-    all_items.sort(key=sort_key, reverse=True)
+    all_items = _dedup_items(all_items, 1200)
 
     sectors_out = []
     for sec in sector_list:
-        sec_items = [x for x in all_items if x.get("sector") == sec][:max_items_per_sector]
+        sec_items = [x for x in all_items if x.get("sector") == sec]
+        sec_items = _dedup_within_list_by_title(sec_items)[:max_items_per_sector]
+
         titles = [x.get("title", "") for x in sec_items]
-        sent = _sentiment_from_titles(titles)
+        score, label = _sentiment_from_titles(titles)
         summary, implications, tickers_mentioned = _flowing_summary(sec, titles, watch)
 
         watch_mentions = []
@@ -832,7 +821,7 @@ def news_briefing(
 
         sectors_out.append({
             "sector": sec,
-            "sentiment": sent,
+            "sentiment": {"label": label, "score": score},
             "summary": summary,
             "implications": implications,
             "topHeadlines": [
@@ -841,8 +830,8 @@ def news_briefing(
                     "link": x.get("link", ""),
                     "published": x.get("published", ""),
                     "sourceFeed": x.get("source", "Google News"),
-                    "sector": sec,
-                    "summary": x.get("summary", ""),
+                    "sector": sec
+                    # summary is lazy-loaded via /news/article/summary
                 }
                 for x in sec_items
             ],
@@ -851,25 +840,27 @@ def news_briefing(
         })
 
     if watch:
-        wl_items = [x for x in all_items if x.get("sector") == "Watchlist"][:max_general]
-        wl_titles = [x.get("title", "") for x in wl_items]
+        wl_items = [x for x in all_items if x.get("sector") == "Watchlist"]
+        wl_items = _dedup_within_list_by_title(wl_items)[:max_general]
 
-        wl_sent = _sentiment_from_titles(wl_titles)
+        wl_titles = [x.get("title", "") for x in wl_items]
+        wl_score, wl_label = _sentiment_from_titles(wl_titles)
         wl_summary, wl_imp, wl_tickers = _flowing_summary("Your watchlist", wl_titles, watch)
 
         sectors_out.insert(0, {
             "sector": "Watchlist",
-            "sentiment": wl_sent,
+            "sentiment": {"label": wl_label, "score": wl_score},
             "summary": wl_summary,
-            "implications": wl_imp + (["Names to watch closely: " + ", ".join(watch[:12]) + "."] if watch else []),
+            "implications": wl_imp + ([
+                "Names to watch closely: " + ", ".join(watch[:12]) + "."
+            ] if watch else []),
             "topHeadlines": [
                 {
                     "title": x.get("title", ""),
                     "link": x.get("link", ""),
                     "published": x.get("published", ""),
                     "sourceFeed": x.get("source", "Google News"),
-                    "sector": "Watchlist",
-                    "summary": x.get("summary", ""),
+                    "sector": "Watchlist"
                 }
                 for x in wl_items
             ],
@@ -880,20 +871,20 @@ def news_briefing(
     all_titles = []
     for s in sectors_out:
         all_titles.extend([h.get("title", "") for h in (s.get("topHeadlines") or [])])
-    overall_sent = _sentiment_from_titles(all_titles)
+    overall_score, overall_label = _sentiment_from_titles(all_titles)
 
     out = {
         "date": datetime.now(timezone.utc).date().isoformat(),
-        "overallSentiment": overall_sent,
+        "overallSentiment": {"label": overall_label, "score": overall_score},
         "sectors": sectors_out,
         "errors": errors,
-        "note": f"Briefing uses Google News RSS. Headlines filtered to last {lookback_days} days. Each headline includes summary from RSS description (optionally meta description fallback).",
+        "note": f"Briefing uses Google News RSS. Headlines limited to {max_age_days} days. Per-headline summary is lazy via /news/article/summary.",
     }
     return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
 
 
 # =========================================================
-# Congress helpers + endpoints (UNCHANGED)
+# Congress endpoints (unchanged from your file)
 # =========================================================
 _party_re = re.compile(r"/\s*([DR])\b", re.IGNORECASE)
 
@@ -1023,7 +1014,7 @@ def holdings_common(window_days: int = Query(default=365, ge=30, le=365), top_n:
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"holdings:common:v500:{window_days}:{top_n}"
+    key = f"holdings:common:v490:{window_days}:{top_n}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1068,7 +1059,7 @@ def congress_daily(window_days: int = Query(default=30, ge=1, le=365), limit: in
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"congress:daily:v500:{window_days}:{limit}"
+    key = f"congress:daily:v490:{window_days}:{limit}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1091,7 +1082,6 @@ def congress_daily(window_days: int = Query(default=30, ge=1, le=365), limit: in
         if best_dt is None or best_dt < since or best_dt > now:
             continue
 
-        party = _norm_party(r)
         tx = _tx_text(r)
         kind = "BUY" if _is_buy(tx) else "SELL" if _is_sell(tx) else ""
         if not kind:
@@ -1113,13 +1103,12 @@ def congress_daily(window_days: int = Query(default=30, ge=1, le=365), limit: in
             "kind": kind,
             "ticker": ticker.upper(),
             "politician": pol,
-            "party": party,
+            "party": _norm_party(r),
             "chamber": chamber,
             "amountRange": amt,
             "traded": _iso_date_only(traded_dt),
             "filed": _iso_date_only(filed_dt),
             "description": desc,
-            "links": {"capitoltrades_politician": "", "capitoltrades_ticker": ""},
             "_best_dt": best_dt,
         })
 
@@ -1138,14 +1127,15 @@ def congress_daily(window_days: int = Query(default=30, ge=1, le=365), limit: in
 
 
 # =========================================================
-# Crypto briefing endpoint (kept)
+# Crypto briefing (recency + dedupe improvements)
 # =========================================================
 @app.get("/crypto/news/briefing")
 def crypto_news_briefing(
     coins: str = Query(default="BTC,ETH,LINK,SHIB"),
     include_top_n: int = Query(default=15, ge=5, le=50),
+    max_age_days: int = Query(default=30, ge=7, le=60),
 ):
-    key = f"crypto:news:v500:{coins}:{include_top_n}"
+    key = f"crypto:news:v490:{coins}:{include_top_n}:{max_age_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1161,31 +1151,51 @@ def crypto_news_briefing(
 
     for c in coin_list[:25]:
         try:
-            items = _fetch_rss_items(_google_news_rss(f"{c} crypto"), timeout=10, max_items=max(10, include_top_n), ttl_seconds=240, stale_ttl_seconds=6 * 3600)
-            items = _dedup_items(items, include_top_n)
+            items = _fetch_rss_items(
+                _google_news_rss(f"{c} crypto"),
+                timeout=10,
+                max_items=max(12, include_top_n * 3),
+                ttl_seconds=240,
+                stale_ttl_seconds=6 * 3600
+            )
+            items = [x for x in items if _is_within_days(str(x.get("published") or ""), max_age_days)]
+            items = _dedup_items(items, 500)
+            items = _dedup_within_list_by_title(items)[:include_top_n]
+
             titles = [x.get("title", "") for x in items]
-            sent = _sentiment_from_titles(titles)
+            score, label = _sentiment_from_titles(titles)
             summary, implications, _tks = _flowing_summary(c, titles, [])
             all_titles.extend(titles)
 
             coin_blocks.append({
                 "symbol": c,
-                "sentiment": sent,
+                "sentiment": {"label": label, "score": score},
                 "summary": summary or (implications[0] if implications else ""),
                 "headlines": [
-                    {"title": x.get("title", ""), "link": x.get("link", ""), "published": x.get("published", ""), "source": "Google News", "summary": (x.get("summary") or "")}
+                    {
+                        "title": x.get("title", ""),
+                        "link": x.get("link", ""),
+                        "published": x.get("published", ""),
+                        "source": "Google News"
+                        # summary is lazy via /crypto/article/summary
+                    }
                     for x in items
                 ]
             })
         except Exception as e:
             errors.append(f"{c}: {type(e).__name__}: {str(e)}")
-            coin_blocks.append({"symbol": c, "sentiment": {"label": "NEUTRAL", "score": 50, "sampleSize": 0, "posHits": 0, "negHits": 0, "confidence": "LOW"}, "summary": "", "headlines": []})
+            coin_blocks.append({
+                "symbol": c,
+                "sentiment": {"label": "NEUTRAL", "score": 50},
+                "summary": "",
+                "headlines": []
+            })
 
-    overall_sent = _sentiment_from_titles(all_titles)
+    overall_score, overall_label = _sentiment_from_titles(all_titles)
 
     out = {
         "date": now.date().isoformat(),
-        "overallSentiment": overall_sent,
+        "overallSentiment": {"label": overall_label, "score": overall_score},
         "catalysts": [
             "Macro risk-on/risk-off can dominate crypto short-term.",
             "Watch for ETF flows, exchange outages, major protocol upgrades, and large unlock schedules (when relevant).",
@@ -1193,6 +1203,6 @@ def crypto_news_briefing(
         "coins": coin_blocks,
         "sources": {"outlets": ["Google News RSS"]},
         "errors": errors,
-        "note": "Crypto briefing is headline-based (Google News RSS). Sentiment is normalized by headline count.",
+        "note": f"Crypto briefing is headline-based. Headlines limited to {max_age_days} days. Per-headline summary is lazy via /crypto/article/summary.",
     }
     return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
