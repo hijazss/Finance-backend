@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.8.0")
+app = FastAPI(title="Finance Signals Backend", version="4.9.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -62,14 +62,14 @@ SESSION = requests.Session()
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.8.0"}
+    return {"status": "ok", "version": "4.9.0"}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "4.8.0",
+        "version": "4.9.0",
         "hasQuiverToken": bool(QUIVER_TOKEN),
         "hasFinnhubKey": bool(FINNHUB_API_KEY),
         "utc": datetime.now(timezone.utc).isoformat(),
@@ -274,57 +274,111 @@ def _ret_from_series(vals: List[float], offset: int) -> Optional[float]:
 
 
 # =========================================================
-# CNN Fear & Greed (best effort)
+# CNN Fear & Greed (hardened)
 # =========================================================
-def _cnn_fear_greed_graphdata(date_str: Optional[str] = None) -> dict:
-    d = date_str or datetime.now(timezone.utc).date().isoformat()
-    url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{d}"
+def _cnn_fear_greed_graphdata(date_str: str) -> dict:
+    url = f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{date_str}"
     r = _requests_get(url, timeout=16, headers=UA_HEADERS)
     r.raise_for_status()
     return r.json()
 
 
+def _fg_from_graphdata(data: dict, date_fallback: str) -> Dict[str, Any]:
+    fg = (data or {}).get("fear_and_greed") or {}
+    now_val = fg.get("now") or {}
+    score = now_val.get("value")
+    rating = now_val.get("valueText") or now_val.get("rating")
+    score_num = _safe_float(score)
+    return {
+        "date": (data or {}).get("date") or date_fallback,
+        "score": int(score_num) if isinstance(score_num, (int, float)) else None,
+        "rating": rating if rating else None,
+    }
+
+
 @app.get("/market/fear-greed")
 def market_fear_greed(date: Optional[str] = Query(default=None)):
-    key = f"feargreed:{date or 'today'}"
-    cached = cache_get(key, allow_stale=True)
+    """
+    Returns:
+      { date, score, rating, error? }
+
+    Behavior:
+      - If date is None: try today, then yesterday, then 2 days back.
+      - Stores a "last_good" record so /market/read can always show something.
+    """
+    req_key = f"feargreed:{date or 'auto'}"
+    cached = cache_get(req_key, allow_stale=True)
     if cached is not None:
         return cached
 
-    try:
-        data = _cnn_fear_greed_graphdata(date)
-        fg = (data or {}).get("fear_and_greed") or {}
-        now_val = fg.get("now") or {}
-        out = {
-            "date": (data or {}).get("date") or (date or datetime.now(timezone.utc).date().isoformat()),
-            "score": now_val.get("value"),
-            "rating": now_val.get("valueText") or now_val.get("rating"),
-        }
-        return cache_set(key, out, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
-    except Exception as e:
-        stale = cache_get(key, allow_stale=True)
-        if stale is not None:
-            return stale
+    last_good_key = "feargreed:last_good"
+    errors: List[str] = []
+
+    def try_date(d: str) -> Optional[Dict[str, Any]]:
+        try:
+            data = _cnn_fear_greed_graphdata(d)
+            out = _fg_from_graphdata(data, d)
+            if isinstance(out.get("score"), int) and out.get("rating"):
+                cache_set(last_good_key, out, ttl_seconds=6 * 3600, stale_ttl_seconds=48 * 3600)
+                return out
+            errors.append(f"FG null/partial for {d}")
+            return None
+        except Exception as e:
+            errors.append(f"{d}: {type(e).__name__}: {str(e)[:160]}")
+            return None
+
+    if date:
+        out = try_date(date)
+        if out:
+            return cache_set(req_key, out, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
+
+        lg = cache_get(last_good_key, allow_stale=True)
+        if lg is not None:
+            merged = dict(lg)
+            merged["error"] = " | ".join(errors[:3])
+            return cache_set(req_key, merged, ttl_seconds=120, stale_ttl_seconds=900)
+
         return cache_set(
-            key,
-            {
-                "date": date or datetime.now(timezone.utc).date().isoformat(),
-                "score": None,
-                "rating": None,
-                "error": f"{type(e).__name__}: {str(e)}",
-            },
+            req_key,
+            {"date": date, "score": None, "rating": None, "error": " | ".join(errors[:3])},
             ttl_seconds=120,
             stale_ttl_seconds=900,
         )
 
+    # auto mode: today then fallback
+    today = datetime.now(timezone.utc).date()
+    candidates = [
+        today.isoformat(),
+        (today - timedelta(days=1)).isoformat(),
+        (today - timedelta(days=2)).isoformat(),
+    ]
+
+    for d in candidates:
+        out = try_date(d)
+        if out:
+            return cache_set(req_key, out, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
+
+    lg = cache_get(last_good_key, allow_stale=True)
+    if lg is not None:
+        merged = dict(lg)
+        merged["error"] = " | ".join(errors[:3])
+        return cache_set(req_key, merged, ttl_seconds=120, stale_ttl_seconds=900)
+
+    return cache_set(
+        req_key,
+        {"date": candidates[0], "score": None, "rating": None, "error": " | ".join(errors[:3])},
+        ttl_seconds=120,
+        stale_ttl_seconds=900,
+    )
+
 
 # =========================================================
-# Daily market read (MATCHES YOUR HTML EXPECTATIONS)
+# Daily market read (matches your HTML expectations)
 # =========================================================
 @app.get("/market/read")
 def market_read():
     """
-    Returns what your frontend expects:
+    Returns:
       {
         date,
         summary,
@@ -334,7 +388,7 @@ def market_read():
         errors:[...]
       }
     """
-    key = "market:read:v480"
+    key = "market:read:v490"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -364,7 +418,6 @@ def market_read():
     except Exception as e:
         errors.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
 
-    # fallback quotes
     def _fallback_last_prev(symbol: str) -> Tuple[Optional[float], Optional[float]]:
         try:
             last, prev = _nasdaq_last_and_prev(symbol)
@@ -399,6 +452,8 @@ def market_read():
     try:
         fgd = market_fear_greed(None)
         fg = {"score": fgd.get("score"), "rating": fgd.get("rating")}
+        if fgd.get("error"):
+            errors.append(f"FearGreed: {fgd.get('error')}")
     except Exception as e:
         errors.append(f"FearGreed: {type(e).__name__}: {str(e)}")
 
@@ -421,7 +476,7 @@ def market_read():
 
     if vix_last is not None:
         parts.append(f"VIX {vix_last:.2f}.")
-    if isinstance(fg.get("score"), (int, float)):
+    if isinstance(fg.get("score"), int):
         parts.append(f"Fear & Greed {fg.get('score')} ({fg.get('rating') or '—'}).")
 
     out = {
@@ -432,7 +487,7 @@ def market_read():
         "vix": {"symbol": "^VIX", "last": vix_last},
         "fearGreed": fg,
         "errors": errors,
-        "note": "Uses Stooq daily history first; falls back to Nasdaq quote when needed.",
+        "note": "Uses Stooq daily history first; falls back to Nasdaq quote when needed. Fear & Greed falls back to prior days and last-good.",
     }
     return cache_set(key, out, ttl_seconds=180, stale_ttl_seconds=1800)
 
@@ -442,7 +497,7 @@ def market_read():
 # =========================================================
 @app.get("/market/entry")
 def market_entry(window_days: int = Query(default=365, ge=30, le=365)):
-    key = f"market:entry:v480:{window_days}"
+    key = f"market:entry:v490:{window_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -665,19 +720,47 @@ _NEG_WORDS = {
 }
 
 
-def _sentiment_from_titles(titles: List[str]) -> Tuple[int, str]:
-    if not titles:
-        return 50, "NEUTRAL"
-    score = 50
+def _sentiment_from_titles(titles: List[str]) -> Dict[str, Any]:
+    """
+    Normalized headline sentiment so 100 does not happen easily on small samples.
+    Returns diagnostics for UI sanity checks:
+      {score,label,sampleSize,posHits,negHits,confidence}
+    """
+    titles = [t for t in (titles or []) if (t or "").strip()]
+    n = len(titles)
+    if n == 0:
+        return {"score": 50, "label": "NEUTRAL", "sampleSize": 0, "posHits": 0, "negHits": 0, "confidence": "LOW"}
+
+    pos_hits = 0
+    neg_hits = 0
+
     for t in titles:
         s = (t or "").lower()
-        pos = sum(1 for w in _POS_WORDS if w in s)
-        neg = sum(1 for w in _NEG_WORDS if w in s)
-        score += 4 * pos
-        score -= 5 * neg
-    score = int(max(0, min(100, score)))
+        pos_hits += sum(1 for w in _POS_WORDS if w in s)
+        neg_hits += sum(1 for w in _NEG_WORDS if w in s)
+
+    # Normalize by headline count to avoid pegging extremes from small n
+    # net per headline in roughly [-2..+2] typical; clamp to avoid wild swings
+    net_per = (pos_hits - neg_hits) / max(1, n)
+    net_per = max(-3.0, min(3.0, net_per))
+
+    # Map to score around 50. Gain controls how fast it moves.
+    gain = 10.0
+    score = int(round(50.0 + gain * net_per))
+    score = max(0, min(100, score))
+
     label = "BULLISH" if score >= 62 else "BEARISH" if score <= 38 else "NEUTRAL"
-    return score, label
+
+    confidence = "LOW" if n < 12 else "MED" if n < 28 else "HIGH"
+
+    return {
+        "score": score,
+        "label": label,
+        "sampleSize": n,
+        "posHits": int(pos_hits),
+        "negHits": int(neg_hits),
+        "confidence": confidence,
+    }
 
 
 def _flowing_summary(sector: str, titles: List[str], watchlist: List[str]) -> Tuple[str, List[str], List[str]]:
@@ -733,7 +816,7 @@ def news_briefing(
     sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
     max_items_per_sector: int = Query(default=12, ge=5, le=30),
 ):
-    key = f"news:brief:v480:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}"
+    key = f"news:brief:v490:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -785,7 +868,8 @@ def news_briefing(
     for sec in sector_list:
         sec_items = [x for x in all_items if x.get("sector") == sec][:max_items_per_sector]
         titles = [x.get("title", "") for x in sec_items]
-        score, label = _sentiment_from_titles(titles)
+
+        sent = _sentiment_from_titles(titles)
         summary, implications, tickers_mentioned = _flowing_summary(sec, titles, watch)
 
         watch_mentions = []
@@ -797,7 +881,7 @@ def news_briefing(
 
         sectors_out.append({
             "sector": sec,
-            "sentiment": {"label": label, "score": score},
+            "sentiment": sent,  # now includes sampleSize/posHits/negHits/confidence
             "summary": summary,
             "implications": implications,
             "topHeadlines": [
@@ -817,12 +901,13 @@ def news_briefing(
     if watch:
         wl_items = [x for x in all_items if x.get("sector") == "Watchlist"][:max_general]
         wl_titles = [x.get("title", "") for x in wl_items]
-        wl_score, wl_label = _sentiment_from_titles(wl_titles)
+
+        wl_sent = _sentiment_from_titles(wl_titles)
         wl_summary, wl_imp, wl_tickers = _flowing_summary("Your watchlist", wl_titles, watch)
 
         sectors_out.insert(0, {
             "sector": "Watchlist",
-            "sentiment": {"label": wl_label, "score": wl_score},
+            "sentiment": wl_sent,
             "summary": wl_summary,
             "implications": wl_imp + ([
                 "Names to watch closely: " + ", ".join(watch[:12]) + "."
@@ -844,14 +929,15 @@ def news_briefing(
     all_titles = []
     for s in sectors_out:
         all_titles.extend([h.get("title", "") for h in (s.get("topHeadlines") or [])])
-    overall_score, overall_label = _sentiment_from_titles(all_titles)
+
+    overall_sent = _sentiment_from_titles(all_titles)
 
     out = {
         "date": datetime.now(timezone.utc).date().isoformat(),
-        "overallSentiment": {"label": overall_label, "score": overall_score},
+        "overallSentiment": overall_sent,  # now includes sample size diagnostics too
         "sectors": sectors_out,
         "errors": errors,
-        "note": "Briefing uses Google News RSS. Summary and implications are heuristic (headline-based).",
+        "note": "Briefing uses Google News RSS. Summary and implications are heuristic (headline-based). Sentiment is normalized by headline count.",
     }
     return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
 
@@ -987,7 +1073,7 @@ def holdings_common(window_days: int = Query(default=365, ge=30, le=365), top_n:
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"holdings:common:v480:{window_days}:{top_n}"
+    key = f"holdings:common:v490:{window_days}:{top_n}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1032,7 +1118,7 @@ def congress_daily(window_days: int = Query(default=30, ge=1, le=365), limit: in
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"congress:daily:v480:{window_days}:{limit}"
+    key = f"congress:daily:v490:{window_days}:{limit}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1109,7 +1195,7 @@ def crypto_news_briefing(
     coins: str = Query(default="BTC,ETH,LINK,SHIB"),
     include_top_n: int = Query(default=15, ge=5, le=50),
 ):
-    key = f"crypto:news:v480:{coins}:{include_top_n}"
+    key = f"crypto:news:v490:{coins}:{include_top_n}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1125,16 +1211,23 @@ def crypto_news_briefing(
 
     for c in coin_list[:25]:
         try:
-            items = _fetch_rss_items(_google_news_rss(f"{c} crypto"), timeout=10, max_items=max(10, include_top_n), ttl_seconds=240, stale_ttl_seconds=6 * 3600)
+            items = _fetch_rss_items(
+                _google_news_rss(f"{c} crypto"),
+                timeout=10,
+                max_items=max(10, include_top_n),
+                ttl_seconds=240,
+                stale_ttl_seconds=6 * 3600
+            )
             items = _dedup_items(items, include_top_n)
             titles = [x.get("title", "") for x in items]
-            score, label = _sentiment_from_titles(titles)
+
+            sent = _sentiment_from_titles(titles)
             summary, implications, _tks = _flowing_summary(c, titles, [])
             all_titles.extend(titles)
 
             coin_blocks.append({
                 "symbol": c,
-                "sentiment": {"label": label, "score": score},
+                "sentiment": sent,
                 "summary": summary or (implications[0] if implications else ""),
                 "headlines": [
                     {"title": x.get("title", ""), "link": x.get("link", ""), "published": x.get("published", ""), "source": "Google News"}
@@ -1145,16 +1238,16 @@ def crypto_news_briefing(
             errors.append(f"{c}: {type(e).__name__}: {str(e)}")
             coin_blocks.append({
                 "symbol": c,
-                "sentiment": {"label": "NEUTRAL", "score": 50},
+                "sentiment": {"label": "NEUTRAL", "score": 50, "sampleSize": 0, "posHits": 0, "negHits": 0, "confidence": "LOW"},
                 "summary": "",
                 "headlines": []
             })
 
-    overall_score, overall_label = _sentiment_from_titles(all_titles)
+    overall_sent = _sentiment_from_titles(all_titles)
 
     out = {
         "date": now.date().isoformat(),
-        "overallSentiment": {"label": overall_label, "score": overall_score},
+        "overallSentiment": overall_sent,
         "catalysts": [
             "Macro risk-on/risk-off can dominate crypto short-term.",
             "Watch for ETF flows, exchange outages, major protocol upgrades, and large unlock schedules (when relevant).",
@@ -1162,6 +1255,6 @@ def crypto_news_briefing(
         "coins": coin_blocks,
         "sources": {"outlets": ["Google News RSS"]},
         "errors": errors,
-        "note": "Crypto briefing is headline-based (Google News RSS).",
+        "note": "Crypto briefing is headline-based (Google News RSS). Sentiment is normalized by headline count.",
     }
     return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
