@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.12.0")
+app = FastAPI(title="Finance Signals Backend", version="4.12.1")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -58,19 +58,27 @@ NASDAQ_HEADERS = {
     "Origin": "https://www.nasdaq.com",
 }
 
+YAHOO_HEADERS = {
+    "User-Agent": UA_HEADERS["User-Agent"],
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": UA_HEADERS["Accept-Language"],
+    "Connection": "keep-alive",
+    "Referer": "https://finance.yahoo.com/",
+}
+
 SESSION = requests.Session()
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.12.0"}
+    return {"status": "ok", "version": "4.12.1"}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "4.12.0",
+        "version": "4.12.1",
         "hasQuiverToken": bool(QUIVER_TOKEN),
         "hasFinnhubKey": bool(FINNHUB_API_KEY),
         "utc": datetime.now(timezone.utc).isoformat(),
@@ -105,23 +113,14 @@ def cache_set(key: str, val: Any, ttl_seconds: int = 120, stale_ttl_seconds: int
 
 
 # =========================================================
-# Provider cooldowns
-# =========================================================
-_PROVIDER_COOLDOWN_UNTIL: Dict[str, float] = {}
-
-
-def _cooldown(provider: str, seconds: int) -> None:
-    _PROVIDER_COOLDOWN_UNTIL[provider] = time.time() + float(seconds)
-
-
-def _is_cooled_down(provider: str) -> bool:
-    return time.time() < _PROVIDER_COOLDOWN_UNTIL.get(provider, 0.0)
-
-
-# =========================================================
 # HTTP helpers
 # =========================================================
-def _requests_get(url: str, params: Optional[dict] = None, timeout: int = 16, headers: Optional[dict] = None) -> requests.Response:
+def _requests_get(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: int = 16,
+    headers: Optional[dict] = None
+) -> requests.Response:
     return SESSION.get(url, params=params, timeout=timeout, headers=headers or UA_HEADERS)
 
 
@@ -165,13 +164,13 @@ def _sma(vals: List[float], n: int) -> Optional[float]:
 
 
 # =========================================================
-# Nasdaq quote (best effort)
+# Nasdaq quote (best effort last price fallback)
 # =========================================================
 def _nasdaq_assetclass_for_symbol(symbol: str) -> str:
     s = (symbol or "").upper().strip()
     if s in ["SPY", "QQQ", "DIA", "IWM"]:
         return "etf"
-    if s in ["VIX", "^VIX", "NDX", "^NDX", "SPX", "^SPX"]:
+    if s in ["VIX", "^VIX", "NDX", "^NDX", "SPX", "^SPX", "TNX", "^TNX"]:
         return "index"
     return "stocks"
 
@@ -184,20 +183,18 @@ def _nasdaq_symbol_normalize(symbol: str) -> str:
         return "SPX"
     if s == "^NDX":
         return "NDX"
+    if s == "^TNX":
+        return "TNX"
     return s
 
 
 def _nasdaq_quote(symbol: str, assetclass: Optional[str] = None) -> dict:
-    if _is_cooled_down("nasdaq"):
-        raise RuntimeError("Nasdaq in cooldown")
-
     sym = _nasdaq_symbol_normalize(symbol)
     ac = assetclass or _nasdaq_assetclass_for_symbol(sym)
 
     url = f"https://api.nasdaq.com/api/quote/{quote_plus(sym)}/info"
     r = _requests_get(url, params={"assetclass": ac}, timeout=14, headers=NASDAQ_HEADERS)
     if r.status_code == 429:
-        _cooldown("nasdaq", 10 * 60)
         raise RuntimeError("Nasdaq rate limited (429)")
     r.raise_for_status()
     return r.json() if r.text else {}
@@ -218,60 +215,73 @@ def _nasdaq_last_and_prev(symbol: str) -> Tuple[Optional[float], Optional[float]
 
 
 # =========================================================
-# Stooq history (stable)
+# Yahoo Finance chart (primary daily series source)
 # =========================================================
-def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
-    if _is_cooled_down("stooq"):
-        raise RuntimeError("Stooq in cooldown")
+def _yahoo_chart_daily_closes(symbol: str, range_str: str = "1y") -> List[Tuple[datetime, float]]:
+    """
+    Uses Yahoo chart endpoint:
+      https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1y
+    """
+    sym = (symbol or "").strip()
+    if not sym:
+        return []
 
-    url = "https://stooq.com/q/d/l/"
-    params = {"s": symbol, "i": "d"}
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(sym)}"
+    params = {"interval": "1d", "range": range_str}
 
-    last_err = None
-    for attempt in range(4):
+    r = _requests_get(url, params=params, timeout=16, headers=YAHOO_HEADERS)
+    if r.status_code == 429:
+        raise RuntimeError("Yahoo rate limited (429)")
+    r.raise_for_status()
+
+    j = r.json() if r.text else {}
+    chart = (j or {}).get("chart") or {}
+    res = (chart.get("result") or [None])[0] or {}
+    ts = res.get("timestamp") or []
+    ind = (res.get("indicators") or {}).get("quote") or []
+    q0 = ind[0] if ind else {}
+    closes = q0.get("close") or []
+
+    out: List[Tuple[datetime, float]] = []
+    for t, c in zip(ts, closes):
+        if t is None or c is None:
+            continue
         try:
-            r = _requests_get(url, params=params, timeout=22, headers=UA_HEADERS)
-            if r.status_code >= 400:
-                last_err = f"HTTP {r.status_code}"
-                time.sleep(min(2.0, 0.6 * (attempt + 1)))
-                continue
+            dt = datetime.fromtimestamp(int(t), tz=timezone.utc)
+            out.append((dt, float(c)))
+        except Exception:
+            continue
 
-            lines = (r.text or "").strip().splitlines()
-            if len(lines) < 3:
-                last_err = "insufficient CSV rows"
-                time.sleep(min(2.0, 0.6 * (attempt + 1)))
-                continue
+    out.sort(key=lambda x: x[0])
+    return out
 
-            out: List[Tuple[datetime, float]] = []
-            for line in lines[1:]:
-                parts = line.split(",")
-                if len(parts) < 5:
-                    continue
-                d = parts[0].strip()
-                c = parts[4].strip()
-                if not d or not c or c.lower() == "null":
-                    continue
-                try:
-                    dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                    out.append((dt, float(c)))
-                except Exception:
-                    continue
 
-            out.sort(key=lambda x: x[0])
-            if out:
-                return out
+def _series_daily(symbol: str, yahoo_symbol: str) -> Tuple[List[Tuple[datetime, float]], List[str]]:
+    """
+    Returns (series, errors). Series is list of (dt, close).
+    """
+    errors: List[str] = []
+    try:
+        s = _yahoo_chart_daily_closes(yahoo_symbol, "1y")
+        if s:
+            return s, errors
+        errors.append(f"Yahoo {symbol}: empty series")
+    except Exception as e:
+        errors.append(f"Yahoo {symbol}: {type(e).__name__}: {str(e)[:160]}")
 
-            last_err = "parsed empty"
-            time.sleep(min(2.0, 0.6 * (attempt + 1)))
-        except requests.exceptions.Timeout as e:
-            last_err = f"Timeout: {type(e).__name__}"
-            time.sleep(min(2.0, 0.6 * (attempt + 1)))
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {str(e)[:160]}"
-            time.sleep(min(2.0, 0.6 * (attempt + 1)))
+    # Last-price fallback only (no history) via Nasdaq
+    try:
+        last, prev = _nasdaq_last_and_prev(symbol)
+        if last is not None:
+            now = datetime.now(timezone.utc)
+            series = [(now - timedelta(days=1), float(prev))] if prev is not None else []
+            series.append((now, float(last)))
+            return series, errors
+        errors.append(f"Nasdaq {symbol}: empty last")
+    except Exception as e:
+        errors.append(f"Nasdaq {symbol}: {type(e).__name__}: {str(e)[:160]}")
 
-    _cooldown("stooq", 120)
-    raise RuntimeError(f"Stooq failed: {last_err or 'unknown'}")
+    return [], errors
 
 
 # =========================================================
@@ -296,36 +306,16 @@ def _realized_vol_pct(vals: List[float], n: int = 20) -> Optional[float]:
     return float(ann * 100.0)
 
 
-def _percentile_rank(window_vals: List[float], x: float) -> Optional[int]:
-    if not window_vals:
-        return None
-    w = [float(v) for v in window_vals if v is not None]
-    if not w:
-        return None
-    w_sorted = sorted(w)
-    lo = 0
-    hi = len(w_sorted)
-    # count <= x
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if w_sorted[mid] <= x:
-            lo = mid + 1
-        else:
-            hi = mid
-    pct = int(round(100.0 * (lo / len(w_sorted))))
-    return max(0, min(100, pct))
-
-
-def _risk_appetite_score(spy_vals: List[float], vix_vals: List[float]) -> Tuple[int, str, str]:
+def _risk_appetite_score(spy_vals: List[float], vix_vals: List[float]) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     """
     0..100 composite:
       - Trend: SPY SMA50 vs SMA200 + price vs SMA200
       - Vol: VIX level normalized
       - Realized vol: SPY RV20
-    Designed to be stable daily without external fear/greed feeds.
+    If VIX is unavailable, return None values so frontend can hide it.
     """
     if not spy_vals or not vix_vals:
-        return 50, "NEUTRAL", "Insufficient data"
+        return None, None, None
 
     price = float(spy_vals[-1])
     vix = float(vix_vals[-1])
@@ -334,14 +324,13 @@ def _risk_appetite_score(spy_vals: List[float], vix_vals: List[float]) -> Tuple[
     sma200 = _sma(spy_vals, 200) or price
 
     trend_cross = 1.0 if sma50 >= sma200 else 0.0
-    price_vs_200 = _clamp01((price / sma200 - 0.92) / (1.08 - 0.92))  # map 0.92..1.08 to 0..1
+    price_vs_200 = _clamp01((price / sma200 - 0.92) / (1.08 - 0.92))
     trend = _clamp01(0.55 * trend_cross + 0.45 * price_vs_200)
 
-    vix_norm = _clamp01(1.0 - ((vix - 12.0) / (35.0 - 12.0)))  # lower VIX is better
+    vix_norm = _clamp01(1.0 - ((vix - 12.0) / (35.0 - 12.0)))
     rv20 = _realized_vol_pct(spy_vals, 20)
     rv_norm = 0.5
     if isinstance(rv20, (int, float)):
-        # map 10%..35% realized vol into 1..0
         rv_norm = _clamp01(1.0 - ((float(rv20) - 10.0) / (35.0 - 10.0)))
 
     score01 = 0.55 * trend + 0.30 * vix_norm + 0.15 * rv_norm
@@ -354,30 +343,16 @@ def _risk_appetite_score(spy_vals: List[float], vix_vals: List[float]) -> Tuple[
     else:
         label = "NEUTRAL"
 
-    notes = f"SPY={price:.2f} SMA50={sma50:.2f} SMA200={sma200:.2f} VIX={vix:.2f}"
-    if rv20 is not None:
-        notes += f" RV20={rv20:.1f}%"
+    notes = f"SPY trend + VIX level + SPY RV20 composite. Score={score}."
     return score, label, notes
 
 
 # =========================================================
-# Daily market index (replacement for daily market read)
+# Daily market index dashboard (frontend uses this)
 # =========================================================
 @app.get("/market/index")
 def market_index():
-    """
-    Daily market index snapshot with volatility + a fear/greed proxy that does not rely on CNN.
-
-    Returns:
-      {
-        date,
-        indices: [{symbol,name,last,ret1dPct,ret5dPct,ret1mPct}],
-        volatility: { vix, vixPercentile1y, vixRet1dPct, vixRet5dPct, spyRealizedVol20dPct, spyRealizedVol60dPct },
-        riskAppetite: { score, label, notes },
-        errors:[...]
-      }
-    """
-    key = "market:index:v4120"
+    key = "market:index:v4121"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -385,111 +360,102 @@ def market_index():
     now = datetime.now(timezone.utc)
     errors: List[str] = []
 
-    # Core daily indices
-    basket = [
-        ("SPY", "S&P 500 proxy", "spy.us"),
-        ("QQQ", "Nasdaq 100 proxy", "qqq.us"),
-        ("DIA", "Dow proxy", "dia.us"),
-        ("IWM", "Russell 2000 proxy", "iwm.us"),
-    ]
+    # Core market proxies
+    # Yahoo symbols: SPY, QQQ, IWM, DIA, ^VIX, ^TNX
+    # Nasdaq fallback uses SPY/QQQ/IWM/DIA/VIX/TNX where possible
+    series_spy, e1 = _series_daily("SPY", "SPY")
+    series_qqq, e2 = _series_daily("QQQ", "QQQ")
+    series_iwm, e3 = _series_daily("IWM", "IWM")
+    series_dia, e4 = _series_daily("DIA", "DIA")
+    series_vix, e5 = _series_daily("^VIX", "^VIX")
+    series_tnx, e6 = _series_daily("^TNX", "^TNX")
 
-    hist: Dict[str, List[float]] = {}
-    last_map: Dict[str, Optional[float]] = {}
+    errors.extend(e1 + e2 + e3 + e4 + e5 + e6)
 
-    def _load_stooq(sym: str, stooq_code: str) -> None:
-        try:
-            series = _stooq_daily_closes(stooq_code)
-            vals = [c for _, c in series]
-            hist[sym] = vals
-            last_map[sym] = float(vals[-1]) if vals else None
-        except Exception as e:
-            errors.append(f"Stooq {sym}: {type(e).__name__}: {str(e)}")
-            hist[sym] = []
-            last_map[sym] = None
+    def _vals(s: List[Tuple[datetime, float]]) -> List[float]:
+        return [c for _, c in s]
 
-    for sym, _nm, stq in basket:
-        _load_stooq(sym, stq)
+    spy_vals = _vals(series_spy)
+    qqq_vals = _vals(series_qqq)
+    iwm_vals = _vals(series_iwm)
+    dia_vals = _vals(series_dia)
+    vix_vals = _vals(series_vix)
+    tnx_vals = _vals(series_tnx)
 
-    # VIX
-    vix_vals: List[float] = []
-    vix_last: Optional[float] = None
-    try:
-        vix_series = _stooq_daily_closes("vix")
-        vix_vals = [c for _, c in vix_series]
-        vix_last = float(vix_vals[-1]) if vix_vals else None
-    except Exception as e:
-        errors.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
-
-    # Fallback for missing last prices
-    def _fallback_last(symbol: str) -> Optional[float]:
-        try:
-            last, _prev = _nasdaq_last_and_prev(symbol)
-            return float(last) if last else None
-        except Exception as e:
-            errors.append(f"Nasdaq {symbol}: {type(e).__name__}: {str(e)}")
-            return None
-
-    for sym, _nm, _stq in basket:
-        if last_map.get(sym) is None:
-            last_map[sym] = _fallback_last(sym)
-
-    if vix_last is None:
-        vix_last = _fallback_last("VIX")
-
-    # Build indices payload
-    indices_out: List[dict] = []
-    for sym, nm, _stq in basket:
-        vals = hist.get(sym, [])
-        last = last_map.get(sym)
-        indices_out.append({
-            "symbol": sym,
-            "name": nm,
+    def _pack(symbol: str, vals: List[float]) -> dict:
+        last = float(vals[-1]) if vals else None
+        return {
+            "symbol": symbol,
             "last": last,
             "ret1dPct": _ret_from_series(vals, 1),
             "ret5dPct": _ret_from_series(vals, 5),
             "ret1mPct": _ret_from_series(vals, 21),
-        })
+        }
 
-    # Volatility metrics
-    vix_1d = _ret_from_series(vix_vals, 1)
-    vix_5d = _ret_from_series(vix_vals, 5)
-
-    vix_pct_1y = None
-    if vix_vals and len(vix_vals) >= 40:
-        w = vix_vals[-252:] if len(vix_vals) >= 252 else vix_vals[:]
-        vix_pct_1y = _percentile_rank(w, float(vix_vals[-1]))
-
-    spy_vals = hist.get("SPY", []) or []
-    rv20 = _realized_vol_pct(spy_vals, 20)
-    rv60 = _realized_vol_pct(spy_vals, 60)
-
-    score, label, notes = _risk_appetite_score(spy_vals, vix_vals if vix_vals else ([vix_last] if vix_last else []))
-
-    out = {
+    out: Dict[str, Any] = {
         "date": now.date().isoformat(),
-        "indices": indices_out,
-        "volatility": {
-            "vix": vix_last,
-            "vixRet1dPct": vix_1d,
-            "vixRet5dPct": vix_5d,
-            "vixPercentile1y": vix_pct_1y,
-            "spyRealizedVol20dPct": rv20,
-            "spyRealizedVol60dPct": rv60,
+        "indices": {
+            "spy": _pack("SPY", spy_vals),
+            "qqq": _pack("QQQ", qqq_vals),
+            "iwm": _pack("IWM", iwm_vals),
+            "dia": _pack("DIA", dia_vals),
+            "vix": _pack("^VIX", vix_vals),
+            "tnx": _pack("^TNX", tnx_vals),  # 10Y yield index level, not a percent here
         },
-        "riskAppetite": {
-            "score": score,
-            "label": label,
-            "notes": notes,
-            "displayName": "Fear/Greed proxy (trend + VIX + realized vol)",
-        },
+        "volatility": None,
+        "riskAppetite": None,
         "errors": errors,
-        "note": "Daily snapshot built from Stooq history (preferred). Nasdaq quote is used only as fallback for last price.",
+        "note": "Market index uses Yahoo Finance daily chart as primary source; Nasdaq quote is fallback. If VIX unavailable, volatility and risk appetite are omitted.",
     }
+
+    # Volatility block: only if we truly have VIX history
+    if len(vix_vals) >= 22:
+        vix_rv = _realized_vol_pct(vix_vals, 20)
+        out["volatility"] = {
+            "vixLevel": float(vix_vals[-1]) if vix_vals else None,
+            "vixRet1dPct": _ret_from_series(vix_vals, 1),
+            "vixRealizedVol20dPct": vix_rv,
+        }
+
+    # Risk appetite proxy: only if SPY + VIX exist
+    score, label, notes = _risk_appetite_score(spy_vals, vix_vals)
+    if score is not None:
+        out["riskAppetite"] = {"score": score, "label": label, "notes": notes}
+
     return cache_set(key, out, ttl_seconds=180, stale_ttl_seconds=1800)
 
 
+# Backward compatibility (if your frontend still calls /market/read anywhere)
+@app.get("/market/read")
+def market_read():
+    idx = market_index()
+    indices = idx.get("indices") or {}
+    spy = indices.get("spy") or {}
+    qqq = indices.get("qqq") or {}
+    vix = indices.get("vix") or {}
+
+    parts: List[str] = []
+    if spy.get("last") is not None:
+        parts.append(f"SPY {spy['last']:.2f} (1D {spy.get('ret1dPct') if spy.get('ret1dPct') is not None else '—'}%).")
+    if qqq.get("last") is not None:
+        parts.append(f"QQQ {qqq['last']:.2f} (1D {qqq.get('ret1dPct') if qqq.get('ret1dPct') is not None else '—'}%).")
+    if vix.get("last") is not None:
+        parts.append(f"VIX {vix['last']:.2f}.")
+
+    return {
+        "date": idx.get("date"),
+        "summary": " ".join(parts).strip() or "Market index loaded.",
+        "sp500": spy,
+        "nasdaq": qqq,
+        "vix": vix,
+        "fearGreed": None,
+        "errors": idx.get("errors") or [],
+        "note": "Deprecated: use /market/index. Kept for older frontends.",
+    }
+
+
 # =========================================================
-# RSS helpers (your existing news/crypto behavior)
+# RSS helpers (unchanged)
 # =========================================================
 def _google_news_rss(query: str) -> str:
     q = quote_plus(query)
@@ -688,7 +654,7 @@ def _headline_summary_safe(title: str, raw_summary: str) -> str:
 
 
 # =========================================================
-# News briefing endpoints (kept)
+# Lightweight sentiment + summaries from titles (unchanged)
 # =========================================================
 _STOPWORDS = {
     "the","a","an","and","or","to","of","in","on","for","with","as","at","by","from","into",
@@ -708,6 +674,34 @@ _NEG_WORDS = {
     "lawsuit","ban","halt","recall","fraud","warning"
 }
 
+def _extract_tickers_from_titles(titles: List[str]) -> List[str]:
+    bad = {"A","I","AN","THE","AND","OR","TO","OF","IN","ON","US","AI"}
+    out = []
+    for t in titles:
+        for x in _TICKER_RE.findall((t or "").upper()):
+            if x in bad:
+                continue
+            out.append(x)
+    seen = set()
+    uniq = []
+    for x in out:
+        if x in seen:
+            continue
+        seen.add(x)
+        uniq.append(x)
+    return uniq[:30]
+
+def _top_terms(titles: List[str], k: int = 12) -> List[str]:
+    counts: Dict[str, int] = {}
+    for t in titles:
+        s = (t or "").lower()
+        words = re.findall(r"[a-zA-Z]{3,}", s)
+        for w in words:
+            if w in _STOPWORDS:
+                continue
+            counts[w] = counts.get(w, 0) + 1
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    return [w for w, _c in ranked[:k]]
 
 def _sentiment_from_titles(titles: List[str]) -> Tuple[int, str]:
     if not titles:
@@ -727,41 +721,9 @@ def _sentiment_from_titles(titles: List[str]) -> Tuple[int, str]:
     return score, label
 
 
-def _top_terms(titles: List[str], k: int = 12) -> List[str]:
-    counts: Dict[str, int] = {}
-    for t in titles:
-        s = (t or "").lower()
-        words = re.findall(r"[a-zA-Z]{3,}", s)
-        for w in words:
-            if w in _STOPWORDS:
-                continue
-            counts[w] = counts.get(w, 0) + 1
-    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
-    return [w for w, _c in ranked[:k]]
-
-
-def _sector_ai_summary(sector: str, titles: List[str]) -> Tuple[str, List[str]]:
-    if not titles:
-        return (f"{sector}: No fresh items in the last 30 days.", ["No key takeaways available."])
-
-    terms = _top_terms(titles, k=10)[:6]
-    score, label = _sentiment_from_titles(titles)
-
-    summary = f"{sector}: {label} tone ({score}/100)."
-    if terms:
-        summary += f" Themes: {', '.join(terms[:5])}."
-
-    bullets: List[str] = []
-    for t in titles[:8]:
-        bullets.append(t.strip().rstrip("."))  # concise, no 50-bullet wall
-        if len(bullets) >= 8:
-            break
-
-    if not bullets:
-        bullets = ["No key takeaways available."]
-    return summary.strip(), bullets[:8]
-
-
+# =========================================================
+# News briefing (kept as you had it)
+# =========================================================
 @app.get("/news/briefing")
 def news_briefing(
     tickers: str = Query(default=""),
@@ -771,7 +733,7 @@ def news_briefing(
     max_items_per_sector: int = Query(default=12, ge=5, le=30),
     max_age_days: int = Query(default=30, ge=7, le=45),
 ):
-    key = f"news:brief:v4120:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}:{max_age_days}"
+    key = f"news:brief:v4121:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}:{max_age_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -821,19 +783,30 @@ def news_briefing(
 
     sectors_out: List[dict] = []
 
-    # Watchlist first
+    def _simple_sector_summary(sec_name: str, titles: List[str]) -> Tuple[str, List[str]]:
+        if not titles:
+            return (f"{sec_name}: No fresh items in the last {max_age_days} days.", [])
+        terms = _top_terms(titles, k=10)[:6]
+        tickers = _extract_tickers_from_titles(titles)[:10]
+        s = []
+        if terms:
+            s.append(f"Main themes: {', '.join(terms)}.")
+        if tickers:
+            s.append(f"Tickers referenced: {', '.join(tickers)}.")
+        return (" ".join(s).strip() or f"{sec_name}: Headlines loaded."), []
+
+    # Watchlist
     if watch:
         wl_items = [x for x in all_items if x.get("sector") == "Watchlist"][:max_general]
         wl_items = _dedup_items(wl_items, max_general)
         wl_titles = [x.get("title", "") for x in wl_items]
         wl_score, wl_label = _sentiment_from_titles(wl_titles)
-        wl_sum, wl_bullets = _sector_ai_summary("Watchlist", wl_titles)
+        wl_sum, _ = _simple_sector_summary("Watchlist", wl_titles)
 
         sectors_out.append({
             "sector": "Watchlist",
             "sentiment": {"label": wl_label, "score": wl_score},
             "summary": wl_sum,
-            "summaryBullets": wl_bullets,
             "topHeadlines": [
                 {
                     "title": x.get("title", ""),
@@ -847,18 +820,17 @@ def news_briefing(
             ],
         })
 
-    # Per-sector
+    # Other sectors
     for sec in sector_list:
         sec_items = [x for x in all_items if x.get("sector") == sec][:max_items_per_sector]
         sec_titles = [x.get("title", "") for x in sec_items]
         score, label = _sentiment_from_titles(sec_titles)
-        sec_sum, sec_bullets = _sector_ai_summary(sec, sec_titles)
+        sec_sum, _ = _simple_sector_summary(sec, sec_titles)
 
         sectors_out.append({
             "sector": sec,
             "sentiment": {"label": label, "score": score},
             "summary": sec_sum,
-            "summaryBullets": sec_bullets,
             "topHeadlines": [
                 {
                     "title": x.get("title", ""),
@@ -872,9 +844,10 @@ def news_briefing(
             ],
         })
 
-    all_titles: List[str] = []
+    all_titles = []
     for s in sectors_out:
         all_titles.extend([h.get("title", "") for h in (s.get("topHeadlines") or [])])
+
     overall_score, overall_label = _sentiment_from_titles(all_titles)
 
     out = {
@@ -888,15 +861,15 @@ def news_briefing(
 
 
 # =========================================================
-# Crypto briefing endpoint
+# Crypto briefing endpoint (kept)
 # =========================================================
 @app.get("/crypto/news/briefing")
 def crypto_news_briefing(
-    coins: str = Query(default="BTC,ETH,CHAINLINK,SHIB"),
+    coins: str = Query(default="BTC,ETH,LINK,SHIB"),
     include_top_n: int = Query(default=15, ge=5, le=50),
     max_age_days: int = Query(default=30, ge=7, le=45),
 ):
-    key = f"crypto:news:v4120:{coins}:{include_top_n}:{max_age_days}"
+    key = f"crypto:news:v4121:{coins}:{include_top_n}:{max_age_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -910,27 +883,10 @@ def crypto_news_briefing(
     all_titles: List[str] = []
     coins_out: List[dict] = []
 
-    # display map: LINK -> CHAINLINK
-    def _display_name(sym: str) -> str:
-        s = sym.upper()
-        if s == "LINK" or s == "CHAINLINK":
-            return "Chainlink"
-        if s == "BTC":
-            return "Bitcoin"
-        if s == "ETH":
-            return "Ethereum"
-        if s == "SHIB":
-            return "Shiba Inu"
-        return s
-
     for c in coin_list[:25]:
         try:
-            query_sym = c
-            if c == "CHAINLINK":
-                query_sym = "LINK"
-
             items = _fetch_rss_items(
-                _google_news_rss(f"{query_sym} crypto"),
+                _google_news_rss(f"{c} crypto"),
                 timeout=10,
                 max_items=max(10, include_top_n),
                 ttl_seconds=240,
@@ -939,16 +895,14 @@ def crypto_news_briefing(
             )
             items = _dedup_items(items, include_top_n)
             titles = [x.get("title", "") for x in items]
-            score, label = _sentiment_from_titles(titles)
-            sum_text, bullets = _sector_ai_summary(_display_name(c), titles)
 
+            score, label = _sentiment_from_titles(titles)
             all_titles.extend(titles)
 
             coins_out.append({
-                "symbol": _display_name(c),
+                "symbol": c,
                 "sentiment": {"label": label, "score": score},
-                "summary": sum_text,
-                "summaryBullets": bullets,
+                "summary": f"{c}: {len(items)} headlines.",
                 "headlines": [
                     {
                         "title": x.get("title", ""),
@@ -963,10 +917,9 @@ def crypto_news_briefing(
         except Exception as e:
             errors.append(f"{c}: {type(e).__name__}: {str(e)}")
             coins_out.append({
-                "symbol": _display_name(c),
+                "symbol": c,
                 "sentiment": {"label": "NEUTRAL", "score": 50},
-                "summary": f"{_display_name(c)}: No fresh items.",
-                "summaryBullets": ["No key takeaways available."],
+                "summary": f"{c}: No fresh items.",
                 "headlines": []
             })
 
@@ -1113,7 +1066,7 @@ def holdings_common(window_days: int = Query(default=365, ge=30, le=365), top_n:
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"holdings:common:v4120:{window_days}:{top_n}"
+    key = f"holdings:common:v4121:{window_days}:{top_n}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1158,7 +1111,7 @@ def congress_daily(window_days: int = Query(default=30, ge=1, le=365), limit: in
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"congress:daily:v4120:{window_days}:{limit}"
+    key = f"congress:daily:v4121:{window_days}:{limit}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
