@@ -1,416 +1,1345 @@
-import os
-import re
-import time
-import math
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus
-import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Convergence Signals</title>
 
-import requests
-import quiverquant
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+  <meta name="theme-color" content="#0b0b0f" />
+  <style>
+    :root{
+      --bg:#0b0b0f;
+      --card:#151522;
+      --text:#ffffff;
+      --muted:rgba(255,255,255,.70);
+      --border:rgba(255,255,255,.10);
 
+      --dem:#4aa3ff;
+      --rep:#ff5a5a;
+      --both:#b38bff;
 
-# =========================================================
-# App
-# =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.12.2")
+      --ok:#7cffc0;
+      --err:#ff8a8a;
 
-ALLOWED_ORIGINS = [
-    "https://hijazss.github.io",
-    "http://localhost:5173",
-    "http://localhost:3000",
-]
+      --pos:#7cffc0;
+      --neg:#ff8a8a;
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-QUIVER_TOKEN = os.getenv("QUIVER_TOKEN", "").strip()
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
-
-UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-}
-
-RSS_HEADERS = {
-    "User-Agent": UA_HEADERS["User-Agent"],
-    "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8",
-    "Accept-Language": UA_HEADERS["Accept-Language"],
-    "Connection": "keep-alive",
-}
-
-NASDAQ_HEADERS = {
-    "User-Agent": UA_HEADERS["User-Agent"],
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": UA_HEADERS["Accept-Language"],
-    "Connection": "keep-alive",
-    "Referer": "https://www.nasdaq.com/",
-    "Origin": "https://www.nasdaq.com",
-}
-
-SESSION = requests.Session()
-
-
-@app.get("/")
-def root():
-    return {"status": "ok", "version": "4.12.2"}
-
-
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "version": "4.12.2",
-        "hasQuiverToken": bool(QUIVER_TOKEN),
-        "hasFinnhubKey": bool(FINNHUB_API_KEY),
-        "utc": datetime.now(timezone.utc).isoformat(),
+      --sec:#ffd27d;
     }
 
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      background:var(--bg);
+      color:var(--text);
+      font-family:-apple-system,BlinkMacSystemFont,sans-serif;
+      font-size:12px;
+    }
+    a{color:inherit;text-decoration:none}
 
-# =========================================================
-# Simple stale-while-revalidate cache
-# key -> (fresh_until_epoch, stale_until_epoch, value)
-# =========================================================
-_CACHE: Dict[str, Tuple[float, float, Any]] = {}
-
-
-def cache_get(key: str, allow_stale: bool = False) -> Optional[Any]:
-    now = time.time()
-    rec = _CACHE.get(key)
-    if not rec:
-        return None
-    fresh_until, stale_until, val = rec
-    if now <= fresh_until:
-        return val
-    if allow_stale and now <= stale_until:
-        return val
-    _CACHE.pop(key, None)
-    return None
-
-
-def cache_set(key: str, val: Any, ttl_seconds: int = 120, stale_ttl_seconds: int = 900) -> Any:
-    now = time.time()
-    _CACHE[key] = (now + float(ttl_seconds), now + float(stale_ttl_seconds), val)
-    return val
-
-
-# =========================================================
-# Provider cooldowns
-# =========================================================
-_PROVIDER_COOLDOWN_UNTIL: Dict[str, float] = {}
-
-
-def _cooldown(provider: str, seconds: int) -> None:
-    _PROVIDER_COOLDOWN_UNTIL[provider] = time.time() + float(seconds)
-
-
-def _is_cooled_down(provider: str) -> bool:
-    return time.time() < _PROVIDER_COOLDOWN_UNTIL.get(provider, 0.0)
-
-
-# =========================================================
-# HTTP helpers
-# =========================================================
-def _requests_get(url: str, params: Optional[dict] = None, timeout: int = 16, headers: Optional[dict] = None) -> requests.Response:
-    return SESSION.get(url, params=params, timeout=timeout, headers=headers or UA_HEADERS)
-
-
-def _safe_float(x: Any) -> Optional[float]:
-    if x is None:
-        return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x).strip().replace("$", "").replace(",", "")
-    m = re.search(r"-?\d+(\.\d+)?", s)
-    if not m:
-        return None
-    try:
-        return float(m.group(0))
-    except Exception:
-        return None
-
-
-def _pct(a: float, b: float) -> float:
-    if not b:
-        return 0.0
-    return 100.0 * (a / b - 1.0)
-
-
-def _ret_from_series(vals: List[float], offset: int) -> Optional[float]:
-    if len(vals) < (offset + 1):
-        return None
-    a = float(vals[-1])
-    b = float(vals[-1 - offset])
-    return _pct(a, b)
-
-
-# =========================================================
-# Nasdaq quote (primary)
-# =========================================================
-def _nasdaq_assetclass_for_symbol(symbol: str) -> str:
-    s = (symbol or "").upper().strip()
-    if s in ["SPY", "QQQ", "DIA", "IWM"]:
-        return "etf"
-    if s in ["VIX", "^VIX", "NDX", "^NDX", "SPX", "^SPX"]:
-        return "index"
-    return "stocks"
-
-
-def _nasdaq_symbol_normalize(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-    if s == "^VIX":
-        return "VIX"
-    if s == "^SPX":
-        return "SPX"
-    if s == "^NDX":
-        return "NDX"
-    return s
-
-
-def _nasdaq_quote(symbol: str, assetclass: Optional[str] = None) -> dict:
-    if _is_cooled_down("nasdaq"):
-        raise RuntimeError("Nasdaq in cooldown")
-
-    sym = _nasdaq_symbol_normalize(symbol)
-    ac = assetclass or _nasdaq_assetclass_for_symbol(sym)
-
-    url = f"https://api.nasdaq.com/api/quote/{quote_plus(sym)}/info"
-    r = _requests_get(url, params={"assetclass": ac}, timeout=14, headers=NASDAQ_HEADERS)
-    if r.status_code == 429:
-        _cooldown("nasdaq", 10 * 60)
-        raise RuntimeError("Nasdaq rate limited (429)")
-    r.raise_for_status()
-    return r.json() if r.text else {}
-
-
-def _nasdaq_last_and_prev(symbol: str) -> Tuple[Optional[float], Optional[float]]:
-    j = _nasdaq_quote(symbol)
-    data = (j or {}).get("data") or {}
-    primary = data.get("primaryData") or {}
-    secondary = data.get("secondaryData") or {}
-    key_stats = data.get("keyStats") or {}
-
-    last = _safe_float(primary.get("lastSalePrice") or primary.get("lastSale") or primary.get("last"))
-    prev = _safe_float(primary.get("previousClose") or secondary.get("previousClose") or key_stats.get("PreviousClose"))
-    if prev is None:
-        prev = _safe_float(key_stats.get("previousClose"))
-    return last, prev
-
-
-# =========================================================
-# Stooq history (optional, never required)
-# =========================================================
-def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
-    if _is_cooled_down("stooq"):
-        raise RuntimeError("Stooq in cooldown")
-
-    url = "https://stooq.com/q/d/l/"
-    params = {"s": symbol, "i": "d"}
-
-    last_err = None
-    for attempt in range(3):
-        try:
-            r = _requests_get(url, params=params, timeout=18, headers=UA_HEADERS)
-            if r.status_code >= 400:
-                last_err = f"HTTP {r.status_code}"
-                time.sleep(0.6 * (attempt + 1))
-                continue
-
-            lines = (r.text or "").strip().splitlines()
-            if len(lines) < 3:
-                last_err = "insufficient CSV rows"
-                time.sleep(0.6 * (attempt + 1))
-                continue
-
-            out: List[Tuple[datetime, float]] = []
-            for line in lines[1:]:
-                parts = line.split(",")
-                if len(parts) < 5:
-                    continue
-                d = parts[0].strip()
-                c = parts[4].strip()
-                if not d or not c or c.lower() == "null":
-                    continue
-                try:
-                    dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                    out.append((dt, float(c)))
-                except Exception:
-                    continue
-
-            out.sort(key=lambda x: x[0])
-            if out:
-                return out
-
-            last_err = "parsed empty"
-            time.sleep(0.6 * (attempt + 1))
-        except requests.exceptions.Timeout as e:
-            last_err = f"Timeout: {type(e).__name__}"
-            time.sleep(0.6 * (attempt + 1))
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {str(e)[:160]}"
-            time.sleep(0.6 * (attempt + 1))
-
-    _cooldown("stooq", 120)
-    raise RuntimeError(f"Stooq failed: {last_err or 'unknown'}")
-
-
-def _realized_vol_pct(vals: List[float], n: int = 20) -> Optional[float]:
-    if len(vals) < (n + 1):
-        return None
-    rets = []
-    for i in range(-n, 0):
-        p0 = float(vals[i - 1])
-        p1 = float(vals[i])
-        if p0 <= 0 or p1 <= 0:
-            continue
-        rets.append(math.log(p1 / p0))
-    if len(rets) < max(5, int(0.75 * n)):
-        return None
-    mean = sum(rets) / len(rets)
-    var = sum((r - mean) ** 2 for r in rets) / max(1, (len(rets) - 1))
-    sd = math.sqrt(var)
-    ann = sd * math.sqrt(252.0)
-    return float(ann * 100.0)
-
-
-def _risk_label(score: int) -> str:
-    if score >= 70:
-        return "RISK-ON"
-    if score <= 40:
-        return "RISK-OFF"
-    return "NEUTRAL"
-
-
-def _simple_risk_proxy(spy_ret1d: Optional[float], qqq_ret1d: Optional[float], vix_last: Optional[float]) -> Dict[str, Any]:
-    """
-    Fully daily, no CNN, no Yahoo.
-    Uses: SPY 1D, QQQ 1D, VIX level.
-    Returns a 0..100 score + label.
-    """
-    score = 50.0
-    notes: List[str] = []
-
-    if isinstance(spy_ret1d, (int, float)):
-        score += max(-8.0, min(8.0, float(spy_ret1d))) * 1.2
-        notes.append(f"SPY 1D={spy_ret1d:.2f}%")
-    if isinstance(qqq_ret1d, (int, float)):
-        score += max(-10.0, min(10.0, float(qqq_ret1d))) * 0.9
-        notes.append(f"QQQ 1D={qqq_ret1d:.2f}%")
-    if isinstance(vix_last, (int, float)):
-        # lower VIX -> higher score
-        v = float(vix_last)
-        if v <= 14:
-            score += 10
-        elif v <= 18:
-            score += 5
-        elif v >= 28:
-            score -= 12
-        elif v >= 22:
-            score -= 7
-        notes.append(f"VIX={v:.2f}")
-
-    score_i = int(round(max(0.0, min(100.0, score))))
-    return {"score": score_i, "label": _risk_label(score_i), "notes": "; ".join(notes)}
-
-
-# =========================================================
-# NEW: Daily market index dashboard
-# =========================================================
-@app.get("/market/index")
-def market_index():
-    key = "market:index:v4122"
-    cached = cache_get(key, allow_stale=True)
-    if cached is not None:
-        return cached
-
-    now = datetime.now(timezone.utc)
-    errors: List[str] = []
-
-    # Primary daily quotes from Nasdaq
-    def q(symbol: str) -> Tuple[Optional[float], Optional[float]]:
-        try:
-            return _nasdaq_last_and_prev(symbol)
-        except Exception as e:
-            errors.append(f"Nasdaq {symbol}: {type(e).__name__}: {str(e)}")
-            return None, None
-
-    spy_last, spy_prev = q("SPY")
-    qqq_last, qqq_prev = q("QQQ")
-    vix_last, vix_prev = q("VIX")
-
-    spy_ret1d = _pct(spy_last, spy_prev) if (spy_last is not None and spy_prev) else None
-    qqq_ret1d = _pct(qqq_last, qqq_prev) if (qqq_last is not None and qqq_prev) else None
-
-    # Optional: history (for 5D/1M + realized vol). Never required.
-    spy_vals: List[float] = []
-    qqq_vals: List[float] = []
-    vix_vals: List[float] = []
-
-    try:
-        spy_hist = _stooq_daily_closes("spy.us")
-        spy_vals = [c for _, c in spy_hist]
-    except Exception as e:
-        errors.append(f"Stooq SPY: {type(e).__name__}: {str(e)}")
-
-    try:
-        qqq_hist = _stooq_daily_closes("qqq.us")
-        qqq_vals = [c for _, c in qqq_hist]
-    except Exception as e:
-        errors.append(f"Stooq QQQ: {type(e).__name__}: {str(e)}")
-
-    try:
-        vix_hist = _stooq_daily_closes("vix")
-        vix_vals = [c for _, c in vix_hist]
-    except Exception as e:
-        errors.append(f"Stooq VIX: {type(e).__name__}: {str(e)}")
-
-    spy_ret5d = _ret_from_series(spy_vals, 5)
-    spy_ret1m = _ret_from_series(spy_vals, 21)
-
-    qqq_ret5d = _ret_from_series(qqq_vals, 5)
-    qqq_ret1m = _ret_from_series(qqq_vals, 21)
-
-    spy_rv20 = _realized_vol_pct(spy_vals, 20)
-
-    risk_proxy = _simple_risk_proxy(spy_ret1d, qqq_ret1d, vix_last)
-
-    out = {
-        "date": now.date().isoformat(),
-        "indices": {
-            "SPY": {"last": spy_last, "ret1dPct": spy_ret1d, "ret5dPct": spy_ret5d, "ret1mPct": spy_ret1m},
-            "QQQ": {"last": qqq_last, "ret1dPct": qqq_ret1d, "ret5dPct": qqq_ret5d, "ret1mPct": qqq_ret1m},
-            "VIX": {"last": vix_last, "ret1dPct": (_pct(vix_last, vix_prev) if (vix_last is not None and vix_prev) else None)},
-        },
-        "volatility": {
-            "spyRealizedVol20dPct": spy_rv20,
-        },
-        "riskAppetite": risk_proxy,
-        "errors": errors,
-        "note": "Primary quotes via Nasdaq. 5D/1M/realized vol use Stooq when available. Endpoint never depends on Yahoo.",
+    .header{
+      padding:12px 14px 8px;
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap:12px;
+      max-width:1100px;
+      margin:0 auto;
+    }
+    .h1{font-size:16px;font-weight:900;letter-spacing:.01em}
+    .subtle{font-size:12px;color:var(--muted);margin-top:2px}
+    .pillBtn{
+      border:1px solid var(--border);
+      padding:7px 10px;
+      border-radius:999px;
+      background:rgba(255,255,255,.05);
+      color:#fff;
+      font-size:12px;
+      cursor:pointer;
     }
 
-    return cache_set(key, out, ttl_seconds=180, stale_ttl_seconds=1800)
+    .container{
+      max-width:1100px;
+      margin:0 auto;
+      padding:8px 14px 110px;
+    }
 
+    .status{
+      border:1px solid var(--border);
+      background:rgba(255,255,255,.03);
+      border-radius:12px;
+      padding:9px 10px;
+      margin:6px 0 10px;
+      font-size:12px;
+      color:var(--muted);
+      line-height:1.25;
+    }
+    .status strong{color:#fff}
+    .ok{color:var(--ok)}
+    .err{color:var(--err)}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
 
-# =========================================================
-# (Keep your existing RSS + news/briefing + crypto + congress endpoints below)
-# NOTE: I am not repeating the entire rest of your file here because you only asked
-# to fix the daily market index provider issue. Paste this file over your existing
-# backend only if you want /market/index added safely.
-# =========================================================
+    .tabRow{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      margin:8px 0 8px;
+      align-items:center;
+    }
+    .tabBtn{
+      border:1px solid var(--border);
+      background:rgba(255,255,255,.04);
+      padding:7px 9px;
+      border-radius:999px;
+      font-size:12px;
+      color:var(--muted);
+      cursor:pointer;
+    }
+    .tabBtnActive{
+      color:#fff;
+      background:rgba(255,255,255,.10);
+    }
 
-# IMPORTANT:
-# If you want me to repaste the full backend including your existing /news/briefing,
-/*  /crypto/news/briefing, /report/holdings/common, /report/congress/daily, etc.,
-    tell me "repaste full backend including all endpoints" and I will provide the full file
-    with this /market/index integrated. */
+    .rightTools{
+      margin-left:auto;
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      align-items:center;
+    }
+    .seg{
+      display:flex;
+      border:1px solid var(--border);
+      border-radius:999px;
+      overflow:hidden;
+      background:rgba(255,255,255,.03);
+    }
+    .seg button{
+      border:0;
+      background:transparent;
+      color:var(--muted);
+      font-size:12px;
+      padding:7px 10px;
+      cursor:pointer;
+    }
+    .seg .on{
+      background:rgba(255,255,255,.10);
+      color:#fff;
+    }
+
+    .sectionTitle{
+      margin:14px 0 8px;
+      font-size:11px;
+      color:var(--muted);
+      letter-spacing:.08em;
+      text-transform:uppercase;
+    }
+
+    .grid2{
+      display:grid;
+      grid-template-columns:1fr;
+      gap:10px;
+    }
+    @media (min-width: 820px){
+      .grid2{grid-template-columns:1fr 1fr;}
+    }
+
+    .grid3{
+      display:grid;
+      grid-template-columns:1fr;
+      gap:10px;
+    }
+    @media (min-width: 980px){
+      .grid3{grid-template-columns:repeat(3,1fr);}
+    }
+    @media (min-width: 760px) and (max-width: 979px){
+      .grid3{grid-template-columns:repeat(2,1fr);}
+    }
+
+    .kpi{
+      background:var(--card);
+      border:1px solid var(--border);
+      border-radius:14px;
+      padding:10px;
+    }
+    .kpiTop{
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+      align-items:flex-start;
+      margin-bottom:6px;
+    }
+    .kpiTitle{
+      font-size:11px;
+      color:var(--muted);
+      letter-spacing:.08em;
+      text-transform:uppercase;
+    }
+    .kpiValue{
+      font-size:16px;
+      font-weight:900;
+      letter-spacing:.02em;
+      margin-top:4px;
+    }
+    .kpiSub{
+      font-size:12px;
+      color:rgba(255,255,255,.82);
+      line-height:1.25;
+    }
+    .kpiList{
+      margin-top:8px;
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+    }
+    .kpiRow{
+      display:flex;
+      justify-content:space-between;
+      gap:8px;
+      font-size:12px;
+      color:rgba(255,255,255,.90);
+      align-items:center;
+    }
+    .kpiBadge{
+      font-size:10px;
+      padding:4px 7px;
+      border-radius:999px;
+      border:1px solid var(--border);
+      background:rgba(255,255,255,.04);
+      white-space:nowrap;
+      color:rgba(255,255,255,.90);
+    }
+    .badgePos{border-color:rgba(124,255,192,.45); color:var(--pos)}
+    .badgeNeg{border-color:rgba(255,138,138,.45); color:var(--neg)}
+    .badgeNeu{border-color:rgba(255,255,255,.18); color:rgba(255,255,255,.85)}
+    .badgeBoth{border-color:rgba(179,139,255,.45); color:var(--both)}
+
+    .card{
+      background:var(--card);
+      border:1px solid var(--border);
+      border-radius:14px;
+      padding:10px 10px 9px;
+      margin-bottom:8px;
+    }
+    .cardTop{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap:10px;
+    }
+
+    .tickerLine{
+      display:flex;
+      align-items:baseline;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .ticker{
+      font-size:13px;
+      font-weight:900;
+      letter-spacing:.03em;
+    }
+    .who{
+      font-size:12px;
+      color:var(--muted);
+      max-width:720px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+
+    .tags{
+      display:flex;
+      gap:6px;
+      flex-wrap:wrap;
+      justify-content:flex-end;
+    }
+    .tag{
+      font-size:10px;
+      padding:4px 7px;
+      border-radius:999px;
+      border:1px solid var(--border);
+      background:rgba(255,255,255,.04);
+      white-space:nowrap;
+    }
+    .tagDem{border-color:rgba(74,163,255,.5); color:var(--dem)}
+    .tagRep{border-color:rgba(255,90,90,.5); color:var(--rep)}
+    .tagBoth{border-color:rgba(179,139,255,.55); color:var(--both)}
+    .tagBuy{border-color:rgba(124,255,192,.45); color:var(--ok)}
+    .tagSell{border-color:rgba(255,138,138,.45); color:var(--err)}
+    .tagSEC{border-color:rgba(255,210,125,.40); color:var(--sec)}
+
+    .metaRow{
+      margin-top:7px;
+      font-size:12px;
+      color:var(--muted);
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+      flex-wrap:wrap;
+      line-height:1.25;
+    }
+
+    .divider{height:1px;background:rgba(255,255,255,.08);margin:8px 0 7px}
+
+    .miniLinks{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      margin-top:8px;
+    }
+    .miniLink{
+      border:1px solid var(--border);
+      background:rgba(255,255,255,.03);
+      padding:6px 9px;
+      border-radius:999px;
+      font-size:11px;
+      color:rgba(255,255,255,.92);
+    }
+
+    .panel{
+      border:1px solid var(--border);
+      background:rgba(255,255,255,.03);
+      border-radius:14px;
+      padding:10px;
+      margin:10px 0 10px;
+    }
+
+    iframe{
+      width:100%;
+      height:360px;
+      border:0;
+      border-radius:12px;
+      background:#000;
+      margin-top:8px;
+    }
+
+    .tabsBottom{
+      position:fixed;
+      bottom:0;
+      left:0;
+      right:0;
+      background:#151522f0;
+      border-top:1px solid var(--border);
+      backdrop-filter:blur(12px);
+    }
+    .tabBarBottom{
+      max-width:1100px;
+      margin:0 auto;
+      display:grid;
+      grid-template-columns:repeat(4,1fr);
+    }
+    .tabBottom{
+      text-align:center;
+      padding:11px 10px 16px;
+      font-size:11px;
+      color:var(--muted);
+      user-select:none;
+      cursor:pointer;
+    }
+    .tabBottomActive{color:#fff}
+
+    .holdingsGrid{
+      display:grid;
+      grid-template-columns:1fr;
+      gap:10px;
+      margin-top:10px;
+    }
+    @media (min-width: 980px){
+      .holdingsGrid{grid-template-columns:1fr 1fr;}
+    }
+    .holdingsItem{
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.02);
+      border-radius:12px;
+      padding:9px;
+    }
+
+    .input{
+      width:100%;
+      border:1px solid var(--border);
+      background:rgba(255,255,255,.03);
+      color:#fff;
+      border-radius:12px;
+      padding:10px;
+      font-size:12px;
+      outline:none;
+    }
+
+    details.briefingDetails{
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.02);
+      border-radius:12px;
+      padding:9px;
+      margin-top:10px;
+    }
+    details.briefingDetails > summary{
+      cursor:pointer;
+      list-style:none;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      user-select:none;
+    }
+    details.briefingDetails > summary::-webkit-details-marker{display:none}
+    .summaryLeft{
+      display:flex;
+      flex-direction:column;
+      gap:3px;
+      min-width:0;
+    }
+    .summaryTitle{
+      font-size:13px;
+      font-weight:900;
+      letter-spacing:.02em;
+    }
+    .summaryMeta{
+      font-size:12px;
+      color:var(--muted);
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      max-width:740px;
+    }
+    .bulletList{
+      margin:8px 0 0;
+      padding-left:16px;
+      color:rgba(255,255,255,.86);
+      line-height:1.3;
+    }
+    .headlineList{
+      margin-top:10px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .headlineItem{
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.02);
+      border-radius:12px;
+      padding:9px;
+    }
+    .headlineTitle{
+      font-size:12px;
+      color:rgba(255,255,255,.92);
+      line-height:1.25;
+    }
+    .headlineMeta{
+      margin-top:6px;
+      font-size:11px;
+      color:var(--muted);
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .headlineSummary{
+      margin-top:6px;
+      font-size:12px;
+      color:rgba(255,255,255,.84);
+      line-height:1.25;
+    }
+  </style>
+</head>
+
+<body>
+  <header class="header">
+    <div>
+      <div class="h1" id="pageTitle">News</div>
+      <div class="subtle" id="reportDate"></div>
+    </div>
+    <button class="pillBtn" id="refreshBtn">Refresh</button>
+  </header>
+
+  <main class="container">
+    <div class="status" id="statusBox">
+      <strong>Status:</strong> <span id="statusText">Loading…</span><br/>
+      <span class="mono" id="statusDetail"></span>
+    </div>
+
+    <div class="tabRow">
+      <button class="tabBtn tabBtnActive" id="tabNewsBtn">News</button>
+      <button class="tabBtn" id="tabCongressBtn">Congress</button>
+      <button class="tabBtn" id="tabCryptoBtn">Crypto</button>
+      <button class="tabBtn" id="tabPerfBtn">Performance</button>
+
+      <div class="rightTools" id="mainWindowTools" style="display:none;">
+        <div class="seg" aria-label="window toggle">
+          <button id="btn30" class="on">30D</button>
+          <button id="btn180">180D</button>
+          <button id="btn365">365D</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="stockPanel" style="display:none;"></div>
+
+    <!-- NEWS TAB -->
+    <section id="viewNews">
+      <div class="sectionTitle">Daily market read</div>
+      <div class="grid3">
+        <div class="kpi" id="readKpiSPY"></div>
+        <div class="kpi" id="readKpiQQQ"></div>
+        <div class="kpi" id="readKpiFG"></div>
+      </div>
+      <div class="panel" style="margin-top:10px;">
+        <div class="kpiSub" id="readSummary">Loading…</div>
+        <div class="subtle" id="readHint" style="margin-top:8px;"></div>
+        <div class="miniLinks" style="margin-top:10px;">
+          <button class="pillBtn" id="readRefreshBtn">Refresh market read</button>
+        </div>
+      </div>
+
+      <div class="sectionTitle">Daily briefing</div>
+      <div class="grid3">
+        <div class="kpi" id="briefKpiSentiment"></div>
+        <div class="kpi" id="briefKpiScope"></div>
+        <div class="kpi" id="briefKpiNotes"></div>
+      </div>
+
+      <div class="sectionTitle">Your watchlist</div>
+      <div class="panel">
+        <div class="kpiSub">
+          Comma-separated tickers. Example: SPY,QQQ,NVDA,AAPL
+        </div>
+        <div style="margin-top:10px;">
+          <input class="input" id="watchInput" value="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B" />
+        </div>
+        <div class="miniLinks" style="margin-top:10px;">
+          <button class="pillBtn" id="watchApplyBtn">Refresh briefing</button>
+        </div>
+      </div>
+
+      <div class="sectionTitle">Sectors</div>
+      <div id="briefingSectors"></div>
+      <div class="subtle" id="briefHint" style="margin-top:12px;"></div>
+    </section>
+
+    <!-- CONGRESS TAB -->
+    <section id="viewCongress" style="display:none;">
+      <div class="sectionTitle">Common holdings (simple)</div>
+      <div class="panel">
+        <div class="kpiSub">
+          Ticker + how many unique politicians disclosed activity in that ticker during the selected window.
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="kpi" id="holdingsKpiSimple"></div>
+
+        <div class="divider"></div>
+
+        <div class="sectionTitle" style="margin-top:0;">Ranked by holder count</div>
+        <div id="holdingsList" class="holdingsGrid"></div>
+
+        <div class="subtle" id="holdingsHint" style="margin-top:10px;"></div>
+      </div>
+
+      <div class="sectionTitle">Day-by-day trade feed</div>
+      <div class="panel">
+        <div class="kpiSub">
+          Grouped by date. Tap a ticker for chart.
+        </div>
+        <div class="divider"></div>
+        <div id="dailyTradeList"></div>
+        <div class="subtle" id="dailyHint" style="margin-top:10px;"></div>
+      </div>
+    </section>
+
+    <!-- CRYPTO TAB -->
+    <section id="viewCrypto" style="display:none;">
+      <div class="sectionTitle">Crypto briefing</div>
+      <div class="panel">
+        <div class="kpiSub">
+          Daily crypto headlines and a simple sentiment gauge.
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="kpi" id="cryptoKpiOverall"></div>
+
+        <div class="divider"></div>
+
+        <div class="kpiSub">Coins (comma-separated):</div>
+        <div style="margin-top:10px;">
+          <input class="input" id="coinInput" value="BTC,ETH,LINK,SHIB" />
+        </div>
+        <div class="miniLinks" style="margin-top:10px;">
+          <button class="pillBtn" id="cryptoApplyBtn">Refresh crypto</button>
+        </div>
+      </div>
+
+      <div id="cryptoCoins"></div>
+      <div class="subtle" id="cryptoHint" style="margin-top:12px;"></div>
+    </section>
+
+    <!-- PERFORMANCE TAB -->
+    <section id="viewPerf" style="display:none;">
+      <div class="sectionTitle">Politician performance</div>
+      <div class="panel">
+        <div class="kpiSub">
+          Portfolio performance inside the app needs a backend integration.
+          Use these trackers plus the Congress day-by-day feed.
+        </div>
+
+        <div class="miniLinks" style="margin-top:10px;">
+          <a class="miniLink" target="_blank" rel="noopener" href="https://www.capitoltrades.com/">Capitol Trades</a>
+          <a class="miniLink" target="_blank" rel="noopener" href="https://www.quiverquant.com/congresstrading/">QuiverQuant Congress Trading</a>
+          <a class="miniLink" target="_blank" rel="noopener" href="https://efdsearch.senate.gov/search/home/">Senate EFD Search</a>
+          <a class="miniLink" target="_blank" rel="noopener" href="https://disclosures-clerk.house.gov/">House Disclosures</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <nav class="tabsBottom">
+    <div class="tabBarBottom">
+      <div class="tabBottom tabBottomActive" id="navNews">News</div>
+      <div class="tabBottom" id="navCongress">Congress</div>
+      <div class="tabBottom" id="navCrypto">Crypto</div>
+      <div class="tabBottom" id="navPerf">Performance</div>
+    </div>
+  </nav>
+
+  <script>
+    const BACKEND_BASE = "https://finance-backend-1-bbi9.onrender.com";
+
+    const MARKET_READ_URL = () => `${BACKEND_BASE}/market/read`;
+    const NEWS_BRIEF_URL = (watchlist) => {
+      const wl = String(watchlist || "");
+      return `${BACKEND_BASE}/news/briefing?tickers=${encodeURIComponent(wl)}&max_general=60&max_per_ticker=6`;
+    };
+
+    const HOLDINGS_URL = (windowDays) =>
+      `${BACKEND_BASE}/report/holdings/common?window_days=${encodeURIComponent(String(windowDays))}&top_n=30`;
+
+    const DAILY_URL = (windowDays) =>
+      `${BACKEND_BASE}/report/congress/daily?window_days=${encodeURIComponent(String(windowDays))}&limit=250`;
+
+    const CRYPTO_URL = (coins) => {
+      const c = String(coins || "");
+      return `${BACKEND_BASE}/crypto/news/briefing?coins=${encodeURIComponent(c)}&include_top_n=15`;
+    };
+
+    const el = (id) => document.getElementById(id);
+
+    let ACTIVE_TAB = "News";
+    let WINDOW_DAYS = 30;
+
+    let CACHE_READ = null;
+    let CACHE_BRIEFING = new Map();
+    let CACHE_HOLDINGS = new Map();
+    let CACHE_DAILY = new Map();
+    let CACHE_CRYPTO = new Map();
+
+    function setStatus(kind, text, detail){
+      const st = el("statusText");
+      const sd = el("statusDetail");
+      st.textContent = text || "";
+      st.className = kind === "ok" ? "ok" : kind === "err" ? "err" : "";
+      sd.textContent = detail || "";
+    }
+
+    function setTitleForTab(tab){
+      el("pageTitle").textContent = tab;
+    }
+
+    async function fetchJson(url){
+      const res = await fetch(url, { cache: "no-store" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok){
+        const msg = (data && (data.detail || data.error || data.message)) ? (data.detail || data.error || data.message) : ("HTTP " + res.status);
+        const err = new Error(msg);
+        err.status = res.status;
+        err.data = data;
+        throw err;
+      }
+      return data;
+    }
+
+    function setStockPanel(ticker){
+      const t = String(ticker||"").toUpperCase();
+      if (!t){
+        el("stockPanel").style.display = "none";
+        el("stockPanel").innerHTML = "";
+        return;
+      }
+      const symbol = "NASDAQ:" + t;
+      const yf = `https://finance.yahoo.com/quote/${encodeURIComponent(t)}`;
+      const tv = `https://www.tradingview.com/symbols/${encodeURIComponent(symbol)}/`;
+
+      el("stockPanel").style.display = "";
+      el("stockPanel").innerHTML = `
+        <div class="panel">
+          <div class="cardTop">
+            <div class="tickerLine">
+              <div class="ticker">${t}</div>
+              <div class="who">Chart</div>
+            </div>
+            <button class="pillBtn" id="closeStockBtn">Close</button>
+          </div>
+          <iframe
+            title="TradingView Chart"
+            src="https://s.tradingview.com/widgetembed/?symbol=${encodeURIComponent(symbol)}&interval=D&hidesidetoolbar=0&symboledit=1&saveimage=1&toolbarbg=%23151522&theme=dark&style=1&timezone=Etc%2FUTC&withdateranges=1&hideideas=1"
+            loading="lazy">
+          </iframe>
+          <div class="miniLinks">
+            <a class="miniLink" href="${yf}" target="_blank" rel="noopener">Open Yahoo</a>
+            <a class="miniLink" href="${tv}" target="_blank" rel="noopener">Open TradingView</a>
+          </div>
+        </div>
+      `;
+      const btn = document.getElementById("closeStockBtn");
+      if (btn) btn.addEventListener("click", () => {
+        history.pushState("", document.title, window.location.pathname + window.location.search);
+        setStockPanel("");
+      });
+    }
+
+    function handleHash(){
+      const h = window.location.hash || "";
+      if (h.startsWith("#stock=")){
+        const t = decodeURIComponent(h.replace("#stock=","")).trim();
+        setStockPanel(t);
+        return;
+      }
+      setStockPanel("");
+    }
+
+    function tickerLinksHTML(ticker){
+      const t = String(ticker||"").toUpperCase();
+      const yf = `https://finance.yahoo.com/quote/${encodeURIComponent(t)}`;
+      const tvChart = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent("NASDAQ:" + t)}`;
+      return `
+        <div class="miniLinks">
+          <a class="miniLink" href="#stock=${t}">Chart</a>
+          <a class="miniLink" href="${yf}" target="_blank" rel="noopener">Yahoo</a>
+          <a class="miniLink" href="${tvChart}" target="_blank" rel="noopener">TV</a>
+        </div>
+      `;
+    }
+
+    function fmtPct(x){
+      if (x === null || x === undefined || isNaN(Number(x))) return "—";
+      const n = Number(x);
+      const s = n > 0 ? "+" : "";
+      return `${s}${n.toFixed(2)}%`;
+    }
+
+    function renderMarketRead(payload){
+      const sp = payload?.sp500 || {};
+      const nq = payload?.nasdaq || {};
+      const fg = payload?.fearGreed || {};
+      const errs = Array.isArray(payload?.errors) ? payload.errors : [];
+
+      el("readKpiSPY").innerHTML = `
+        <div class="kpiTop">
+          <div>
+            <div class="kpiTitle">S&P proxy</div>
+            <div class="kpiValue">${sp?.last ? sp.last : "—"}</div>
+          </div>
+          <span class="kpiBadge badgeNeu">${sp?.symbol || "SPY"}</span>
+        </div>
+        <div class="kpiSub">
+          1D: <strong>${fmtPct(sp?.ret1dPct)}</strong> · 5D: <strong>${fmtPct(sp?.ret5dPct)}</strong> · 1M: <strong>${fmtPct(sp?.ret1mPct)}</strong>
+        </div>
+      `;
+
+      el("readKpiQQQ").innerHTML = `
+        <div class="kpiTop">
+          <div>
+            <div class="kpiTitle">Nasdaq proxy</div>
+            <div class="kpiValue">${nq?.last ? nq.last : "—"}</div>
+          </div>
+          <span class="kpiBadge badgeNeu">${nq?.symbol || "QQQ"}</span>
+        </div>
+        <div class="kpiSub">
+          1D: <strong>${fmtPct(nq?.ret1dPct)}</strong> · 5D: <strong>${fmtPct(nq?.ret5dPct)}</strong> · 1M: <strong>${fmtPct(nq?.ret1mPct)}</strong>
+        </div>
+      `;
+
+      const fgScore = fg?.score;
+      const fgRating = fg?.rating;
+      const fgBadge = (typeof fgScore === "number")
+        ? (fgScore >= 60 ? "badgePos" : fgScore <= 40 ? "badgeNeg" : "badgeNeu")
+        : "badgeNeu";
+
+      el("readKpiFG").innerHTML = `
+        <div class="kpiTop">
+          <div>
+            <div class="kpiTitle">Fear & greed</div>
+            <div class="kpiValue">${(typeof fgScore === "number") ? fgScore : "—"}</div>
+          </div>
+          <span class="kpiBadge ${fgBadge}">${fgRating || "External index"}</span>
+        </div>
+        <div class="kpiSub">${(typeof fgScore === "number") ? "Loaded." : "Not available right now."}</div>
+      `;
+
+      el("readSummary").textContent = String(payload?.summary || "—");
+      el("readHint").textContent = errs.length ? ("Market read issues: " + errs.slice(0,2).join(" | ")) : "Market read loaded.";
+    }
+
+    async function loadMarketRead(force){
+      if (CACHE_READ && !force){
+        renderMarketRead(CACHE_READ);
+        return;
+      }
+      const url = MARKET_READ_URL();
+      el("readHint").textContent = `Loading from: ${url}`;
+      try{
+        const data = await fetchJson(url);
+        CACHE_READ = data;
+        renderMarketRead(data);
+      }catch(err){
+        el("readHint").textContent = `Could not load market read. ${err?.message || ""}`;
+        el("readSummary").textContent = "—";
+      }
+    }
+
+    function sentimentBadge(s){
+      const score = Number(s?.score ?? 50);
+      const label = String(s?.label ?? "NEUTRAL");
+      if (score >= 60) return { cls: "badgePos", label: label, score };
+      if (score <= 40) return { cls: "badgeNeg", label: label, score };
+      return { cls: "badgeNeu", label: label, score };
+    }
+
+    function normalizeNewsErrors(err){
+      if (!err) return [];
+      if (Array.isArray(err)) return err.filter(Boolean).map(String);
+      if (typeof err === "object"){
+        const out = [];
+        for (const k of Object.keys(err)){
+          const v = err[k];
+          if (Array.isArray(v)) out.push(...v.filter(Boolean).map(String));
+          else if (v) out.push(String(v));
+        }
+        return out;
+      }
+      return [String(err)];
+    }
+
+    function normalizeSectorHeadlines(s){
+      if (!s || typeof s !== "object") return [];
+      if (Array.isArray(s.headlines)) return s.headlines;
+      if (Array.isArray(s.topHeadlines)) return s.topHeadlines;
+      return [];
+    }
+
+    function headlineHTML(h){
+      const title = String(h?.title || "").trim();
+      const link = String(h?.link || "").trim();
+      const pub = String(h?.published || "").trim();
+      const bucket = String(h?.bucket || h?.sourceFeed || h?.source || "").trim();
+      const summary = String(h?.summary || "").trim();
+
+      return `
+        <div class="headlineItem">
+          <div class="headlineTitle">${link ? `<a href="${link}" target="_blank" rel="noopener">${title}</a>` : title}</div>
+          ${summary ? `<div class="headlineSummary">${summary}</div>` : ""}
+          <div class="headlineMeta">
+            ${pub ? `<span>Published: <strong>${pub}</strong></span>` : ""}
+            ${bucket ? `<span>Source: <strong>${bucket}</strong></span>` : ""}
+          </div>
+        </div>
+      `;
+    }
+
+    function sectorPanelHTML(s){
+      const sector = String(s?.sector || "General");
+      const sent = sentimentBadge(s?.sentiment);
+      const summary = String(s?.summary || "").trim();
+      const headlines = normalizeSectorHeadlines(s);
+
+      const meta = [];
+      meta.push(`${headlines.length} headlines`);
+      meta.push(`Sentiment ${sent.score}/100`);
+      const metaLine = meta.join(" · ");
+
+      return `
+        <details class="briefingDetails">
+          <summary>
+            <div class="summaryLeft">
+              <div class="summaryTitle">${sector}</div>
+              <div class="summaryMeta">${metaLine}${summary ? " · " + summary : ""}</div>
+            </div>
+            <div class="tags">
+              <span class="kpiBadge badgeNeu">${headlines.length}</span>
+              <span class="kpiBadge ${sent.cls}">${sent.label} · ${sent.score}</span>
+            </div>
+          </summary>
+
+          <div class="divider"></div>
+
+          <div class="kpiSub">
+            <strong>Sector scan:</strong> ${summary || "No summary available."}
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="kpiSub"><strong>Headlines:</strong></div>
+          <div class="headlineList">
+            ${headlines.length ? headlines.map(headlineHTML).join("") : "<div class='subtle'>No headlines in this sector.</div>"}
+          </div>
+        </details>
+      `;
+    }
+
+    function renderBriefing(data, watchlist){
+      const overall = sentimentBadge(data?.overallSentiment);
+      const sectors = Array.isArray(data?.sectors) ? data.sectors : [];
+      const date = String(data?.date || "");
+      const note = String(data?.note || "");
+
+      const total = sectors.reduce((a, s) => a + normalizeSectorHeadlines(s).length, 0);
+
+      el("briefKpiSentiment").innerHTML = `
+        <div class="kpiTop">
+          <div>
+            <div class="kpiTitle">Overall sentiment</div>
+            <div class="kpiValue">${overall.score}/100</div>
+          </div>
+          <span class="kpiBadge ${overall.cls}">${overall.label}</span>
+        </div>
+        <div class="kpiSub">Headline-based context gauge.</div>
+        <div class="kpiList">
+          <div class="kpiRow"><span>Date</span><span class="kpiBadge badgeNeu">${date || "—"}</span></div>
+        </div>
+      `;
+
+      el("briefKpiScope").innerHTML = `
+        <div class="kpiTop">
+          <div>
+            <div class="kpiTitle">Briefing scope</div>
+            <div class="kpiValue">${total} headlines</div>
+          </div>
+          <span class="kpiBadge badgeNeu">Sectors</span>
+        </div>
+        <div class="kpiSub">
+          Watchlist: ${String(watchlist||"").split(",").filter(x => x.trim()).length} tickers
+        </div>
+        <div class="kpiList">
+          <div class="kpiRow"><span>Sectors</span><span class="kpiBadge badgeNeu">${sectors.length}</span></div>
+        </div>
+      `;
+
+      el("briefKpiNotes").innerHTML = `
+        <div class="kpiTop">
+          <div>
+            <div class="kpiTitle">Notes</div>
+            <div class="kpiValue">RSS</div>
+          </div>
+          <span class="kpiBadge badgeNeu">Backend</span>
+        </div>
+        <div class="kpiSub">${note ? note : "Daily briefing."}</div>
+      `;
+
+      el("briefingSectors").innerHTML = sectors.length
+        ? sectors.map(sectorPanelHTML).join("")
+        : "<div class='subtle'>No sectors returned.</div>";
+
+      const errAll = normalizeNewsErrors(data?.errors);
+      el("briefHint").textContent = errAll.length
+        ? ("Some feeds failed: " + errAll.slice(0, 3).join(" | "))
+        : "Daily briefing loaded.";
+    }
+
+    async function loadBriefing(watchlist, force){
+      const key = String(watchlist || "").trim();
+      if (CACHE_BRIEFING.has(key) && !force){
+        renderBriefing(CACHE_BRIEFING.get(key), key);
+        return;
+      }
+
+      const url = NEWS_BRIEF_URL(key);
+      el("briefingSectors").innerHTML = "<div class='subtle'>Loading daily briefing…</div>";
+      el("briefHint").textContent = `Loading from: ${url}`;
+
+      try{
+        const data = await fetchJson(url);
+        CACHE_BRIEFING.set(key, data);
+        renderBriefing(data, key);
+      }catch(err){
+        el("briefingSectors").innerHTML = "<div class='subtle'>Could not load briefing.</div>";
+        el("briefHint").textContent = `Backend /news/briefing failed. ${err?.message || ""}`;
+        el("briefKpiSentiment").innerHTML = "";
+        el("briefKpiScope").innerHTML = "";
+        el("briefKpiNotes").innerHTML = "";
+      }
+    }
+
+    function holdingsRowHTML(item){
+      const t = String(item.ticker || "").toUpperCase();
+      const holders = Number(item.holders ?? 0);
+      return `
+        <div class="holdingsItem">
+          <div class="cardTop">
+            <div>
+              <div class="tickerLine">
+                <a class="ticker" href="#stock=${encodeURIComponent(t)}">${t}</a>
+                <span class="kpiBadge badgeNeu">Holders: <strong>${holders}</strong></span>
+              </div>
+              <div class="who">Popularity list (idea discovery)</div>
+            </div>
+            <div class="tags">
+              <span class="tag tagSEC">HOLDINGS</span>
+            </div>
+          </div>
+          ${tickerLinksHTML(t)}
+        </div>
+      `;
+    }
+
+    function renderHoldingsCommon(payload){
+      const win = Number(payload?.windowDays || WINDOW_DAYS);
+      const list = Array.isArray(payload?.commonHoldings) ? payload.commonHoldings : [];
+
+      if (!list.length){
+        el("holdingsKpiSimple").innerHTML = `
+          <div class="kpiTop">
+            <div>
+              <div class="kpiTitle">Holdings</div>
+              <div class="kpiValue">No data</div>
+            </div>
+            <span class="kpiBadge badgeNeu">${win}D</span>
+          </div>
+          <div class="kpiSub">
+            If you see this, check backend <span class="mono">/report/holdings/common</span> and that QUIVER_TOKEN exists.
+          </div>
+        `;
+        el("holdingsList").innerHTML = "<div class='subtle'>No holdings data returned.</div>";
+        el("holdingsHint").textContent = "If empty, try another window or check backend health.";
+        return;
+      }
+
+      const sorted = list.slice()
+        .map(x => ({ ticker: x.ticker, holders: Number(x.holders||0) }))
+        .filter(x => x.ticker)
+        .sort((a,b) => (b.holders - a.holders) || String(a.ticker).localeCompare(String(b.ticker)));
+
+      const top = sorted[0];
+
+      el("holdingsKpiSimple").innerHTML = `
+        <div class="kpiTop">
+          <div>
+            <div class="kpiTitle">Top holding</div>
+            <div class="kpiValue">${top ? String(top.ticker).toUpperCase() : "—"}</div>
+          </div>
+          <span class="kpiBadge badgeNeu">${win}D</span>
+        </div>
+        <div class="kpiSub">Idea discovery. Not a timing signal.</div>
+        <div class="kpiList">
+          ${sorted.slice(0,5).map(x => `
+            <div class="kpiRow">
+              <a href="#stock=${encodeURIComponent(String(x.ticker).toUpperCase())}"><strong>${String(x.ticker).toUpperCase()}</strong></a>
+              <span class="kpiBadge badgeNeu">${Number(x.holders||0)} holders</span>
+            </div>
+          `).join("")}
+        </div>
+      `;
+
+      el("holdingsList").innerHTML = sorted.map(holdingsRowHTML).join("");
+      el("holdingsHint").textContent = "Simple view: ticker + holders.";
+    }
+
+    async function loadHoldingsCommon(windowDays, force){
+      const key = String(windowDays || 365);
+      if (CACHE_HOLDINGS.has(key) && !force){
+        renderHoldingsCommon(CACHE_HOLDINGS.get(key));
+        return;
+      }
+
+      const url = HOLDINGS_URL(windowDays || 365);
+      el("holdingsList").innerHTML = "<div class='subtle'>Loading holdings…</div>";
+      el("holdingsHint").textContent = `Loading from: ${url}`;
+
+      try{
+        const data = await fetchJson(url);
+        CACHE_HOLDINGS.set(key, data);
+        renderHoldingsCommon(data);
+      }catch(err){
+        renderHoldingsCommon({ windowDays: windowDays || 365, commonHoldings: [] });
+        el("holdingsHint").textContent = `Could not load holdings. ${err?.message || ""} (Most common cause: missing QUIVER_TOKEN on backend.)`;
+      }
+    }
+
+    function dailyItemHTML(it){
+      const kind = String(it.kind||"").toUpperCase();
+      const t = String(it.ticker||"").toUpperCase();
+      const who = String(it.politician||"").trim();
+      const chamber = String(it.chamber||"").trim();
+      const amt = String(it.amountRange||"").trim();
+      const traded = String(it.traded||"");
+      const filed = String(it.filed||"");
+      const desc = String(it.description||"").trim();
+
+      return `
+        <div class="card">
+          <div class="cardTop">
+            <div>
+              <div class="tickerLine">
+                ${t ? `<a class="ticker" href="#stock=${encodeURIComponent(t)}">${t}</a>` : `<div class="ticker">N/A</div>`}
+                <div class="who">${who}${chamber ? " · " + chamber : ""}</div>
+              </div>
+            </div>
+            <div class="tags">
+              ${kind === "BUY" ? `<span class="tag tagBuy">BUY</span>` : `<span class="tag tagSell">SELL</span>`}
+              <span class="tag tagSEC">DISCLOSURE</span>
+            </div>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="metaRow">
+            ${amt ? `<div>Amount: <strong>${amt}</strong></div>` : ""}
+            ${traded ? `<div>Traded: <strong>${traded}</strong></div>` : ""}
+            ${filed ? `<div>Filed: <strong>${filed}</strong></div>` : ""}
+          </div>
+
+          ${desc ? `
+            <div class="metaRow">
+              <div style="max-width:900px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                ${desc}
+              </div>
+            </div>
+          ` : ""}
+
+          ${tickerLinksHTML(t)}
+        </div>
+      `;
+    }
+
+    function renderDaily(payload){
+      const days = Array.isArray(payload?.days) ? payload.days : [];
+      if (!days.length){
+        el("dailyTradeList").innerHTML = "<div class='subtle'>No daily trades returned for this window.</div>";
+        el("dailyHint").textContent = "If empty, try 180D or 365D. If always empty, check backend QUIVER_TOKEN.";
+        return;
+      }
+
+      el("dailyTradeList").innerHTML = days.map(d => {
+        const items = Array.isArray(d.items) ? d.items : [];
+        return `
+          <div class="sectionTitle">${d.date}</div>
+          ${items.map(dailyItemHTML).join("")}
+        `;
+      }).join("");
+
+      el("dailyHint").textContent = "Day-by-day activity feed loaded.";
+    }
+
+    async function loadDaily(windowDays, force){
+      const key = String(windowDays || 30);
+      if (CACHE_DAILY.has(key) && !force){
+        renderDaily(CACHE_DAILY.get(key));
+        return;
+      }
+
+      const url = DAILY_URL(windowDays || 30);
+      el("dailyTradeList").innerHTML = "<div class='subtle'>Loading daily feed…</div>";
+      el("dailyHint").textContent = `Loading from: ${url}`;
+
+      try{
+        const data = await fetchJson(url);
+        CACHE_DAILY.set(key, data);
+        renderDaily(data);
+      }catch(err){
+        renderDaily({ days: [] });
+        el("dailyHint").textContent = `Could not load daily feed. ${err?.message || ""} (Most common cause: missing QUIVER_TOKEN on backend.)`;
+      }
+    }
+
+    function renderCrypto(payload){
+      const overall = sentimentBadge(payload?.overallSentiment);
+      const date = String(payload?.date || "");
+      const note = String(payload?.note || "");
+      const errs = Array.isArray(payload?.errors) ? payload.errors : [];
+
+      el("cryptoKpiOverall").innerHTML = `
+        <div class="kpiTop">
+          <div>
+            <div class="kpiTitle">Overall sentiment</div>
+            <div class="kpiValue">${overall.score}/100</div>
+          </div>
+          <span class="kpiBadge ${overall.cls}">${overall.label}</span>
+        </div>
+        <div class="kpiSub">Headline-based gauge.</div>
+        <div class="kpiList">
+          <div class="kpiRow"><span>Date</span><span class="kpiBadge badgeNeu">${date || "—"}</span></div>
+        </div>
+      `;
+
+      const coins = Array.isArray(payload?.coins) ? payload.coins : [];
+      if (!coins.length){
+        el("cryptoCoins").innerHTML = "<div class='subtle'>No coins returned.</div>";
+      } else {
+        el("cryptoCoins").innerHTML = coins.map(c => {
+          const symRaw = String(c?.symbol || "").toUpperCase();
+          const sym = (symRaw === "LINK") ? "Chainlink" : symRaw;
+          const sent = sentimentBadge(c?.sentiment);
+          const sum = String(c?.summary || "").trim();
+          const heads = Array.isArray(c?.headlines) ? c.headlines : [];
+
+          return `
+            <details class="briefingDetails">
+              <summary>
+                <div class="summaryLeft">
+                  <div class="summaryTitle">${sym}</div>
+                  <div class="summaryMeta">${heads.length} headlines · Sentiment ${sent.score}/100${sum ? " · " + sum : ""}</div>
+                </div>
+                <div class="tags">
+                  <span class="kpiBadge badgeNeu">${heads.length}</span>
+                  <span class="kpiBadge ${sent.cls}">${sent.label} · ${sent.score}</span>
+                </div>
+              </summary>
+
+              <div class="divider"></div>
+
+              <div class="kpiSub"><strong>Scan:</strong> ${sum || "No summary available."}</div>
+
+              <div class="divider"></div>
+
+              <div class="kpiSub"><strong>Headlines:</strong></div>
+              <div class="headlineList">
+                ${heads.length ? heads.map(h => headlineHTML({
+                  title: h.title,
+                  link: h.link,
+                  published: h.published,
+                  sourceFeed: h.source,
+                  summary: h.summary
+                })).join("") : "<div class='subtle'>No headlines.</div>"}
+              </div>
+            </details>
+          `;
+        }).join("");
+      }
+
+      el("cryptoHint").textContent = errs.length
+        ? ("Some feeds failed: " + errs.slice(0, 3).join(" | "))
+        : (note || "Crypto briefing loaded.");
+    }
+
+    async function loadCrypto(coins, force){
+      const key = String(coins || "").trim().toUpperCase();
+      if (CACHE_CRYPTO.has(key) && !force){
+        renderCrypto(CACHE_CRYPTO.get(key));
+        return;
+      }
+
+      const url = CRYPTO_URL(key);
+      el("cryptoCoins").innerHTML = "<div class='subtle'>Loading crypto briefing…</div>";
+      el("cryptoHint").textContent = `Loading from: ${url}`;
+
+      try{
+        const data = await fetchJson(url);
+        CACHE_CRYPTO.set(key, data);
+        renderCrypto(data);
+      }catch(err){
+        el("cryptoCoins").innerHTML = "<div class='subtle'>Could not load crypto.</div>";
+        el("cryptoHint").textContent = `Backend /crypto/news/briefing failed. ${err?.message || ""}`;
+        el("cryptoKpiOverall").innerHTML = "";
+      }
+    }
+
+    function showTab(tab){
+      ACTIVE_TAB = tab;
+      setTitleForTab(tab);
+
+      el("viewNews").style.display = tab === "News" ? "" : "none";
+      el("viewCongress").style.display = tab === "Congress" ? "" : "none";
+      el("viewCrypto").style.display = tab === "Crypto" ? "" : "none";
+      el("viewPerf").style.display = tab === "Performance" ? "" : "none";
+
+      el("tabNewsBtn").classList.toggle("tabBtnActive", tab === "News");
+      el("tabCongressBtn").classList.toggle("tabBtnActive", tab === "Congress");
+      el("tabCryptoBtn").classList.toggle("tabBtnActive", tab === "Crypto");
+      el("tabPerfBtn").classList.toggle("tabBtnActive", tab === "Performance");
+
+      el("navNews").classList.toggle("tabBottomActive", tab === "News");
+      el("navCongress").classList.toggle("tabBottomActive", tab === "Congress");
+      el("navCrypto").classList.toggle("tabBottomActive", tab === "Crypto");
+      el("navPerf").classList.toggle("tabBottomActive", tab === "Performance");
+
+      el("mainWindowTools").style.display = (tab === "Congress") ? "" : "none";
+
+      if (tab === "News"){
+        loadMarketRead(false);
+        loadBriefing(el("watchInput").value, false);
+      }
+      if (tab === "Congress"){
+        loadHoldingsCommon(WINDOW_DAYS, false);
+        loadDaily(WINDOW_DAYS, false);
+      }
+      if (tab === "Crypto"){
+        loadCrypto(el("coinInput").value, false);
+      }
+
+      handleHash();
+    }
+
+    function setWindow(days){
+      WINDOW_DAYS = days;
+      el("btn30").classList.toggle("on", WINDOW_DAYS === 30);
+      el("btn180").classList.toggle("on", WINDOW_DAYS === 180);
+      el("btn365").classList.toggle("on", WINDOW_DAYS === 365);
+
+      if (ACTIVE_TAB === "Congress"){
+        loadHoldingsCommon(WINDOW_DAYS, true);
+        loadDaily(WINDOW_DAYS, true);
+      }
+    }
+
+    function handleRefresh(){
+      CACHE_READ = null;
+      CACHE_BRIEFING.clear();
+      CACHE_HOLDINGS.clear();
+      CACHE_DAILY.clear();
+      CACHE_CRYPTO.clear();
+
+      setStatus("", "Refreshing…", "");
+      if (ACTIVE_TAB === "News"){
+        loadMarketRead(true);
+        loadBriefing(el("watchInput").value, true);
+      } else if (ACTIVE_TAB === "Congress"){
+        loadHoldingsCommon(WINDOW_DAYS, true);
+        loadDaily(WINDOW_DAYS, true);
+      } else if (ACTIVE_TAB === "Crypto"){
+        loadCrypto(el("coinInput").value, true);
+      }
+    }
+
+    el("btn30").addEventListener("click", () => setWindow(30));
+    el("btn180").addEventListener("click", () => setWindow(180));
+    el("btn365").addEventListener("click", () => setWindow(365));
+
+    el("tabNewsBtn").addEventListener("click", () => showTab("News"));
+    el("tabCongressBtn").addEventListener("click", () => showTab("Congress"));
+    el("tabCryptoBtn").addEventListener("click", () => showTab("Crypto"));
+    el("tabPerfBtn").addEventListener("click", () => showTab("Performance"));
+
+    el("navNews").addEventListener("click", () => showTab("News"));
+    el("navCongress").addEventListener("click", () => showTab("Congress"));
+    el("navCrypto").addEventListener("click", () => showTab("Crypto"));
+    el("navPerf").addEventListener("click", () => showTab("Performance"));
+
+    el("refreshBtn").addEventListener("click", handleRefresh);
+    window.addEventListener("hashchange", handleHash);
+
+    el("watchApplyBtn").addEventListener("click", () => {
+      loadBriefing(el("watchInput").value, true);
+    });
+
+    el("readRefreshBtn").addEventListener("click", () => {
+      loadMarketRead(true);
+    });
+
+    el("cryptoApplyBtn").addEventListener("click", () => {
+      loadCrypto(el("coinInput").value, true);
+    });
+
+    showTab("News");
+    setStatus("ok", "Ready ✅", "");
+    el("reportDate").textContent = "";
+  </script>
+</body>
+</html>
