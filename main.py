@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlparse, parse_qs, unquote
+
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.11.2")
+app = FastAPI(title="Finance Signals Backend", version="4.12.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -62,14 +63,14 @@ SESSION = requests.Session()
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.11.2"}
+    return {"status": "ok", "version": "4.12.0"}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "4.11.2",
+        "version": "4.12.0",
         "hasQuiverToken": bool(QUIVER_TOKEN),
         "hasFinnhubKey": bool(FINNHUB_API_KEY),
         "utc": datetime.now(timezone.utc).isoformat(),
@@ -120,8 +121,20 @@ def _is_cooled_down(provider: str) -> bool:
 # =========================================================
 # HTTP helpers
 # =========================================================
-def _requests_get(url: str, params: Optional[dict] = None, timeout: int = 16, headers: Optional[dict] = None, allow_redirects: bool = True) -> requests.Response:
-    return SESSION.get(url, params=params, timeout=timeout, headers=headers or UA_HEADERS, allow_redirects=allow_redirects)
+def _requests_get(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: int = 16,
+    headers: Optional[dict] = None,
+    allow_redirects: bool = True,
+) -> requests.Response:
+    return SESSION.get(
+        url,
+        params=params,
+        timeout=timeout,
+        headers=headers or UA_HEADERS,
+        allow_redirects=allow_redirects,
+    )
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -268,7 +281,7 @@ def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
 # =========================================================
 @app.get("/market/read")
 def market_read():
-    key = "market:read:v4112"
+    key = "market:read:v4120"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -325,8 +338,16 @@ def market_read():
         return f"{s}{x:.2f}%"
 
     parts: List[str] = []
-    parts.append(f"SPY {spy_last:.2f} (1D {_fmt_pct(spy_1d)}, 5D {_fmt_pct(spy_5d)}, 1M {_fmt_pct(spy_1m)})." if spy_last is not None else "SPY unavailable.")
-    parts.append(f"QQQ {qqq_last:.2f} (1D {_fmt_pct(qqq_1d)}, 5D {_fmt_pct(qqq_5d)}, 1M {_fmt_pct(qqq_1m)})." if qqq_last is not None else "QQQ unavailable.")
+    parts.append(
+        f"SPY {spy_last:.2f} (1D {_fmt_pct(spy_1d)}, 5D {_fmt_pct(spy_5d)}, 1M {_fmt_pct(spy_1m)})."
+        if spy_last is not None
+        else "SPY unavailable."
+    )
+    parts.append(
+        f"QQQ {qqq_last:.2f} (1D {_fmt_pct(qqq_1d)}, 5D {_fmt_pct(qqq_5d)}, 1M {_fmt_pct(qqq_1m)})."
+        if qqq_last is not None
+        else "QQQ unavailable."
+    )
     if vix_last is not None:
         parts.append(f"VIX {vix_last:.2f}.")
 
@@ -336,7 +357,7 @@ def market_read():
         "sp500": {"symbol": "SPY", "last": spy_last, "ret1dPct": spy_1d, "ret5dPct": spy_5d, "ret1mPct": spy_1m},
         "nasdaq": {"symbol": "QQQ", "last": qqq_last, "ret1dPct": qqq_1d, "ret5dPct": qqq_5d, "ret1mPct": qqq_1m},
         "vix": {"symbol": "^VIX", "last": vix_last},
-        "fearGreed": {"score": None, "rating": None},  # keep field for frontend compatibility
+        "fearGreed": {"score": None, "rating": None},
         "errors": errors,
         "note": "Uses Stooq daily history first; falls back to Nasdaq quote when needed.",
     }
@@ -355,7 +376,7 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 _META_DESC_RE = re.compile(
     r'<meta[^>]+(?:name="description"|property="og:description")[^>]+content="([^"]+)"',
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 _P_RE = re.compile(r"<p[^>]*>(.*?)</p>", re.IGNORECASE | re.DOTALL)
 
@@ -525,9 +546,21 @@ def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
 # =========================================================
 # Article summary extraction (best effort, no extra deps)
 # =========================================================
+def _is_valid_public_http_url(url: str) -> bool:
+    try:
+        u = urlparse(url)
+        if u.scheme not in ("http", "https"):
+            return False
+        if not u.netloc:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _maybe_decode_google_news_redirect(url: str) -> str:
     """
-    Some Google News RSS links have ?url= publisher URL.
+    Some Google News RSS links have ?url=publisher URL.
     If present, use it without fetching.
     """
     try:
@@ -538,6 +571,29 @@ def _maybe_decode_google_news_redirect(url: str) -> str:
     except Exception:
         pass
     return url
+
+
+def _try_resolve_via_head(url: str) -> str:
+    """
+    Follow redirects quickly (HEAD first, then GET) to reach the publisher URL.
+    This helps when the RSS link points to news.google.com/articles/*.
+    """
+    url0 = (url or "").strip()
+    if not url0:
+        return ""
+    try:
+        r = SESSION.head(url0, timeout=8, allow_redirects=True, headers=UA_HEADERS)
+        if r.url and r.url != url0:
+            return r.url
+    except Exception:
+        pass
+    try:
+        r2 = _requests_get(url0, timeout=8, headers=UA_HEADERS, allow_redirects=True)
+        if r2.url and r2.url != url0:
+            return r2.url
+    except Exception:
+        pass
+    return url0
 
 
 def _extract_meta_description(html: str) -> str:
@@ -554,55 +610,63 @@ def _extract_first_sentences_from_paragraphs(html: str, max_sentences: int = 3) 
         return ""
     paras = _P_RE.findall(html)
     text_bits: List[str] = []
-    for p in paras[:8]:
+    for p in paras[:10]:
         clean = _strip_html(p)
         if len(clean) < 60:
             continue
         text_bits.append(clean)
-        if len(" ".join(text_bits)) > 900:
+        if len(" ".join(text_bits)) > 1100:
             break
     blob = " ".join(text_bits).strip()
     if not blob:
         return ""
-    # split into sentences
     sents = re.split(r"(?<=[\.\!\?])\s+", blob)
     sents = [s.strip() for s in sents if s.strip()]
     return " ".join(sents[:max_sentences]).strip()
 
 
-def _fetch_article_snippet(url: str) -> str:
+def _fetch_article_snippet(url: str) -> Tuple[str, str]:
     """
-    Fetch publisher page (or google redirect) and extract a short snippet.
+    Fetch publisher page and extract a short snippet.
+    Returns: (resolved_url, snippet)
     Cached.
     """
     url0 = (url or "").strip()
     if not url0:
-        return ""
+        return "", ""
 
     url0 = _maybe_decode_google_news_redirect(url0)
-    key = f"art:snip:{url0[:280]}"
-    cached = cache_get(key, allow_stale=True)
-    if cached is not None:
-        return str(cached or "")
+    url0 = _try_resolve_via_head(url0)
 
-    # Keep this fast and polite. Many publishers block bots.
+    key = f"art:snip:{url0[:300]}"
+    cached = cache_get(key, allow_stale=True)
+    if cached is not None and isinstance(cached, dict):
+        return str(cached.get("resolved") or url0), str(cached.get("snippet") or "")
+
     try:
         r = _requests_get(url0, timeout=10, headers=UA_HEADERS, allow_redirects=True)
+        resolved = r.url or url0
         if r.status_code >= 400:
-            return cache_set(key, "", ttl_seconds=180, stale_ttl_seconds=3600)
+            cache_set(key, {"resolved": resolved, "snippet": ""}, ttl_seconds=180, stale_ttl_seconds=3600)
+            return resolved, ""
+
         html = (r.text or "")[:250000]
 
         desc = _extract_meta_description(html)
         if desc and len(desc) >= 60:
-            return cache_set(key, desc, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
+            cache_set(key, {"resolved": resolved, "snippet": desc}, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
+            return resolved, desc
 
         p = _extract_first_sentences_from_paragraphs(html, max_sentences=3)
         if p and len(p) >= 80:
-            return cache_set(key, p, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
+            cache_set(key, {"resolved": resolved, "snippet": p}, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
+            return resolved, p
 
-        return cache_set(key, "", ttl_seconds=180, stale_ttl_seconds=3600)
+        cache_set(key, {"resolved": resolved, "snippet": ""}, ttl_seconds=180, stale_ttl_seconds=3600)
+        return resolved, ""
     except Exception:
-        return cache_set(key, "", ttl_seconds=180, stale_ttl_seconds=3600)
+        cache_set(key, {"resolved": url0, "snippet": ""}, ttl_seconds=180, stale_ttl_seconds=3600)
+        return url0, ""
 
 
 def _title_is_repeating(title: str, text: str) -> bool:
@@ -612,7 +676,6 @@ def _title_is_repeating(title: str, text: str) -> bool:
         return False
     if s.startswith(t):
         return True
-    # heavy overlap
     t_words = {w for w in re.findall(r"[a-zA-Z]{3,}", t)}
     s_words = {w for w in re.findall(r"[a-zA-Z]{3,}", s)}
     if not t_words:
@@ -630,7 +693,6 @@ def _to_bullets(text: str, max_bullets: int = 3) -> List[str]:
     if not s:
         return []
 
-    # Sentence split
     sents = re.split(r"(?<=[\.\!\?])\s+", s)
     sents = [x.strip() for x in sents if x.strip()]
 
@@ -638,72 +700,99 @@ def _to_bullets(text: str, max_bullets: int = 3) -> List[str]:
     for sent in sents:
         if len(sent) < 35:
             continue
-        # trim
-        if len(sent) > 180:
-            sent = sent[:180].rsplit(" ", 1)[0].strip() + "…"
+        if len(sent) > 185:
+            sent = sent[:185].rsplit(" ", 1)[0].strip() + "…"
         bullets.append(sent)
         if len(bullets) >= max_bullets:
             break
 
-    # If we only got 1 bullet, try splitting on semicolons/commas
     if len(bullets) < 2:
         chunks = re.split(r"\s*;\s*|\s+but\s+|\s+while\s+", s)
         chunks = [c.strip() for c in chunks if len(c.strip()) >= 40]
         for c in chunks[:max_bullets]:
             if len(bullets) >= max_bullets:
                 break
-            if len(c) > 180:
-                c = c[:180].rsplit(" ", 1)[0].strip() + "…"
+            if len(c) > 185:
+                c = c[:185].rsplit(" ", 1)[0].strip() + "…"
             if c not in bullets:
                 bullets.append(c)
 
     return bullets[:max_bullets]
 
 
-def _headline_bullets(title: str, raw_summary: str, link: str) -> List[str]:
+def _headline_bullets(title: str, raw_summary: str, link: str) -> Tuple[List[str], str]:
     """
     Best effort bullet summary:
       1) Fetch article snippet (meta description or first paragraphs)
       2) Else use RSS rawSummary
-      3) Else return []
+    Returns (bullets, resolved_url)
     """
-    # 1) article snippet
-    snip = _fetch_article_snippet(link)
+    resolved, snip = _fetch_article_snippet(link)
     if snip and not _title_is_repeating(title, snip):
         b = _to_bullets(snip, max_bullets=3)
         if b:
-            return b
+            return b, resolved
 
-    # 2) RSS summary
     rs = _strip_html(raw_summary or "")
     if rs and not _title_is_repeating(title, rs):
         b = _to_bullets(rs, max_bullets=3)
         if b:
-            return b
+            return b, resolved
 
-    return []
+    return [], resolved
 
 
 # =========================================================
-# Lightweight sentiment and summaries (existing)
+# NEW: Article summarizer endpoint for frontend
+# =========================================================
+@app.get("/news/summarize")
+def news_summarize(url: str = Query(..., description="Publisher URL or Google News article URL")):
+    u = (url or "").strip()
+    if not u or len(u) > 1800:
+        raise HTTPException(400, "Invalid url")
+    if not _is_valid_public_http_url(u):
+        raise HTTPException(400, "URL must be http(s)")
+
+    key = f"news:summarize:v1:{u[:500]}"
+    cached = cache_get(key, allow_stale=True)
+    if cached is not None:
+        return cached
+
+    # Title is unknown here, so pass empty to avoid over-filtering.
+    bullets, resolved = _headline_bullets("", "", u)
+
+    # If we got nothing, try again using meta/paragraph extraction directly (already done),
+    # so at this point it is likely blocked by the publisher or paywalled.
+    out = {
+        "url": u,
+        "resolvedUrl": resolved or u,
+        "bullets": bullets[:3],
+        "note": "Best effort extraction from publisher page. Some sites block bots or require subscriptions.",
+    }
+    return cache_set(key, out, ttl_seconds=6 * 3600, stale_ttl_seconds=24 * 3600)
+
+
+# =========================================================
+# Lightweight sentiment and summaries
 # =========================================================
 _STOPWORDS = {
-    "the","a","an","and","or","to","of","in","on","for","with","as","at","by","from","into",
-    "over","after","before","than","is","are","was","were","be","been","being","it","its",
-    "this","that","these","those","you","your","they","their","we","our","us","will","may",
-    "new","today","latest","live","update","reports","report","says","say","said"
+    "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "as", "at", "by", "from", "into",
+    "over", "after", "before", "than", "is", "are", "was", "were", "be", "been", "being", "it", "its",
+    "this", "that", "these", "those", "you", "your", "they", "their", "we", "our", "us", "will", "may",
+    "new", "today", "latest", "live", "update", "reports", "report", "says", "say", "said"
 }
 
 _TICKER_RE = re.compile(r"\b[A-Z]{1,5}\b")
 
 _POS_WORDS = {
-    "beats","beat","surge","soar","record","upgrade","strong","growth","profit","raises",
-    "rally","bullish","wins","approval","partnership","acquisition","buyback"
+    "beats", "beat", "surge", "soar", "record", "upgrade", "strong", "growth", "profit", "raises",
+    "rally", "bullish", "wins", "approval", "partnership", "acquisition", "buyback"
 }
 _NEG_WORDS = {
-    "miss","misses","slump","falls","drop","downgrade","weak","layoff","cuts","probe",
-    "lawsuit","ban","halt","recall","fraud","warning"
+    "miss", "misses", "slump", "falls", "drop", "downgrade", "weak", "layoff", "cuts", "probe",
+    "lawsuit", "ban", "halt", "recall", "fraud", "warning"
 }
+
 
 def _sentiment_from_titles(titles: List[str]) -> Tuple[int, str]:
     if not titles:
@@ -722,7 +811,7 @@ def _sentiment_from_titles(titles: List[str]) -> Tuple[int, str]:
 
 
 def _extract_tickers_from_titles(titles: List[str]) -> List[str]:
-    bad = {"A","I","AN","THE","AND","OR","TO","OF","IN","ON","US","AI"}
+    bad = {"A", "I", "AN", "THE", "AND", "OR", "TO", "OF", "IN", "ON", "US", "AI"}
     out = []
     for t in titles:
         for x in _TICKER_RE.findall((t or "").upper()):
@@ -778,7 +867,7 @@ def news_briefing(
     max_items_per_sector: int = Query(default=12, ge=5, le=30),
     max_age_days: int = Query(default=30, ge=7, le=45),
 ):
-    key = f"news:brief:v4112:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}:{max_age_days}"
+    key = f"news:brief:v4120:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}:{max_age_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -796,7 +885,10 @@ def news_briefing(
         jobs.append((sec, _google_news_rss(f"{sec} stocks markets")))
 
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = [(sec, ex.submit(_fetch_rss_items, url, 10, max_items_per_sector * 3, 240, 6 * 3600, max_age_days)) for sec, url in jobs]
+        futs = [
+            (sec, ex.submit(_fetch_rss_items, url, 10, max_items_per_sector * 3, 240, 6 * 3600, max_age_days))
+            for sec, url in jobs
+        ]
         for sec, fut in futs:
             try:
                 items = fut.result()
@@ -812,7 +904,10 @@ def news_briefing(
         for t in watch[:40]:
             ticker_jobs.append((t, _google_news_rss(f"{t} stock")))
         with ThreadPoolExecutor(max_workers=8) as ex:
-            futs2 = [(t, ex.submit(_fetch_rss_items, url, 10, max_per_ticker * 2, 240, 6 * 3600, max_age_days)) for t, url in ticker_jobs]
+            futs2 = [
+                (t, ex.submit(_fetch_rss_items, url, 10, max_per_ticker * 2, 240, 6 * 3600, max_age_days))
+                for t, url in ticker_jobs
+            ]
             for t, fut in futs2:
                 try:
                     items = fut.result()
@@ -826,7 +921,6 @@ def news_briefing(
 
     all_items = _dedup_items(all_items, 1500)
 
-    # Build outputs and include per-headline bullets
     sectors_out: List[dict] = []
 
     def _headlines_payload(items: List[dict], sec: str) -> List[dict]:
@@ -836,7 +930,8 @@ def news_briefing(
             link = x.get("link", "") or ""
             pub = x.get("published", "") or ""
             raw = x.get("rawSummary", "") or ""
-            bullets = _headline_bullets(title, raw, link)
+
+            bullets, resolved = _headline_bullets(title, raw, link)
 
             out.append({
                 "title": title,
@@ -844,14 +939,12 @@ def news_briefing(
                 "published": pub,
                 "sourceFeed": x.get("source", "Google News"),
                 "sector": sec,
-                # Backward compatibility:
                 "summary": bullets[0] if bullets else "",
-                # New: render these under each headline:
                 "summaryBullets": bullets,
+                "resolvedUrl": resolved,
             })
         return out
 
-    # Watchlist sector first
     if watch:
         wl_items = [x for x in all_items if x.get("sector") == "Watchlist"][:max_general]
         wl_items = _dedup_items(wl_items, max_general)
@@ -864,13 +957,12 @@ def news_briefing(
             "sentiment": {"label": wl_label, "score": wl_score},
             "summary": "Per-headline takeaways shown under each item.",
             "aiSummary": "Per-headline takeaways shown under each item.",
-            "implications": [],  # frontend can ignore
+            "implications": [],
             "topHeadlines": _headlines_payload(wl_items, "Watchlist"),
             "watchlistMentions": watch[:25],
             "tickersMentioned": _extract_tickers_from_titles(wl_titles)[:12],
         })
 
-    # Each sector
     for sec in sector_list:
         sec_items = [x for x in all_items if x.get("sector") == sec][:max_items_per_sector]
         sec_titles = [x.get("title", "") for x in sec_items]
@@ -883,13 +975,13 @@ def news_briefing(
             "sentiment": {"label": label, "score": score},
             "summary": ai_sum,
             "aiSummary": ai_sum,
-            "implications": [],  # user wanted to remove this section
+            "implications": [],
             "topHeadlines": _headlines_payload(sec_items, sec),
             "watchlistMentions": [],
             "tickersMentioned": _extract_tickers_from_titles(sec_titles)[:12],
         })
 
-    all_titles = []
+    all_titles: List[str] = []
     for s in sectors_out:
         all_titles.extend([h.get("title", "") for h in (s.get("topHeadlines") or [])])
 
@@ -914,7 +1006,7 @@ def crypto_news_briefing(
     include_top_n: int = Query(default=15, ge=5, le=50),
     max_age_days: int = Query(default=30, ge=7, le=45),
 ):
-    key = f"crypto:news:v4112:{coins}:{include_top_n}:{max_age_days}"
+    key = f"crypto:news:v4120:{coins}:{include_top_n}:{max_age_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -952,7 +1044,7 @@ def crypto_news_briefing(
                 link = x.get("link", "") or ""
                 pub = x.get("published", "") or ""
                 raw = x.get("rawSummary", "") or ""
-                bullets = _headline_bullets(title, raw, link)
+                bullets, resolved = _headline_bullets(title, raw, link)
 
                 heads.append({
                     "title": title,
@@ -961,6 +1053,7 @@ def crypto_news_briefing(
                     "source": "Google News",
                     "summary": bullets[0] if bullets else "",
                     "summaryBullets": bullets,
+                    "resolvedUrl": resolved,
                 })
 
             coins_out.append({
@@ -1125,7 +1218,7 @@ def holdings_common(window_days: int = Query(default=365, ge=30, le=365), top_n:
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"holdings:common:v4112:{window_days}:{top_n}"
+    key = f"holdings:common:v4120:{window_days}:{top_n}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1170,7 +1263,7 @@ def congress_daily(window_days: int = Query(default=30, ge=1, le=365), limit: in
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"congress:daily:v4112:{window_days}:{limit}"
+    key = f"congress:daily:v4120:{window_days}:{limit}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
