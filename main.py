@@ -3,7 +3,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus, urlparse, parse_qs
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.12.0")
+app = FastAPI(title="Finance Signals Backend", version="4.12.1")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -48,6 +48,13 @@ RSS_HEADERS = {
     "Connection": "keep-alive",
 }
 
+HTML_HEADERS = {
+    "User-Agent": UA_HEADERS["User-Agent"],
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": UA_HEADERS["Accept-Language"],
+    "Connection": "keep-alive",
+}
+
 NASDAQ_HEADERS = {
     "User-Agent": UA_HEADERS["User-Agent"],
     "Accept": "application/json, text/plain, */*",
@@ -62,14 +69,14 @@ SESSION = requests.Session()
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.12.0"}
+    return {"status": "ok", "version": "4.12.1"}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "4.12.0",
+        "version": "4.12.1",
         "hasQuiverToken": bool(QUIVER_TOKEN),
         "hasFinnhubKey": bool(FINNHUB_API_KEY),
         "utc": datetime.now(timezone.utc).isoformat(),
@@ -125,9 +132,11 @@ def _requests_get(
     params: Optional[dict] = None,
     timeout: int = 16,
     headers: Optional[dict] = None,
-    allow_redirects: bool = True
+    allow_redirects: bool = True,
 ) -> requests.Response:
-    return SESSION.get(url, params=params, timeout=timeout, headers=headers or UA_HEADERS, allow_redirects=allow_redirects)
+    return SESSION.get(
+        url, params=params, timeout=timeout, headers=headers or UA_HEADERS, allow_redirects=allow_redirects
+    )
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -274,7 +283,7 @@ def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
 # =========================================================
 @app.get("/market/read")
 def market_read():
-    key = "market:read:v4120"
+    key = "market:read:v4121"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -333,11 +342,13 @@ def market_read():
     parts: List[str] = []
     parts.append(
         f"SPY {spy_last:.2f} (1D {_fmt_pct(spy_1d)}, 5D {_fmt_pct(spy_5d)}, 1M {_fmt_pct(spy_1m)})."
-        if spy_last is not None else "SPY unavailable."
+        if spy_last is not None
+        else "SPY unavailable."
     )
     parts.append(
         f"QQQ {qqq_last:.2f} (1D {_fmt_pct(qqq_1d)}, 5D {_fmt_pct(qqq_5d)}, 1M {_fmt_pct(qqq_1m)})."
-        if qqq_last is not None else "QQQ unavailable."
+        if qqq_last is not None
+        else "QQQ unavailable."
     )
     if vix_last is not None:
         parts.append(f"VIX {vix_last:.2f}.")
@@ -348,7 +359,7 @@ def market_read():
         "sp500": {"symbol": "SPY", "last": spy_last, "ret1dPct": spy_1d, "ret5dPct": spy_5d, "ret1mPct": spy_1m},
         "nasdaq": {"symbol": "QQQ", "last": qqq_last, "ret1dPct": qqq_1d, "ret5dPct": qqq_5d, "ret1mPct": qqq_1m},
         "vix": {"symbol": "^VIX", "last": vix_last},
-        "fearGreed": {"score": None, "rating": None},  # keep field for frontend compatibility
+        "fearGreed": {"score": None, "rating": None},
         "errors": errors,
         "note": "Uses Stooq daily history first; falls back to Nasdaq quote when needed.",
     }
@@ -365,18 +376,26 @@ def _google_news_rss(query: str) -> str:
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
+_SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>")
 _META_DESC_RE = re.compile(
-    r'<meta[^>]+(?:name="description"|property="og:description")[^>]+content="([^"]+)"',
-    re.IGNORECASE
+    r'<meta[^>]+(?:name="description"|property="og:description"|name="twitter:description")[^>]+content="([^"]+)"',
+    re.IGNORECASE,
 )
-_P_RE = re.compile(r"<p[^>]*>(.*?)</p>", re.IGNORECASE | re.DOTALL)
+_P_RE = re.compile(r"(?is)<p[^>]*>(.*?)</p>")
 
 
 def _strip_html(s: str) -> str:
     if not s:
         return ""
+    s = _SCRIPT_STYLE_RE.sub(" ", s)
     s2 = _TAG_RE.sub(" ", s)
-    s2 = s2.replace("&nbsp;", " ").replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
+    s2 = (
+        s2.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+    )
     s2 = _WS_RE.sub(" ", s2).strip()
     return s2
 
@@ -535,8 +554,12 @@ def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
 
 
 # =========================================================
-# Article summary extraction (best effort, no extra deps)
+# Article resolution + key takeaways
 # =========================================================
+_EXTERNAL_HREF_RE = re.compile(r'href="(https?://[^"]+)"', re.IGNORECASE)
+_GOOGLE_NEWS_REDIRECT_URL_RE = re.compile(r"[?&]url=([^&]+)", re.IGNORECASE)
+
+
 def _maybe_decode_google_news_redirect(url: str) -> str:
     """
     Some Google News RSS links have ?url=publisher URL.
@@ -549,7 +572,66 @@ def _maybe_decode_google_news_redirect(url: str) -> str:
             return q["url"][0]
     except Exception:
         pass
+    m = _GOOGLE_NEWS_REDIRECT_URL_RE.search(url or "")
+    if m:
+        try:
+            return unquote(m.group(1))
+        except Exception:
+            return url
     return url
+
+
+def _is_google_news_link(url: str) -> bool:
+    try:
+        u = urlparse(url)
+        return (u.netloc or "").lower().endswith("news.google.com")
+    except Exception:
+        return False
+
+
+def _resolve_google_news_to_publisher(url: str) -> str:
+    """
+    Google News RSS links often point to news.google.com/rss/articles/... or .../articles/...
+    Those pages contain an outbound publisher link, but it is not always in ?url=.
+    This function fetches the Google page once and picks the first outbound non-google href.
+    """
+    url0 = (url or "").strip()
+    if not url0:
+        return url0
+
+    key = f"gn:resolve:{url0[:240]}"
+    cached = cache_get(key, allow_stale=True)
+    if cached is not None:
+        return str(cached or url0)
+
+    if not _is_google_news_link(url0):
+        resolved = _maybe_decode_google_news_redirect(url0)
+        return cache_set(key, resolved, ttl_seconds=6 * 3600, stale_ttl_seconds=24 * 3600)
+
+    # First try decoding url= in query
+    decoded = _maybe_decode_google_news_redirect(url0)
+    if decoded and not _is_google_news_link(decoded):
+        return cache_set(key, decoded, ttl_seconds=6 * 3600, stale_ttl_seconds=24 * 3600)
+
+    # Otherwise, fetch the Google News intermediate page and parse outbound hrefs
+    try:
+        r = _requests_get(url0, timeout=10, headers=HTML_HEADERS, allow_redirects=True)
+        html = (r.text or "")[:200000]
+        hrefs = _EXTERNAL_HREF_RE.findall(html)
+        for h in hrefs:
+            h2 = _maybe_decode_google_news_redirect(h)
+            if not h2:
+                continue
+            if _is_google_news_link(h2):
+                continue
+            # Avoid obvious junk
+            if any(x in h2.lower() for x in ["accounts.google.com", "policies.google.com", "support.google.com"]):
+                continue
+            return cache_set(key, h2, ttl_seconds=6 * 3600, stale_ttl_seconds=24 * 3600)
+    except Exception:
+        pass
+
+    return cache_set(key, url0, ttl_seconds=3600, stale_ttl_seconds=24 * 3600)
 
 
 def _extract_meta_description(html: str) -> str:
@@ -561,17 +643,18 @@ def _extract_meta_description(html: str) -> str:
     return _strip_html(m.group(1))
 
 
-def _extract_first_sentences_from_paragraphs(html: str, max_sentences: int = 3) -> str:
+def _extract_first_sentences_from_paragraphs(html: str, max_sentences: int = 4) -> str:
     if not html:
         return ""
+    html = _SCRIPT_STYLE_RE.sub(" ", html)
     paras = _P_RE.findall(html)
     text_bits: List[str] = []
-    for p in paras[:8]:
+    for p in paras[:12]:
         clean = _strip_html(p)
         if len(clean) < 60:
             continue
         text_bits.append(clean)
-        if len(" ".join(text_bits)) > 900:
+        if len(" ".join(text_bits)) > 1400:
             break
     blob = " ".join(text_bits).strip()
     if not blob:
@@ -583,32 +666,32 @@ def _extract_first_sentences_from_paragraphs(html: str, max_sentences: int = 3) 
 
 def _fetch_article_snippet(url: str) -> str:
     """
-    Fetch publisher page (or google redirect) and extract a short snippet.
-    Cached. Best effort: many publishers block bots.
+    Fetch publisher page and extract a short snippet (meta description or first paragraphs).
+    Cached.
     """
     url0 = (url or "").strip()
     if not url0:
         return ""
 
-    url0 = _maybe_decode_google_news_redirect(url0)
-    key = f"art:snip:{url0[:280]}"
+    resolved = _resolve_google_news_to_publisher(url0)
+    key = f"art:snip:{resolved[:280]}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return str(cached or "")
 
     try:
-        r = _requests_get(url0, timeout=10, headers=UA_HEADERS, allow_redirects=True)
+        r = _requests_get(resolved, timeout=10, headers=HTML_HEADERS, allow_redirects=True)
         if r.status_code >= 400:
             return cache_set(key, "", ttl_seconds=180, stale_ttl_seconds=3600)
-        html = (r.text or "")[:250000]
+        html = (r.text or "")[:300000]
 
         desc = _extract_meta_description(html)
-        if desc and len(desc) >= 60:
-            return cache_set(key, desc, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
+        if desc and len(desc) >= 80:
+            return cache_set(key, desc, ttl_seconds=1800, stale_ttl_seconds=12 * 3600)
 
-        p = _extract_first_sentences_from_paragraphs(html, max_sentences=3)
-        if p and len(p) >= 80:
-            return cache_set(key, p, ttl_seconds=900, stale_ttl_seconds=6 * 3600)
+        p = _extract_first_sentences_from_paragraphs(html, max_sentences=4)
+        if p and len(p) >= 120:
+            return cache_set(key, p, ttl_seconds=1800, stale_ttl_seconds=12 * 3600)
 
         return cache_set(key, "", ttl_seconds=180, stale_ttl_seconds=3600)
     except Exception:
@@ -627,51 +710,80 @@ def _title_is_repeating(title: str, text: str) -> bool:
     if not t_words:
         return False
     overlap = len(t_words & s_words) / max(1, len(t_words))
-    return overlap >= 0.80
+    return overlap >= 0.75
 
 
 def _to_bullets(text: str, max_bullets: int = 3) -> List[str]:
     """
-    Turn a snippet into 2-3 concise bullets.
+    Convert a snippet into 2-3 "key takeaway" bullets.
+    We bias toward sentences that carry facts (numbers/verbs) and avoid ultra-generic lines.
     """
     s = _strip_html(text or "")
     s = re.sub(r"\s+", " ", s).strip()
     if not s:
         return []
 
+    # Sentence split
     sents = re.split(r"(?<=[\.\!\?])\s+", s)
     sents = [x.strip() for x in sents if x.strip()]
 
+    # Filter out generic boilerplate
+    def _too_generic(x: str) -> bool:
+        xl = x.lower()
+        bad = [
+            "click here",
+            "sign up",
+            "subscribe",
+            "cookies",
+            "privacy policy",
+            "terms of service",
+            "read more",
+            "advertisement",
+        ]
+        if any(b in xl for b in bad):
+            return True
+        # very short or very title-like
+        if len(x) < 45:
+            return True
+        return False
+
+    candidates = [x for x in sents if not _too_generic(x)]
+
+    # Rank: prefer sentences with numbers, percent, dollar, or strong verbs
+    def _score(x: str) -> int:
+        xl = x.lower()
+        sc = 0
+        if re.search(r"\$|%|\b\d", x):
+            sc += 3
+        if any(w in xl for w in ["said", "announced", "expects", "forecast", "reported", "plans", "will", "could"]):
+            sc += 2
+        if any(w in xl for w in ["because", "after", "while", "as", "due to", "amid"]):
+            sc += 1
+        return sc
+
+    candidates.sort(key=lambda x: (-_score(x), -len(x)))
+
     bullets: List[str] = []
-    for sent in sents:
-        if len(sent) < 35:
+    for sent in candidates:
+        # Trim and keep punchy
+        if len(sent) > 200:
+            sent = sent[:200].rsplit(" ", 1)[0].strip() + "…"
+        # Avoid duplicates
+        if any(sent[:80] == b[:80] for b in bullets):
             continue
-        if len(sent) > 180:
-            sent = sent[:180].rsplit(" ", 1)[0].strip() + "…"
         bullets.append(sent)
         if len(bullets) >= max_bullets:
             break
-
-    if len(bullets) < 2:
-        chunks = re.split(r"\s*;\s*|\s+but\s+|\s+while\s+", s)
-        chunks = [c.strip() for c in chunks if len(c.strip()) >= 40]
-        for c in chunks[:max_bullets]:
-            if len(bullets) >= max_bullets:
-                break
-            if len(c) > 180:
-                c = c[:180].rsplit(" ", 1)[0].strip() + "…"
-            if c not in bullets:
-                bullets.append(c)
 
     return bullets[:max_bullets]
 
 
 def _headline_bullets(title: str, raw_summary: str, link: str) -> List[str]:
     """
-    Best effort bullet summary:
-      1) Fetch article snippet (meta description or first paragraphs)
-      2) Else use RSS rawSummary
-      3) Else fallback to title (never empty)
+    Best effort:
+      1) Resolve Google News -> publisher and extract snippet from publisher page
+      2) Else use RSS raw summary/description
+      3) Else return [] (NO title fallback to avoid duplication)
     """
     snip = _fetch_article_snippet(link)
     if snip and not _title_is_repeating(title, snip):
@@ -685,31 +797,105 @@ def _headline_bullets(title: str, raw_summary: str, link: str) -> List[str]:
         if b:
             return b
 
-    t = (title or "").strip()
-    if t:
-        return [t]
     return []
 
 
 # =========================================================
-# Lightweight sentiment + summaries
+# Lightweight sentiment + sector summary
 # =========================================================
 _STOPWORDS = {
-    "the","a","an","and","or","to","of","in","on","for","with","as","at","by","from","into",
-    "over","after","before","than","is","are","was","were","be","been","being","it","its",
-    "this","that","these","those","you","your","they","their","we","our","us","will","may",
-    "new","today","latest","live","update","reports","report","says","say","said"
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "as",
+    "at",
+    "by",
+    "from",
+    "into",
+    "over",
+    "after",
+    "before",
+    "than",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+    "you",
+    "your",
+    "they",
+    "their",
+    "we",
+    "our",
+    "us",
+    "will",
+    "may",
+    "new",
+    "today",
+    "latest",
+    "live",
+    "update",
+    "reports",
+    "report",
+    "says",
+    "say",
+    "said",
 }
 
 _TICKER_RE = re.compile(r"\b[A-Z]{1,5}\b")
 
 _POS_WORDS = {
-    "beats","beat","surge","soar","record","upgrade","strong","growth","profit","raises",
-    "rally","bullish","wins","approval","partnership","acquisition","buyback"
+    "beats",
+    "beat",
+    "surge",
+    "soar",
+    "record",
+    "upgrade",
+    "strong",
+    "growth",
+    "profit",
+    "raises",
+    "rally",
+    "bullish",
+    "wins",
+    "approval",
+    "partnership",
+    "acquisition",
+    "buyback",
 }
 _NEG_WORDS = {
-    "miss","misses","slump","falls","drop","downgrade","weak","layoff","cuts","probe",
-    "lawsuit","ban","halt","recall","fraud","warning"
+    "miss",
+    "misses",
+    "slump",
+    "falls",
+    "drop",
+    "downgrade",
+    "weak",
+    "layoff",
+    "cuts",
+    "probe",
+    "lawsuit",
+    "ban",
+    "halt",
+    "recall",
+    "fraud",
+    "warning",
 }
 
 
@@ -730,7 +916,7 @@ def _sentiment_from_titles(titles: List[str]) -> Tuple[int, str]:
 
 
 def _extract_tickers_from_titles(titles: List[str]) -> List[str]:
-    bad = {"A","I","AN","THE","AND","OR","TO","OF","IN","ON","US","AI"}
+    bad = {"A", "I", "AN", "THE", "AND", "OR", "TO", "OF", "IN", "ON", "US", "AI"}
     out = []
     for t in titles:
         for x in _TICKER_RE.findall((t or "").upper()):
@@ -770,27 +956,13 @@ def _sector_ai_summary(sector: str, titles: List[str]) -> str:
         parts.append(f"Main themes: {', '.join(terms)}.")
     if tickers:
         parts.append(f"Tickers referenced: {', '.join(tickers[:8])}.")
-    parts.append("Use this as context and confirm via the linked sources.")
+    parts.append("Key takeaways are shown under each headline when extraction is possible.")
     return " ".join(parts).strip()
 
 
 # =========================================================
-# Precomputed daily news store
+# News briefing builder
 # =========================================================
-_DAILY_NEWS: Dict[str, Any] = {}  # date(YYYY-MM-DD) -> dict(key->payload)
-
-
-def _daily_key(
-    tickers: str,
-    sectors: str,
-    max_general: int,
-    max_per_ticker: int,
-    max_items_per_sector: int,
-    max_age_days: int
-) -> str:
-    return f"daily:{tickers}:{sectors}:{max_general}:{max_per_ticker}:{max_items_per_sector}:{max_age_days}"
-
-
 def _build_news_payload(
     tickers: str,
     max_general: int,
@@ -855,17 +1027,21 @@ def _build_news_payload(
             link = x.get("link", "") or ""
             pub = x.get("published", "") or ""
             raw = x.get("rawSummary", "") or ""
+
             bullets = _headline_bullets(title, raw, link)
 
-            out.append({
-                "title": title,
-                "link": link,
-                "published": pub,
-                "sourceFeed": x.get("source", "Google News"),
-                "sector": sec,
-                "summary": bullets[0] if bullets else "",
-                "summaryBullets": bullets,
-            })
+            # IMPORTANT: No title duplication. If no bullets extracted, keep empty.
+            out.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "published": pub,
+                    "sourceFeed": x.get("source", "Google News"),
+                    "sector": sec,
+                    "summary": bullets[0] if bullets else "",
+                    "summaryBullets": bullets,
+                }
+            )
         return out
 
     sectors_out: List[dict] = []
@@ -873,18 +1049,21 @@ def _build_news_payload(
     if watch:
         wl_items = [x for x in all_items if x.get("sector") == "Watchlist"][:max_general]
         wl_items = _dedup_items(wl_items, max_general)
+
         wl_titles = [x.get("title", "") for x in wl_items]
         wl_score, wl_label = _sentiment_from_titles(wl_titles)
 
-        sectors_out.append({
-            "sector": "Watchlist",
-            "sentiment": {"label": wl_label, "score": wl_score},
-            "summary": "Per-headline takeaways shown under each item.",
-            "aiSummary": "Per-headline takeaways shown under each item.",
-            "topHeadlines": _headlines_payload(wl_items, "Watchlist"),
-            "watchlistMentions": watch[:25],
-            "tickersMentioned": _extract_tickers_from_titles(wl_titles)[:12],
-        })
+        sectors_out.append(
+            {
+                "sector": "Watchlist",
+                "sentiment": {"label": wl_label, "score": wl_score},
+                "summary": "Key takeaways are listed under each headline when available.",
+                "aiSummary": "Key takeaways are listed under each headline when available.",
+                "topHeadlines": _headlines_payload(wl_items, "Watchlist"),
+                "watchlistMentions": watch[:25],
+                "tickersMentioned": _extract_tickers_from_titles(wl_titles)[:12],
+            }
+        )
 
     for sec in sector_list:
         sec_items = [x for x in all_items if x.get("sector") == sec][:max_items_per_sector]
@@ -892,15 +1071,17 @@ def _build_news_payload(
         score, label = _sentiment_from_titles(sec_titles)
         ai_sum = _sector_ai_summary(sec, sec_titles)
 
-        sectors_out.append({
-            "sector": sec,
-            "sentiment": {"label": label, "score": score},
-            "summary": ai_sum,
-            "aiSummary": ai_sum,
-            "topHeadlines": _headlines_payload(sec_items, sec),
-            "watchlistMentions": [],
-            "tickersMentioned": _extract_tickers_from_titles(sec_titles)[:12],
-        })
+        sectors_out.append(
+            {
+                "sector": sec,
+                "sentiment": {"label": label, "score": score},
+                "summary": ai_sum,
+                "aiSummary": ai_sum,
+                "topHeadlines": _headlines_payload(sec_items, sec),
+                "watchlistMentions": [],
+                "tickersMentioned": _extract_tickers_from_titles(sec_titles)[:12],
+            }
+        )
 
     all_titles: List[str] = []
     for s in sectors_out:
@@ -908,29 +1089,42 @@ def _build_news_payload(
 
     overall_score, overall_label = _sentiment_from_titles(all_titles)
 
+    # Add useful debugging stats
+    total_heads = 0
+    total_with_bullets = 0
+    for s in sectors_out:
+        heads = s.get("topHeadlines") or []
+        total_heads += len(heads)
+        total_with_bullets += sum(1 for h in heads if (h.get("summaryBullets") or []))
+
     return {
         "date": datetime.now(timezone.utc).date().isoformat(),
         "overallSentiment": {"label": overall_label, "score": overall_score},
         "sectors": sectors_out,
         "errors": errors,
-        "note": f"Google News RSS. Headlines limited to last {max_age_days} days. "
-                f"Per-headline summaries extracted when possible; otherwise title fallback.",
+        "note": (
+            f"Google News RSS. Headlines limited to last {max_age_days} days. "
+            f"Key takeaways are extracted from publisher pages when possible. "
+            f"Bullet coverage: {total_with_bullets}/{total_heads} headlines."
+        ),
     }
 
 
 # =========================================================
-# News briefing (LIVE) endpoint (existing frontend uses this)
+# News briefing (LIVE) endpoint (frontend uses this)
 # =========================================================
 @app.get("/news/briefing")
 def news_briefing(
     tickers: str = Query(default=""),
     max_general: int = Query(default=60, ge=10, le=200),
     max_per_ticker: int = Query(default=6, ge=1, le=30),
-    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
+    sectors: str = Query(
+        default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"
+    ),
     max_items_per_sector: int = Query(default=12, ge=5, le=30),
     max_age_days: int = Query(default=30, ge=7, le=45),
 ):
-    key = f"news:brief:v4120:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}:{max_age_days}"
+    key = f"news:brief:v4121:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}:{max_age_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -947,21 +1141,26 @@ def news_briefing(
 
 
 # =========================================================
-# Precomputed daily endpoints
+# Optional: precomputed daily (same idea you mentioned)
 # =========================================================
+_DAILY_NEWS: Dict[str, Any] = {}
+
+
+def _daily_key(tickers: str, sectors: str, max_general: int, max_per_ticker: int, max_items_per_sector: int, max_age_days: int) -> str:
+    return f"daily:{tickers}:{sectors}:{max_general}:{max_per_ticker}:{max_items_per_sector}:{max_age_days}"
+
+
 @app.post("/news/build-daily")
 def news_build_daily(
     tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
     max_general: int = Query(default=60, ge=10, le=200),
     max_per_ticker: int = Query(default=6, ge=1, le=30),
-    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
+    sectors: str = Query(
+        default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"
+    ),
     max_items_per_sector: int = Query(default=12, ge=5, le=30),
     max_age_days: int = Query(default=30, ge=7, le=45),
 ):
-    """
-    Build and store a daily briefing once.
-    Call this from a cron job (Render scheduled job, GitHub action, etc.).
-    """
     today = datetime.now(timezone.utc).date().isoformat()
     dkey = _daily_key(tickers, sectors, max_general, max_per_ticker, max_items_per_sector, max_age_days)
 
@@ -980,7 +1179,11 @@ def news_build_daily(
     cache_set(f"news:daily:{today}:{dkey}", payload, ttl_seconds=24 * 3600, stale_ttl_seconds=72 * 3600)
 
     headline_count = sum(len(s.get("topHeadlines") or []) for s in payload.get("sectors") or [])
-    return {"ok": True, "date": today, "storedKey": dkey, "headlineCount": headline_count}
+    with_bullets = sum(
+        sum(1 for h in (s.get("topHeadlines") or []) if (h.get("summaryBullets") or []))
+        for s in (payload.get("sectors") or [])
+    )
+    return {"ok": True, "date": today, "storedKey": dkey, "headlineCount": headline_count, "withBullets": with_bullets}
 
 
 @app.get("/news/daily")
@@ -988,15 +1191,13 @@ def news_daily(
     tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
     max_general: int = Query(default=60, ge=10, le=200),
     max_per_ticker: int = Query(default=6, ge=1, le=30),
-    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
+    sectors: str = Query(
+        default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"
+    ),
     max_items_per_sector: int = Query(default=12, ge=5, le=30),
     max_age_days: int = Query(default=30, ge=7, le=45),
     allow_live_fallback: bool = Query(default=True),
 ):
-    """
-    Returns the precomputed daily briefing if available.
-    If missing and allow_live_fallback=true, builds once on-demand.
-    """
     today = datetime.now(timezone.utc).date().isoformat()
     dkey = _daily_key(tickers, sectors, max_general, max_per_ticker, max_items_per_sector, max_age_days)
 
@@ -1033,7 +1234,7 @@ def news_daily(
 
 
 # =========================================================
-# Crypto briefing endpoint
+# Crypto briefing endpoint (kept)
 # =========================================================
 @app.get("/crypto/news/briefing")
 def crypto_news_briefing(
@@ -1041,7 +1242,7 @@ def crypto_news_briefing(
     include_top_n: int = Query(default=15, ge=5, le=50),
     max_age_days: int = Query(default=30, ge=7, le=45),
 ):
-    key = f"crypto:news:v4120:{coins}:{include_top_n}:{max_age_days}"
+    key = f"crypto:news:v4121:{coins}:{include_top_n}:{max_age_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1081,31 +1282,37 @@ def crypto_news_briefing(
                 raw = x.get("rawSummary", "") or ""
                 bullets = _headline_bullets(title, raw, link)
 
-                heads.append({
-                    "title": title,
-                    "link": link,
-                    "published": pub,
-                    "source": "Google News",
-                    "summary": bullets[0] if bullets else "",
-                    "summaryBullets": bullets,
-                })
+                heads.append(
+                    {
+                        "title": title,
+                        "link": link,
+                        "published": pub,
+                        "source": "Google News",
+                        "summary": bullets[0] if bullets else "",
+                        "summaryBullets": bullets,
+                    }
+                )
 
-            coins_out.append({
-                "symbol": c,
-                "sentiment": {"label": label, "score": score},
-                "summary": ai_sum,
-                "aiSummary": ai_sum,
-                "headlines": heads
-            })
+            coins_out.append(
+                {
+                    "symbol": c,
+                    "sentiment": {"label": label, "score": score},
+                    "summary": ai_sum,
+                    "aiSummary": ai_sum,
+                    "headlines": heads,
+                }
+            )
         except Exception as e:
             errors.append(f"{c}: {type(e).__name__}: {str(e)}")
-            coins_out.append({
-                "symbol": c,
-                "sentiment": {"label": "NEUTRAL", "score": 50},
-                "summary": f"{c}: No fresh items.",
-                "aiSummary": f"{c}: No fresh items.",
-                "headlines": []
-            })
+            coins_out.append(
+                {
+                    "symbol": c,
+                    "sentiment": {"label": "NEUTRAL", "score": 50},
+                    "summary": f"{c}: No fresh items.",
+                    "aiSummary": f"{c}: No fresh items.",
+                    "headlines": [],
+                }
+            )
 
     overall_score, overall_label = _sentiment_from_titles(all_titles)
 
@@ -1114,8 +1321,7 @@ def crypto_news_briefing(
         "overallSentiment": {"label": overall_label, "score": overall_score},
         "coins": coins_out,
         "errors": errors,
-        "note": f"Google News RSS. Headlines limited to last {max_age_days} days. "
-                f"Per-headline summaries extracted when possible; otherwise title fallback.",
+        "note": f"Google News RSS. Headlines limited to last {max_age_days} days. Key takeaways extracted when possible.",
     }
     return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
 
@@ -1247,14 +1453,11 @@ def _amount_range(row: dict) -> str:
 
 
 @app.get("/report/holdings/common")
-def holdings_common(
-    window_days: int = Query(default=365, ge=30, le=365),
-    top_n: int = Query(default=30, ge=5, le=200)
-):
+def holdings_common(window_days: int = Query(default=365, ge=30, le=365), top_n: int = Query(default=30, ge=5, le=200)):
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"holdings:common:v4120:{window_days}:{top_n}"
+    key = f"holdings:common:v4121:{window_days}:{top_n}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1295,14 +1498,11 @@ def holdings_common(
 
 
 @app.get("/report/congress/daily")
-def congress_daily(
-    window_days: int = Query(default=30, ge=1, le=365),
-    limit: int = Query(default=250, ge=50, le=1000)
-):
+def congress_daily(window_days: int = Query(default=30, ge=1, le=365), limit: int = Query(default=250, ge=50, le=1000)):
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"congress:daily:v4120:{window_days}:{limit}"
+    key = f"congress:daily:v4121:{window_days}:{limit}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1343,18 +1543,20 @@ def congress_daily(
         amt = _amount_range(r)
         desc = str(_pick_first(r, ["Description", "description", "AssetDescription", "asset_description"], "")).strip()
 
-        items.append({
-            "kind": kind,
-            "ticker": ticker.upper(),
-            "politician": pol,
-            "party": party,
-            "chamber": chamber,
-            "amountRange": amt,
-            "traded": _iso_date_only(traded_dt),
-            "filed": _iso_date_only(filed_dt),
-            "description": desc,
-            "_best_dt": best_dt,
-        })
+        items.append(
+            {
+                "kind": kind,
+                "ticker": ticker.upper(),
+                "politician": pol,
+                "party": party,
+                "chamber": chamber,
+                "amountRange": amt,
+                "traded": _iso_date_only(traded_dt),
+                "filed": _iso_date_only(filed_dt),
+                "description": desc,
+                "_best_dt": best_dt,
+            }
+        )
 
     items.sort(key=lambda x: x.get("_best_dt") or datetime(1970, 1, 1, tzinfo=timezone.utc), reverse=True)
     items = items[:limit]
