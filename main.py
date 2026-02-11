@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlparse, parse_qs
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import quiverquant
@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="Finance Signals Backend", version="4.12.1")
+app = FastAPI(title="Finance Signals Backend", version="4.12.0")
 
 ALLOWED_ORIGINS = [
     "https://hijazss.github.io",
@@ -59,29 +59,17 @@ NASDAQ_HEADERS = {
 
 SESSION = requests.Session()
 
-# =========================================================
-# Summary guardrails (prevents Render timeouts)
-# =========================================================
-# Max publisher-page fetches per request (everything else uses RSS snippets)
-MAX_PUBLISHER_FETCHES_PER_REQUEST = int(os.getenv("MAX_PUBLISHER_FETCHES_PER_REQUEST", "40"))
-# Max seconds allowed for the whole bullets phase
-BULLETS_TOTAL_BUDGET_SECONDS = float(os.getenv("BULLETS_TOTAL_BUDGET_SECONDS", "18"))
-# Per-article request timeout
-ARTICLE_FETCH_TIMEOUT_SECONDS = int(os.getenv("ARTICLE_FETCH_TIMEOUT_SECONDS", "6"))
-# Parallelism for article fetching
-ARTICLE_FETCH_WORKERS = int(os.getenv("ARTICLE_FETCH_WORKERS", "10"))
-
 
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.12.1"}
+    return {"status": "ok", "version": "4.12.0"}
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "version": "4.12.1",
+        "version": "4.12.0",
         "hasQuiverToken": bool(QUIVER_TOKEN),
         "hasFinnhubKey": bool(FINNHUB_API_KEY),
         "utc": datetime.now(timezone.utc).isoformat(),
@@ -132,7 +120,13 @@ def _is_cooled_down(provider: str) -> bool:
 # =========================================================
 # HTTP helpers
 # =========================================================
-def _requests_get(url: str, params: Optional[dict] = None, timeout: int = 16, headers: Optional[dict] = None, allow_redirects: bool = True) -> requests.Response:
+def _requests_get(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: int = 16,
+    headers: Optional[dict] = None,
+    allow_redirects: bool = True
+) -> requests.Response:
     return SESSION.get(url, params=params, timeout=timeout, headers=headers or UA_HEADERS, allow_redirects=allow_redirects)
 
 
@@ -276,11 +270,11 @@ def _stooq_daily_closes(symbol: str) -> List[Tuple[datetime, float]]:
 
 
 # =========================================================
-# Daily market read
+# Daily market read (frontend uses /market/read)
 # =========================================================
 @app.get("/market/read")
 def market_read():
-    key = "market:read:v4121"
+    key = "market:read:v4120"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -337,8 +331,14 @@ def market_read():
         return f"{s}{x:.2f}%"
 
     parts: List[str] = []
-    parts.append(f"SPY {spy_last:.2f} (1D {_fmt_pct(spy_1d)}, 5D {_fmt_pct(spy_5d)}, 1M {_fmt_pct(spy_1m)})." if spy_last is not None else "SPY unavailable.")
-    parts.append(f"QQQ {qqq_last:.2f} (1D {_fmt_pct(qqq_1d)}, 5D {_fmt_pct(qqq_5d)}, 1M {_fmt_pct(qqq_1m)})." if qqq_last is not None else "QQQ unavailable.")
+    parts.append(
+        f"SPY {spy_last:.2f} (1D {_fmt_pct(spy_1d)}, 5D {_fmt_pct(spy_5d)}, 1M {_fmt_pct(spy_1m)})."
+        if spy_last is not None else "SPY unavailable."
+    )
+    parts.append(
+        f"QQQ {qqq_last:.2f} (1D {_fmt_pct(qqq_1d)}, 5D {_fmt_pct(qqq_5d)}, 1M {_fmt_pct(qqq_1m)})."
+        if qqq_last is not None else "QQQ unavailable."
+    )
     if vix_last is not None:
         parts.append(f"VIX {vix_last:.2f}.")
 
@@ -348,7 +348,7 @@ def market_read():
         "sp500": {"symbol": "SPY", "last": spy_last, "ret1dPct": spy_1d, "ret5dPct": spy_5d, "ret1mPct": spy_1m},
         "nasdaq": {"symbol": "QQQ", "last": qqq_last, "ret1dPct": qqq_1d, "ret5dPct": qqq_5d, "ret1mPct": qqq_1m},
         "vix": {"symbol": "^VIX", "last": vix_last},
-        "fearGreed": {"score": None, "rating": None},
+        "fearGreed": {"score": None, "rating": None},  # keep field for frontend compatibility
         "errors": errors,
         "note": "Uses Stooq daily history first; falls back to Nasdaq quote when needed.",
     }
@@ -535,9 +535,13 @@ def _dedup_items(items: List[dict], max_items: int) -> List[dict]:
 
 
 # =========================================================
-# Article summary extraction (best effort, guarded)
+# Article summary extraction (best effort, no extra deps)
 # =========================================================
 def _maybe_decode_google_news_redirect(url: str) -> str:
+    """
+    Some Google News RSS links have ?url=publisher URL.
+    If present, use it without fetching.
+    """
     try:
         u = urlparse(url)
         q = parse_qs(u.query or "")
@@ -578,18 +582,22 @@ def _extract_first_sentences_from_paragraphs(html: str, max_sentences: int = 3) 
 
 
 def _fetch_article_snippet(url: str) -> str:
+    """
+    Fetch publisher page (or google redirect) and extract a short snippet.
+    Cached. Best effort: many publishers block bots.
+    """
     url0 = (url or "").strip()
     if not url0:
         return ""
-    url0 = _maybe_decode_google_news_redirect(url0)
 
+    url0 = _maybe_decode_google_news_redirect(url0)
     key = f"art:snip:{url0[:280]}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return str(cached or "")
 
     try:
-        r = _requests_get(url0, timeout=ARTICLE_FETCH_TIMEOUT_SECONDS, headers=UA_HEADERS, allow_redirects=True)
+        r = _requests_get(url0, timeout=10, headers=UA_HEADERS, allow_redirects=True)
         if r.status_code >= 400:
             return cache_set(key, "", ttl_seconds=180, stale_ttl_seconds=3600)
         html = (r.text or "")[:250000]
@@ -623,6 +631,9 @@ def _title_is_repeating(title: str, text: str) -> bool:
 
 
 def _to_bullets(text: str, max_bullets: int = 3) -> List[str]:
+    """
+    Turn a snippet into 2-3 concise bullets.
+    """
     s = _strip_html(text or "")
     s = re.sub(r"\s+", " ", s).strip()
     if not s:
@@ -655,27 +666,33 @@ def _to_bullets(text: str, max_bullets: int = 3) -> List[str]:
     return bullets[:max_bullets]
 
 
-def _headline_bullets_from_rss(title: str, raw_summary: str) -> List[str]:
+def _headline_bullets(title: str, raw_summary: str, link: str) -> List[str]:
+    """
+    Best effort bullet summary:
+      1) Fetch article snippet (meta description or first paragraphs)
+      2) Else use RSS rawSummary
+      3) Else fallback to title (never empty)
+    """
+    snip = _fetch_article_snippet(link)
+    if snip and not _title_is_repeating(title, snip):
+        b = _to_bullets(snip, max_bullets=3)
+        if b:
+            return b
+
     rs = _strip_html(raw_summary or "")
     if rs and not _title_is_repeating(title, rs):
         b = _to_bullets(rs, max_bullets=3)
         if b:
             return b
+
+    t = (title or "").strip()
+    if t:
+        return [t]
     return []
 
 
-def _headline_bullets_best_effort(title: str, raw_summary: str, link: str, allow_publisher_fetch: bool) -> List[str]:
-    if allow_publisher_fetch:
-        snip = _fetch_article_snippet(link)
-        if snip and not _title_is_repeating(title, snip):
-            b = _to_bullets(snip, max_bullets=3)
-            if b:
-                return b
-    return _headline_bullets_from_rss(title, raw_summary)
-
-
 # =========================================================
-# Lightweight sentiment and summaries
+# Lightweight sentiment + summaries
 # =========================================================
 _STOPWORDS = {
     "the","a","an","and","or","to","of","in","on","for","with","as","at","by","from","into",
@@ -694,6 +711,7 @@ _NEG_WORDS = {
     "miss","misses","slump","falls","drop","downgrade","weak","layoff","cuts","probe",
     "lawsuit","ban","halt","recall","fraud","warning"
 }
+
 
 def _sentiment_from_titles(titles: List[str]) -> Tuple[int, str]:
     if not titles:
@@ -742,9 +760,9 @@ def _top_terms(titles: List[str], k: int = 12) -> List[str]:
     return [w for w, _c in ranked[:k]]
 
 
-def _sector_ai_summary(sector: str, titles: List[str]) -> Tuple[str, List[str]]:
+def _sector_ai_summary(sector: str, titles: List[str]) -> str:
     if not titles:
-        return (f"{sector}: No fresh items in the last 30 days.", [])
+        return f"{sector}: No fresh items in the last 30 days."
     terms = _top_terms(titles, k=10)[:6]
     tickers = _extract_tickers_from_titles(titles)[:10]
     parts: List[str] = []
@@ -753,26 +771,34 @@ def _sector_ai_summary(sector: str, titles: List[str]) -> Tuple[str, List[str]]:
     if tickers:
         parts.append(f"Tickers referenced: {', '.join(tickers[:8])}.")
     parts.append("Use this as context and confirm via the linked sources.")
-    return " ".join(parts).strip(), []
+    return " ".join(parts).strip()
 
 
 # =========================================================
-# News briefing (FIXED: bounded + parallel bullet extraction)
+# Precomputed daily news store
 # =========================================================
-@app.get("/news/briefing")
-def news_briefing(
-    tickers: str = Query(default=""),
-    max_general: int = Query(default=60, ge=10, le=200),
-    max_per_ticker: int = Query(default=6, ge=1, le=30),
-    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
-    max_items_per_sector: int = Query(default=12, ge=5, le=30),
-    max_age_days: int = Query(default=30, ge=7, le=45),
-):
-    key = f"news:brief:v4121:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}:{max_age_days}"
-    cached = cache_get(key, allow_stale=True)
-    if cached is not None:
-        return cached
+_DAILY_NEWS: Dict[str, Any] = {}  # date(YYYY-MM-DD) -> dict(key->payload)
 
+
+def _daily_key(
+    tickers: str,
+    sectors: str,
+    max_general: int,
+    max_per_ticker: int,
+    max_items_per_sector: int,
+    max_age_days: int
+) -> str:
+    return f"daily:{tickers}:{sectors}:{max_general}:{max_per_ticker}:{max_items_per_sector}:{max_age_days}"
+
+
+def _build_news_payload(
+    tickers: str,
+    max_general: int,
+    max_per_ticker: int,
+    sectors: str,
+    max_items_per_sector: int,
+    max_age_days: int,
+) -> Dict[str, Any]:
     watch = [x.strip().upper() for x in (tickers or "").split(",") if x.strip()]
     sector_list = [s.strip() for s in (sectors or "").split(",") if s.strip()]
     if not sector_list:
@@ -786,7 +812,10 @@ def news_briefing(
         jobs.append((sec, _google_news_rss(f"{sec} stocks markets")))
 
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = [(sec, ex.submit(_fetch_rss_items, url, 10, max_items_per_sector * 3, 240, 6 * 3600, max_age_days)) for sec, url in jobs]
+        futs = [
+            (sec, ex.submit(_fetch_rss_items, url, 10, max_items_per_sector * 3, 240, 6 * 3600, max_age_days))
+            for sec, url in jobs
+        ]
         for sec, fut in futs:
             try:
                 items = fut.result()
@@ -802,7 +831,10 @@ def news_briefing(
         for t in watch[:40]:
             ticker_jobs.append((t, _google_news_rss(f"{t} stock")))
         with ThreadPoolExecutor(max_workers=8) as ex:
-            futs2 = [(t, ex.submit(_fetch_rss_items, url, 10, max_per_ticker * 2, 240, 6 * 3600, max_age_days)) for t, url in ticker_jobs]
+            futs2 = [
+                (t, ex.submit(_fetch_rss_items, url, 10, max_per_ticker * 2, 240, 6 * 3600, max_age_days))
+                for t, url in ticker_jobs
+            ]
             for t, fut in futs2:
                 try:
                     items = fut.result()
@@ -816,82 +848,31 @@ def news_briefing(
 
     all_items = _dedup_items(all_items, 1500)
 
-    # ---------- bounded + parallel bullets ----------
-    bullets_deadline = time.time() + BULLETS_TOTAL_BUDGET_SECONDS
-    publisher_budget = MAX_PUBLISHER_FETCHES_PER_REQUEST
-
-    def build_headlines_payload(items: List[dict], sec: str) -> List[dict]:
-        nonlocal publisher_budget
-
-        # Prepare jobs: only for first N items overall that still have budget and time
-        payload: List[dict] = []
-        tasks: Dict[int, dict] = {}
-
-        for idx, x in enumerate(items):
+    def _headlines_payload(items: List[dict], sec: str) -> List[dict]:
+        out = []
+        for x in items:
             title = x.get("title", "") or ""
             link = x.get("link", "") or ""
             pub = x.get("published", "") or ""
             raw = x.get("rawSummary", "") or ""
+            bullets = _headline_bullets(title, raw, link)
 
-            allow_fetch = False
-            if publisher_budget > 0 and time.time() < bullets_deadline and link:
-                allow_fetch = True
-                publisher_budget -= 1
-
-            payload.append({
+            out.append({
                 "title": title,
                 "link": link,
                 "published": pub,
                 "sourceFeed": x.get("source", "Google News"),
                 "sector": sec,
-                "_rawSummary": raw,
-                "_allowFetch": allow_fetch,
-                "summary": "",
-                "summaryBullets": [],
+                "summary": bullets[0] if bullets else "",
+                "summaryBullets": bullets,
             })
-
-            if allow_fetch:
-                tasks[idx] = payload[idx]
-
-        # Run publisher fetches in parallel, but stop honoring results if we hit deadline
-        if tasks:
-            with ThreadPoolExecutor(max_workers=ARTICLE_FETCH_WORKERS) as ex:
-                future_map = {}
-                for idx, row in tasks.items():
-                    future_map[ex.submit(_headline_bullets_best_effort, row["title"], row["_rawSummary"], row["link"], True)] = idx
-
-                for fut in as_completed(future_map):
-                    if time.time() >= bullets_deadline:
-                        break
-                    idx = future_map[fut]
-                    try:
-                        b = fut.result(timeout=0)
-                        payload[idx]["summaryBullets"] = b or []
-                        payload[idx]["summary"] = (b[0] if b else "")
-                    except Exception:
-                        # leave empty for now, will fall back to RSS below
-                        pass
-
-        # Fill any missing bullets from RSS immediately
-        for row in payload:
-            if not row["summaryBullets"]:
-                b = _headline_bullets_from_rss(row["title"], row["_rawSummary"])
-                row["summaryBullets"] = b or []
-                row["summary"] = (b[0] if b else "")
-
-            # cleanup internal keys
-            row.pop("_rawSummary", None)
-            row.pop("_allowFetch", None)
-
-        return payload
+        return out
 
     sectors_out: List[dict] = []
 
-    # Watchlist sector first
     if watch:
         wl_items = [x for x in all_items if x.get("sector") == "Watchlist"][:max_general]
         wl_items = _dedup_items(wl_items, max_general)
-
         wl_titles = [x.get("title", "") for x in wl_items]
         wl_score, wl_label = _sentiment_from_titles(wl_titles)
 
@@ -900,49 +881,159 @@ def news_briefing(
             "sentiment": {"label": wl_label, "score": wl_score},
             "summary": "Per-headline takeaways shown under each item.",
             "aiSummary": "Per-headline takeaways shown under each item.",
-            "implications": [],
-            "topHeadlines": build_headlines_payload(wl_items, "Watchlist"),
+            "topHeadlines": _headlines_payload(wl_items, "Watchlist"),
             "watchlistMentions": watch[:25],
             "tickersMentioned": _extract_tickers_from_titles(wl_titles)[:12],
         })
 
-    # Each sector
     for sec in sector_list:
         sec_items = [x for x in all_items if x.get("sector") == sec][:max_items_per_sector]
         sec_titles = [x.get("title", "") for x in sec_items]
-
         score, label = _sentiment_from_titles(sec_titles)
-        ai_sum, _unused = _sector_ai_summary(sec, sec_titles)
+        ai_sum = _sector_ai_summary(sec, sec_titles)
 
         sectors_out.append({
             "sector": sec,
             "sentiment": {"label": label, "score": score},
             "summary": ai_sum,
             "aiSummary": ai_sum,
-            "implications": [],
-            "topHeadlines": build_headlines_payload(sec_items, sec),
+            "topHeadlines": _headlines_payload(sec_items, sec),
             "watchlistMentions": [],
             "tickersMentioned": _extract_tickers_from_titles(sec_titles)[:12],
         })
 
-    all_titles = []
+    all_titles: List[str] = []
     for s in sectors_out:
         all_titles.extend([h.get("title", "") for h in (s.get("topHeadlines") or [])])
 
     overall_score, overall_label = _sentiment_from_titles(all_titles)
 
-    out = {
+    return {
         "date": datetime.now(timezone.utc).date().isoformat(),
         "overallSentiment": {"label": overall_label, "score": overall_score},
         "sectors": sectors_out,
         "errors": errors,
-        "note": f"Google News RSS. Headlines limited to last {max_age_days} days. Bullets: bounded + parallel publisher fetch, RSS fallback.",
+        "note": f"Google News RSS. Headlines limited to last {max_age_days} days. "
+                f"Per-headline summaries extracted when possible; otherwise title fallback.",
     }
-    return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
 
 
 # =========================================================
-# Crypto briefing endpoint (also bounded bullets)
+# News briefing (LIVE) endpoint (existing frontend uses this)
+# =========================================================
+@app.get("/news/briefing")
+def news_briefing(
+    tickers: str = Query(default=""),
+    max_general: int = Query(default=60, ge=10, le=200),
+    max_per_ticker: int = Query(default=6, ge=1, le=30),
+    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
+    max_items_per_sector: int = Query(default=12, ge=5, le=30),
+    max_age_days: int = Query(default=30, ge=7, le=45),
+):
+    key = f"news:brief:v4120:{tickers}:{max_general}:{max_per_ticker}:{sectors}:{max_items_per_sector}:{max_age_days}"
+    cached = cache_get(key, allow_stale=True)
+    if cached is not None:
+        return cached
+
+    payload = _build_news_payload(
+        tickers=tickers,
+        max_general=max_general,
+        max_per_ticker=max_per_ticker,
+        sectors=sectors,
+        max_items_per_sector=max_items_per_sector,
+        max_age_days=max_age_days,
+    )
+    return cache_set(key, payload, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
+
+
+# =========================================================
+# Precomputed daily endpoints
+# =========================================================
+@app.post("/news/build-daily")
+def news_build_daily(
+    tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
+    max_general: int = Query(default=60, ge=10, le=200),
+    max_per_ticker: int = Query(default=6, ge=1, le=30),
+    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
+    max_items_per_sector: int = Query(default=12, ge=5, le=30),
+    max_age_days: int = Query(default=30, ge=7, le=45),
+):
+    """
+    Build and store a daily briefing once.
+    Call this from a cron job (Render scheduled job, GitHub action, etc.).
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    dkey = _daily_key(tickers, sectors, max_general, max_per_ticker, max_items_per_sector, max_age_days)
+
+    payload = _build_news_payload(
+        tickers=tickers,
+        max_general=max_general,
+        max_per_ticker=max_per_ticker,
+        sectors=sectors,
+        max_items_per_sector=max_items_per_sector,
+        max_age_days=max_age_days,
+    )
+
+    _DAILY_NEWS[today] = _DAILY_NEWS.get(today, {})
+    _DAILY_NEWS[today][dkey] = payload
+
+    cache_set(f"news:daily:{today}:{dkey}", payload, ttl_seconds=24 * 3600, stale_ttl_seconds=72 * 3600)
+
+    headline_count = sum(len(s.get("topHeadlines") or []) for s in payload.get("sectors") or [])
+    return {"ok": True, "date": today, "storedKey": dkey, "headlineCount": headline_count}
+
+
+@app.get("/news/daily")
+def news_daily(
+    tickers: str = Query(default="SPY,QQQ,NVDA,AAPL,MSFT,AMZN,GOOGL,META,TSLA,BRK-B"),
+    max_general: int = Query(default=60, ge=10, le=200),
+    max_per_ticker: int = Query(default=6, ge=1, le=30),
+    sectors: str = Query(default="AI,Medical,Energy,Robotics,Infrastructure,Semiconductors,Cloud,Cybersecurity,Defense,Financials,Consumer"),
+    max_items_per_sector: int = Query(default=12, ge=5, le=30),
+    max_age_days: int = Query(default=30, ge=7, le=45),
+    allow_live_fallback: bool = Query(default=True),
+):
+    """
+    Returns the precomputed daily briefing if available.
+    If missing and allow_live_fallback=true, builds once on-demand.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    dkey = _daily_key(tickers, sectors, max_general, max_per_ticker, max_items_per_sector, max_age_days)
+
+    cached = cache_get(f"news:daily:{today}:{dkey}", allow_stale=True)
+    if cached is not None:
+        return cached
+
+    stored = (_DAILY_NEWS.get(today) or {}).get(dkey)
+    if stored is not None:
+        cache_set(f"news:daily:{today}:{dkey}", stored, ttl_seconds=24 * 3600, stale_ttl_seconds=72 * 3600)
+        return stored
+
+    if not allow_live_fallback:
+        return {
+            "date": today,
+            "overallSentiment": {"label": "NEUTRAL", "score": 50},
+            "sectors": [],
+            "errors": ["Daily summary not built yet. Call POST /news/build-daily (cron)."],
+            "note": "No daily summary stored for today.",
+        }
+
+    payload = _build_news_payload(
+        tickers=tickers,
+        max_general=max_general,
+        max_per_ticker=max_per_ticker,
+        sectors=sectors,
+        max_items_per_sector=max_items_per_sector,
+        max_age_days=max_age_days,
+    )
+    _DAILY_NEWS[today] = _DAILY_NEWS.get(today, {})
+    _DAILY_NEWS[today][dkey] = payload
+    cache_set(f"news:daily:{today}:{dkey}", payload, ttl_seconds=24 * 3600, stale_ttl_seconds=72 * 3600)
+    return payload
+
+
+# =========================================================
+# Crypto briefing endpoint
 # =========================================================
 @app.get("/crypto/news/briefing")
 def crypto_news_briefing(
@@ -950,7 +1041,7 @@ def crypto_news_briefing(
     include_top_n: int = Query(default=15, ge=5, le=50),
     max_age_days: int = Query(default=30, ge=7, le=45),
 ):
-    key = f"crypto:news:v4121:{coins}:{include_top_n}:{max_age_days}"
+    key = f"crypto:news:v4120:{coins}:{include_top_n}:{max_age_days}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -978,7 +1069,7 @@ def crypto_news_briefing(
             titles = [x.get("title", "") for x in items]
 
             score, label = _sentiment_from_titles(titles)
-            ai_sum, _unused = _sector_ai_summary(c, titles)
+            ai_sum = _sector_ai_summary(c, titles)
 
             all_titles.extend(titles)
 
@@ -988,9 +1079,7 @@ def crypto_news_briefing(
                 link = x.get("link", "") or ""
                 pub = x.get("published", "") or ""
                 raw = x.get("rawSummary", "") or ""
-
-                # Crypto uses RSS-first (fast) to avoid timeouts
-                bullets = _headline_bullets_from_rss(title, raw)
+                bullets = _headline_bullets(title, raw, link)
 
                 heads.append({
                     "title": title,
@@ -1006,7 +1095,6 @@ def crypto_news_briefing(
                 "sentiment": {"label": label, "score": score},
                 "summary": ai_sum,
                 "aiSummary": ai_sum,
-                "implications": [],
                 "headlines": heads
             })
         except Exception as e:
@@ -1016,7 +1104,6 @@ def crypto_news_briefing(
                 "sentiment": {"label": "NEUTRAL", "score": 50},
                 "summary": f"{c}: No fresh items.",
                 "aiSummary": f"{c}: No fresh items.",
-                "implications": [],
                 "headlines": []
             })
 
@@ -1027,7 +1114,8 @@ def crypto_news_briefing(
         "overallSentiment": {"label": overall_label, "score": overall_score},
         "coins": coins_out,
         "errors": errors,
-        "note": f"Google News RSS. Headlines limited to last {max_age_days} days. Bullets: RSS-first for speed.",
+        "note": f"Google News RSS. Headlines limited to last {max_age_days} days. "
+                f"Per-headline summaries extracted when possible; otherwise title fallback.",
     }
     return cache_set(key, out, ttl_seconds=300, stale_ttl_seconds=3 * 3600)
 
@@ -1159,11 +1247,14 @@ def _amount_range(row: dict) -> str:
 
 
 @app.get("/report/holdings/common")
-def holdings_common(window_days: int = Query(default=365, ge=30, le=365), top_n: int = Query(default=30, ge=5, le=200)):
+def holdings_common(
+    window_days: int = Query(default=365, ge=30, le=365),
+    top_n: int = Query(default=30, ge=5, le=200)
+):
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"holdings:common:v4121:{window_days}:{top_n}"
+    key = f"holdings:common:v4120:{window_days}:{top_n}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
@@ -1204,11 +1295,14 @@ def holdings_common(window_days: int = Query(default=365, ge=30, le=365), top_n:
 
 
 @app.get("/report/congress/daily")
-def congress_daily(window_days: int = Query(default=30, ge=1, le=365), limit: int = Query(default=250, ge=50, le=1000)):
+def congress_daily(
+    window_days: int = Query(default=30, ge=1, le=365),
+    limit: int = Query(default=250, ge=50, le=1000)
+):
     if not QUIVER_TOKEN:
         raise HTTPException(500, "QUIVER_TOKEN missing")
 
-    key = f"congress:daily:v4121:{window_days}:{limit}"
+    key = f"congress:daily:v4120:{window_days}:{limit}"
     cached = cache_get(key, allow_stale=True)
     if cached is not None:
         return cached
